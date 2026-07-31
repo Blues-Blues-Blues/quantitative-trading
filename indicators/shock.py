@@ -49,3 +49,21 @@ def bollinger(
     return pd.DataFrame(
         {"upper": upper, "middle": middle, "lower": lower, "bbw": bbw}
     )
+
+
+def residual_volatility(
+    close: pd.Series,
+    ma_series: pd.Series,
+    window: int = 20,
+    ddof: int = 0,
+) -> pd.Series:
+    """残差波动率：收盘价相对均线（趋势主轴）的偏离序列的滚动标准差。
+
+    偏离值 = Close / MA - 1（价格围绕主轴的百分比偏离），
+    对其求 window 日滚动标准差，衡量股价围绕趋势主轴震荡抖动的剧烈程度。
+
+    :param ddof: 标准差自由度，0 = 总体标准差（与布林带口径一致）
+    :return: 窗口不足时 NaN（偏离值本身为 NaN 时窗口内无有效数据，同样输出 NaN）
+    """
+    deviation = close / ma_series.where(ma_series != 0) - 1
+    return deviation.rolling(window=window, min_periods=window).std(ddof=ddof)

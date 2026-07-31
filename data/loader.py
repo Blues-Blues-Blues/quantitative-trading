@@ -106,37 +106,72 @@ def _cache_path(symbol: str, start_date: str, end_date: str, adjustflag: int) ->
     return os.path.join(_CACHE_DIR, fname)
 
 
+def _fetch_start_date(start_date: str, warmup_days: int) -> str:
+    """计算实际拉取起始日期：按日历日向前扩展预热段。
+
+    交易日约为日历日的 5/7，取 2 倍系数留足节假日缓冲，
+    之后在 load_daily 内精确截取 warmup_days 个交易日。
+    """
+    if warmup_days <= 0:
+        return start_date
+    start = pd.to_datetime(start_date)
+    buffer_days = int(round(warmup_days * 2.0))
+    return (start - pd.Timedelta(days=buffer_days)).strftime("%Y-%m-%d")
+
+
+def _slice_warmup(df: pd.DataFrame, start_date: str, warmup_days: int) -> pd.DataFrame:
+    """截取预热区间：保留 start_date 之前最近 warmup_days 个交易日 + 回测段。
+
+    新股/数据不足时保留现有全部数据（从上市日起），不报错。
+    """
+    if warmup_days <= 0:
+        return df
+    start_ts = pd.Timestamp(start_date)
+    pre = df[df.index < start_ts]
+    if len(pre) > warmup_days:
+        pre = pre.tail(warmup_days)
+    warmup_start = pre.index[0] if len(pre) else df.index[0]
+    return df[df.index >= warmup_start]
+
+
 def load_daily(
     symbol: str,
     start_date: str,
     end_date: str,
     adjustflag: int = ADJUST_NONE,
     use_cache: bool = True,
+    warmup_days: int = 0,
 ) -> pd.DataFrame:
     """
     加载单只股票日线数据。
 
     :param symbol: 股票代码，如 "600000" 或 "sh.600000"
-    :param start_date: 起始日期 "YYYY-MM-DD"
-    :param end_date: 结束日期 "YYYY-MM-DD"
+    :param start_date: 回测起始日期 "YYYY-MM-DD"
+    :param end_date: 回测结束日期 "YYYY-MM-DD"
     :param adjustflag: 复权标志，1=后复权 2=前复权 3=不复权
     :param use_cache: 是否使用/写入本地 CSV 缓存
+    :param warmup_days: 预热交易日数（默认 0）。>0 时在 start_date 之前
+        额外拉取 warmup_days 个交易日的数据，保证 MA60 等长周期指标
+        在回测第一天就有效；返回数据 = 预热段 + 回测段，调用方用
+        `df[df.index >= start_date]` 切片即可。
     :return: 标准格式 DataFrame，DatetimeIndex 升序，剔除停牌日
     :raises ConnectionError: 未登录或登录失败
     :raises RuntimeError: baostock 查询失败
     :raises ValueError: 无数据
     """
     code = _to_bs_code(symbol)
-    cache_file = _cache_path(code, start_date, end_date, adjustflag)
+    fetch_start = _fetch_start_date(start_date, warmup_days)
+    cache_file = _cache_path(code, fetch_start, end_date, adjustflag)
 
     if use_cache and os.path.exists(cache_file):
         df = pd.read_csv(cache_file, parse_dates=["date"])
-        return df.set_index("date").sort_index()
+        df = df.set_index("date").sort_index()
+        return _slice_warmup(df, start_date, warmup_days)
 
     rs = bs.query_history_k_data_plus(
         code,
         _QUERY_FIELDS,
-        start_date=start_date,
+        start_date=fetch_start,
         end_date=end_date,
         frequency="d",
         adjustflag=str(adjustflag),
@@ -149,7 +184,7 @@ def load_daily(
         rows.append(rs.get_row_data())
 
     if not rows:
-        raise ValueError(f"{code} 在 {start_date} ~ {end_date} 无数据，请检查代码或日期范围")
+        raise ValueError(f"{code} 在 {fetch_start} ~ {end_date} 无数据，请检查代码或日期范围")
 
     df = pd.DataFrame(rows, columns=rs.fields)
     df = df.rename(columns=_FIELD_MAP)
@@ -162,7 +197,7 @@ def load_daily(
     if use_cache:
         df.to_csv(cache_file, encoding="utf-8")
 
-    return df
+    return _slice_warmup(df, start_date, warmup_days)
 
 
 def load_daily_multi(
@@ -171,13 +206,14 @@ def load_daily_multi(
     end_date: str,
     adjustflag: int = ADJUST_NONE,
     use_cache: bool = True,
+    warmup_days: int = 0,
 ) -> Dict[str, pd.DataFrame]:
     """
     批量加载多只股票日线数据。
 
-    :return: {symbol: DataFrame}
+    :return: {symbol: DataFrame}（含预热段，各股数据量可能不同）
     """
     result = {}
     for s in symbols:
-        result[s] = load_daily(s, start_date, end_date, adjustflag, use_cache)
+        result[s] = load_daily(s, start_date, end_date, adjustflag, use_cache, warmup_days)
     return result

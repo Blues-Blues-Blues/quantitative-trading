@@ -40,7 +40,9 @@ def compute_target_weights(
                                     "atr_ratio": ATR/Close,
                                     "thresh_atr": ATR 动态阈值,
                                     "mdm": 动量衰减是否生效（已含持仓>=5日门控）,
-                                    "is_shock": 是否震荡市}}
+                                    "is_shock": 是否震荡市}}，
+        其中 is_shock 在新指标体系下由 is_trend 反推：is_shock = not is_trend
+        （is_trend 为 False 即视为震荡，不持仓）
     :param max_total_weight: 总权重上限（默认 0.95）
     :return: {symbol: 目标权重}，仅含权重 > 0 的标的；未满仓部分即现金
     """

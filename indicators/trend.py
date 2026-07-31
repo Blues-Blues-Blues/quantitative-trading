@@ -12,6 +12,14 @@ def ma(close: pd.Series, window: int) -> pd.Series:
     return close.rolling(window=window).mean()
 
 
+def ma_slope(ma_series: pd.Series, window: int = 5) -> pd.Series:
+    """均线斜率：N 日变化率 (MA[t] - MA[t-N]) / MA[t-N]，窗口不足时输出 NaN。
+
+    用于判断趋势主轴（如 MA60）是否具备明确向上方向。
+    """
+    return ma_series.pct_change(window)
+
+
 def macd(
     close: pd.Series,
     fast: int = 12,

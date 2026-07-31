@@ -6,8 +6,8 @@
 import numpy as np
 import pandas as pd
 
-from indicators.shock import atr, bollinger
-from indicators.trend import adx, ma, macd
+from indicators.shock import atr, bollinger, residual_volatility
+from indicators.trend import adx, ma, ma_slope, macd
 
 
 def ma_volume(volume: pd.Series, window: int) -> pd.Series:
@@ -75,16 +75,22 @@ def momentum_decay_cond(df: pd.DataFrame) -> pd.Series:
     )
 
 
-def add_dynamic_thresholds(df: pd.DataFrame, window: int = 252) -> pd.DataFrame:
-    """动态阈值：基于滚动 window 日（默认 252）分位数，窗口不足时用现有数据。
+def add_dynamic_thresholds(
+    df: pd.DataFrame,
+    window: int = 252,
+    resid_window: int = 250,
+) -> pd.DataFrame:
+    """动态阈值：基于滚动分位数，窗口不足时用现有数据计算（min_periods=1）。
 
-    前置要求：df 已包含列 adx、bbw、atr、close；
+    前置要求：df 已包含列 adx、atr、close、resid_vol20；
     turnover 缺失时 thresh_turnover_low 填 NaN，不报错。
     """
     df["thresh_adx"] = rolling_quantile(df["adx"], window, 0.25)
-    df["thresh_bbw"] = rolling_quantile(df["bbw"], window, 0.30)
+    # thresh_bbw 仅旧的 is_shock 判定使用，已废弃，注释保留备查
+    # df["thresh_bbw"] = rolling_quantile(df["bbw"], window, 0.30)
     atr_ratio = df["atr"] / df["close"].where(df["close"] != 0)
     df["thresh_atr"] = rolling_quantile(atr_ratio, window, 0.70)
+    df["thresh_resid_vol"] = rolling_quantile(df["resid_vol20"], resid_window, 0.70)
     if "turnover" in df.columns:
         df["thresh_turnover_low"] = rolling_quantile(df["turnover"], window, 0.10)
     else:
@@ -105,10 +111,16 @@ def compute_all(
     vol_ma_periods=(5, 10),
     thresh_window: int = 252,
     turn_window: int = 60,
+    trend_ma: int = 60,
+    slope_window: int = 5,
+    resid_window: int = 20,
+    resid_thresh_window: int = 250,
+    slope_threshold: float = 0.0,
 ) -> pd.DataFrame:
     """统一指标入口：计算全部指标列并追加到 DataFrame，返回新 DataFrame。
 
     :param df: loader 返回的标准行情 DataFrame（含 open/high/low/close/volume/turnover）
+    :param slope_threshold: MA60 5 日斜率阈值（默认 0，主轴向上即可）
     :return: 追加全部指标列的 DataFrame（缺失数据以 NaN 填充，不会报错）
 
     新增列：
@@ -119,8 +131,10 @@ def compute_all(
         upper, middle, lower, bbw  布林带 + 带宽
         ma5_vol, ma10_vol          量能均线
         turnover_pct               60 日换手率分位数
-        thresh_adx, thresh_bbw, thresh_atr, thresh_turnover_low  动态阈值
-        is_shock                   震荡市判定（True=震荡，NaN 视为震荡）
+        ma60, ma60_slope5          趋势主轴 MA60 及其 5 日斜率
+        resid_vol20                20 日残差波动率（偏离 MA60 的滚动标准差）
+        thresh_adx, thresh_atr, thresh_resid_vol, thresh_turnover_low  动态阈值
+        is_trend                   趋势判定（True=趋势，False=震荡；NaN 视为震荡）
         tq                         趋势质量打分 0~3
         vc                         量能确认打分 0~2
         mdm_cond                   动量衰减条件（bool，不含持仓天数门控）
@@ -130,6 +144,11 @@ def compute_all(
     # 均线
     for p in ma_periods:
         out[f"ma{p}"] = ma(out["close"], p)
+
+    # MA60 趋势主轴及其斜率、残差波动率
+    out["ma60"] = ma(out["close"], trend_ma)
+    out["ma60_slope5"] = ma_slope(out["ma60"], slope_window)
+    out["resid_vol20"] = residual_volatility(out["close"], out["ma60"], resid_window)
 
     # MACD
     m = macd(out["close"], macd_fast, macd_slow, macd_signal)
@@ -155,13 +174,19 @@ def compute_all(
     else:
         out["turnover_pct"] = float("nan")
 
-    # 动态阈值（依赖上方已算出的 adx/bbw/atr）
-    add_dynamic_thresholds(out, thresh_window)
+    # 动态阈值（依赖上方已算出的 adx/atr/resid_vol20）
+    add_dynamic_thresholds(out, thresh_window, resid_thresh_window)
 
-    # 震荡市判定：ADX 弱趋势 且 BBW 窄带宽；数据不足（NaN）时视为震荡（保守，不交易）
-    shock = (out["adx"] < out["thresh_adx"]) & (out["bbw"] < out["thresh_bbw"])
-    missing = out[["adx", "bbw", "thresh_adx", "thresh_bbw"]].isna().any(axis=1)
-    out["is_shock"] = shock | missing
+    # 趋势主轴判定 is_trend：MA60 5日斜率 > 阈值 且 残差波动率 < 动态阈值；
+    # 任一条件不满足（含 NaN）视为震荡，不交易。
+    out["is_trend"] = (out["ma60_slope5"] > slope_threshold) & (
+        out["resid_vol20"] < out["thresh_resid_vol"]
+    )
+
+    # 旧的震荡市判定（ADX + BBW），已废弃，改用 is_trend，注释保留备查
+    # shock = (out["adx"] < out["thresh_adx"]) & (out["bbw"] < out["thresh_bbw"])
+    # missing = out[["adx", "bbw", "thresh_adx", "thresh_bbw"]].isna().any(axis=1)
+    # out["is_shock"] = shock | missing
 
     # 因子与打分
     out["tq"] = trend_quality(out)
