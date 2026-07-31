@@ -27,6 +27,54 @@ def turnover_percentile(turnover: pd.Series, window: int = 60) -> pd.Series:
     )
 
 
+def trend_quality(df: pd.DataFrame) -> pd.Series:
+    """趋势质量 TQ（0~3）：趋势强度 + 均线多头排列 + 价格站上 MA20。
+
+    T1: ADX >= thresh_adx
+    T2: MA5 > MA10 > MA20
+    T3: Close > MA20
+
+    任一条件遇 NaN 视为不满足（不加分）。
+    """
+    t1 = df["adx"] >= df["thresh_adx"]
+    t2 = (df["ma5"] > df["ma10"]) & (df["ma10"] > df["ma20"])
+    t3 = df["close"] > df["ma20"]
+    return t1.astype(int) + t2.astype(int) + t3.astype(int)
+
+
+def volume_confirm(df: pd.DataFrame) -> pd.Series:
+    """量能确认 VC（0~2）：量能放大 + 换手率分位不低。
+
+    V1: MA5_VOL > MA10_VOL
+    V2: turnover_percentile >= 0.4
+
+    任一条件遇 NaN 视为不满足（不加分）。
+    """
+    v1 = df["ma5_vol"] > df["ma10_vol"]
+    v2 = df["turnover_pct"] >= 0.4
+    return v1.astype(int) + v2.astype(int)
+
+
+def momentum_decay_cond(df: pd.DataFrame) -> pd.Series:
+    """动量衰减条件（bool）：上升趋势中 MACD 柱动能减弱。
+
+    近期均值 = (BAR[t-2] + BAR[t-1]) / 2
+    前期均值 = (BAR[t-4] + BAR[t-3]) / 2
+    条件 = DIF > 0 且 DIF > DEA 且 BAR > 0 且 (近期均值 < 前期均值)
+
+    注意：条件本身不含"持仓天数"约束；"持仓 >= 5 交易日"的门控由策略层
+    结合持仓状态判断（mdm_cond 且持仓天数 >= 5 才视为动量衰减卖出信号）。
+    """
+    recent = (df["bar"].shift(2) + df["bar"].shift(1)) / 2
+    prior = (df["bar"].shift(4) + df["bar"].shift(3)) / 2
+    return (
+        (df["dif"] > 0)
+        & (df["dif"] > df["dea"])
+        & (df["bar"] > 0)
+        & (recent < prior)
+    )
+
+
 def add_dynamic_thresholds(df: pd.DataFrame, window: int = 252) -> pd.DataFrame:
     """动态阈值：基于滚动 window 日（默认 252）分位数，窗口不足时用现有数据。
 
@@ -72,6 +120,10 @@ def compute_all(
         ma5_vol, ma10_vol          量能均线
         turnover_pct               60 日换手率分位数
         thresh_adx, thresh_bbw, thresh_atr, thresh_turnover_low  动态阈值
+        is_shock                   震荡市判定（True=震荡，NaN 视为震荡）
+        tq                         趋势质量打分 0~3
+        vc                         量能确认打分 0~2
+        mdm_cond                   动量衰减条件（bool，不含持仓天数门控）
     """
     out = df.copy()
 
@@ -105,5 +157,15 @@ def compute_all(
 
     # 动态阈值（依赖上方已算出的 adx/bbw/atr）
     add_dynamic_thresholds(out, thresh_window)
+
+    # 震荡市判定：ADX 弱趋势 且 BBW 窄带宽；数据不足（NaN）时视为震荡（保守，不交易）
+    shock = (out["adx"] < out["thresh_adx"]) & (out["bbw"] < out["thresh_bbw"])
+    missing = out[["adx", "bbw", "thresh_adx", "thresh_bbw"]].isna().any(axis=1)
+    out["is_shock"] = shock | missing
+
+    # 因子与打分
+    out["tq"] = trend_quality(out)
+    out["vc"] = volume_confirm(out)
+    out["mdm_cond"] = momentum_decay_cond(out)
 
     return out

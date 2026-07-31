@@ -4,10 +4,72 @@
 - 最大持股数不超过 max_holdings（默认 4 只）
 - 所有持仓总权重不得超过 max_total_weight（默认 0.95，即至少保留 5% 现金）
 
-该模块只负责"约束"，不负责选股与信号判断，选股结果由策略层提供。
+目标仓位计算（compute_target_weights）：基础权重映射 + 波动率/MDM/震荡市修正 + 总仓封顶。
+
+该模块只负责"约束与权重计算"，不负责选股与信号判断，选股结果由策略层提供。
 """
 
 from typing import Dict, Sequence
+
+# 目标权重映射：TQ+VC 总分 -> 基础权重（<=2 分为 0）
+_BASE_WEIGHTS = {5: 0.25, 4: 0.18, 3: 0.10}
+
+# MDM 修正阈值：权重 >= 18% 时降至 10%，否则降至 0%
+_MDM_HIGH_FLOOR = 0.18
+_MDM_DECAY_WEIGHT = 0.10
+
+# 波动率修正系数
+_VOLATILITY_FACTOR = 0.6
+
+
+def weight_from_score(score: int) -> float:
+    """基础权重映射：TQ+VC 总分（0~5）-> 基础权重。
+
+    5分 -> 25%，4分 -> 18%，3分 -> 10%，<=2分 -> 0%。
+    """
+    return _BASE_WEIGHTS.get(int(score), 0.0)
+
+
+def compute_target_weights(
+    stock_factors: Dict[str, dict],
+    max_total_weight: float = 0.95,
+) -> Dict[str, float]:
+    """目标仓位计算：按顺序执行波动率/MDM/震荡市修正，最后总仓封顶。
+
+    :param stock_factors: {symbol: {"score": tq+vc 总分,
+                                    "atr_ratio": ATR/Close,
+                                    "thresh_atr": ATR 动态阈值,
+                                    "mdm": 动量衰减是否生效（已含持仓>=5日门控）,
+                                    "is_shock": 是否震荡市}}
+    :param max_total_weight: 总权重上限（默认 0.95）
+    :return: {symbol: 目标权重}，仅含权重 > 0 的标的；未满仓部分即现金
+    """
+    weights: Dict[str, float] = {}
+    for symbol, f in stock_factors.items():
+        w = weight_from_score(f["score"])
+
+        # 1. 波动率修正：高波动（ATR/Close > 阈值）权重打 6 折
+        if float(f["atr_ratio"]) > float(f["thresh_atr"]):
+            w *= _VOLATILITY_FACTOR
+
+        # 2. MDM 修正：动量衰减（且已持仓 >= 5 日）大幅降权
+        if f.get("mdm"):
+            w = _MDM_DECAY_WEIGHT if w >= _MDM_HIGH_FLOOR else 0.0
+
+        # 3. 震荡市修正：震荡期不持仓
+        if f.get("is_shock"):
+            w = 0.0
+
+        if w > 0:
+            weights[symbol] = w
+
+    # 4. 总仓封顶：所有个股权重和 > 上限时按比例缩放
+    total = sum(weights.values())
+    if total > max_total_weight:
+        scale = max_total_weight / total
+        weights = {s: w * scale for s, w in weights.items()}
+
+    return weights
 
 
 class PositionManager:
