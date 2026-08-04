@@ -111,7 +111,7 @@ def compute_all(
     vol_ma_periods=(5, 10),
     thresh_window: int = 252,
     turn_window: int = 60,
-    trend_ma: int = 60,
+    trend_ma: int = 20,
     slope_window: int = 5,
     resid_window: int = 20,
     resid_thresh_window: int = 250,
@@ -120,7 +120,9 @@ def compute_all(
     """统一指标入口：计算全部指标列并追加到 DataFrame，返回新 DataFrame。
 
     :param df: loader 返回的标准行情 DataFrame（含 open/high/low/close/volume/turnover）
-    :param slope_threshold: MA60 5 日斜率阈值（默认 0，主轴向上即可）
+    :param trend_ma: 趋势主轴均线周期（默认 20）；主轴列名为 ma{trend_ma}、
+        ma{trend_ma}_slope5，斜率与残差波动率均围绕该主轴计算
+    :param slope_threshold: 主轴 5 日斜率阈值（默认 0，主轴向上即可）
     :return: 追加全部指标列的 DataFrame（缺失数据以 NaN 填充，不会报错）
 
     新增列：
@@ -131,8 +133,8 @@ def compute_all(
         upper, middle, lower, bbw  布林带 + 带宽
         ma5_vol, ma10_vol          量能均线
         turnover_pct               60 日换手率分位数
-        ma60, ma60_slope5          趋势主轴 MA60 及其 5 日斜率
-        resid_vol20                20 日残差波动率（偏离 MA60 的滚动标准差）
+        ma20, ma20_slope5          趋势主轴（默认 MA20）及其 5 日斜率
+        resid_vol20                20 日残差波动率（偏离趋势主轴的滚动标准差）
         thresh_adx, thresh_atr, thresh_resid_vol, thresh_turnover_low  动态阈值
         is_trend                   趋势判定（True=趋势，False=震荡；NaN 视为震荡）
         tq                         趋势质量打分 0~3
@@ -145,10 +147,11 @@ def compute_all(
     for p in ma_periods:
         out[f"ma{p}"] = ma(out["close"], p)
 
-    # MA60 趋势主轴及其斜率、残差波动率
-    out["ma60"] = ma(out["close"], trend_ma)
-    out["ma60_slope5"] = ma_slope(out["ma60"], slope_window)
-    out["resid_vol20"] = residual_volatility(out["close"], out["ma60"], resid_window)
+    # MA 趋势主轴（默认 MA20）及其斜率、残差波动率
+    axis = f"ma{trend_ma}"
+    out[axis] = ma(out["close"], trend_ma)
+    out[f"{axis}_slope5"] = ma_slope(out[axis], slope_window)
+    out["resid_vol20"] = residual_volatility(out["close"], out[axis], resid_window)
 
     # MACD
     m = macd(out["close"], macd_fast, macd_slow, macd_signal)
@@ -177,9 +180,9 @@ def compute_all(
     # 动态阈值（依赖上方已算出的 adx/atr/resid_vol20）
     add_dynamic_thresholds(out, thresh_window, resid_thresh_window)
 
-    # 趋势主轴判定 is_trend：MA60 5日斜率 > 阈值 且 残差波动率 < 动态阈值；
+    # 趋势主轴判定 is_trend：主轴 MA 5日斜率 > 阈值 且 残差波动率 < 动态阈值；
     # 任一条件不满足（含 NaN）视为震荡，不交易。
-    out["is_trend"] = (out["ma60_slope5"] > slope_threshold) & (
+    out["is_trend"] = (out[f"{axis}_slope5"] > slope_threshold) & (
         out["resid_vol20"] < out["thresh_resid_vol"]
     )
 

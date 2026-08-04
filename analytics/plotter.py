@@ -48,10 +48,10 @@ def plot_trend(
     title: str = None,
     figsize: tuple = (16, 6),
 ) -> str:
-    """绘制收盘价走势 + MA5 + MA20 + MA60（虚线），震荡区间用半透明黄色标注。
+    """绘制收盘价走势 + MA5 + MA20，震荡区间用半透明黄色标注。
 
-    :param df: compute_all 输出的 DataFrame（需含 close/ma5/ma20/is_trend 列；
-        含 ma60 列时自动加画 MA60 虚线）。
+    :param df: compute_all 输出的 DataFrame（需含 close/ma5/ma20/is_trend 列）。
+        趋势主轴若存在（由 "_slope5" 列反推）且非 MA5/MA20，会以紫色虚线加画。
         若含 code 列，标题会自动标注股票代码。
         注意：若 df 含预热段，请先切片为回测段再传入，本函数按传入数据原样绘制。
     :param fname: 文件名（不含路径时保存到 analytics/pictures/）。
@@ -70,8 +70,16 @@ def plot_trend(
     ax.plot(df.index, df["close"], label="收盘价", color="#1f77b4", linewidth=1.2)
     ax.plot(df.index, df["ma5"], label="MA5", color="#ff7f0e", linewidth=1.0)
     ax.plot(df.index, df["ma20"], label="MA20", color="#2ca02c", linewidth=1.0)
-    if "ma60" in df.columns:
-        ax.plot(df.index, df["ma60"], label="MA60", color="#9467bd",
+
+    # 趋势主轴：由 "_slope5" 列反推（如 ma60 -> MA60）。
+    # 主轴为 MA5/MA20 时已在上方绘制，不重复；其他周期以紫色虚线加画。
+    axis_col = None
+    for col in df.columns:
+        if col.endswith("_slope5"):
+            axis_col = col[: -len("_slope5")]
+            break
+    if axis_col and axis_col not in ("ma5", "ma20"):
+        ax.plot(df.index, df[axis_col], label=axis_col.upper(), color="#9467bd",
                 linewidth=1.2, linestyle="--")
 
     # 震荡区间（is_trend == False 的连续段）半透明黄色
