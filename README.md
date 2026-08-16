@@ -2,7 +2,7 @@
 
 基于 [baostock](http://baostock.com/) 行情数据的 A 股量化交易回测框架。项目以「数据层 → 指标层 → 策略层 → 执行引擎层 → 评估与绘图」的分层结构组织代码。
 
-当前开发状态：**数据加载与基础指标体系已完成，仓位管理与绘图可用**；回测引擎、策略主体（情绪策略/状态机/闸门）、机器学习寻优、Level-2 与宏观因子、评估归因等模块为规划中的占位实现。
+当前开发状态：**数据层、指标因子层、信号合成与状态机、回测撮合引擎均已实现并通过单元测试（90 项）**；机器学习寻优、绩效评估与归因、Level-2/宏观真实数据源接入、项目主入口等模块为规划中的占位实现。
 
 ## 功能特性
 
@@ -11,9 +11,13 @@
 - **指标体系**：MA、MACD、ADX、ATR、布林带等常用指标，全部仅使用历史数据（无未来函数）
 - **市场状态判定**：基于趋势主轴斜率 + 残差波动率的 `is_trend` 判定，区分趋势日与震荡日
 - **多因子打分**：趋势质量 TQ（0~3）+ 量能确认 VC（0~2），配合动态阈值（滚动分位数）
+- **时间对齐管道**：`TimeAligner` 多源异构数据时钟对齐（宏观/外盘 T-1 全量对齐、龙虎榜 T+1 隔离），内置 `verify_no_lookahead` 防未来函数校验
+- **因子体系**：资金主体分层（小/中/大/超大单净流）、微观结构因子（OFSS 盘口/CPS 筹码/PSS 价格结构）、宏观共振因子（MRS/GRS/IRS 与 Global_Mod/Chain_Mod），统一由 `FeatureEngine` 调度
+- **信号合成与状态机**：Agent_MS/Final_MS/Capital_Purity 合成公式、`S_push / S_youzi_only / S_noise` 三态机、8 层开仓硬闸门与 6 层平仓闸门（`strategy/signals.py`）
 - **仓位管理**：权重映射、波动率/MDM/震荡市修正、最大持股数与总仓位上限约束
+- **回测撮合引擎**：事件驱动型分钟级撮合——T+1 双份额冻结、涨跌停盘中拦截、动态滑点（订单参与率冲击模型）、佣金/印花税/过户费、动态仓位 `Position_Size` 公式、单股与总杠杆上限风控，输出完整成交日志与净值曲线
 - **可视化**：价格走势 + 均线 + 震荡区间色带标注，自动输出图片
-- **规划中能力**：Level-2 微观结构因子（OFSS/CPS/PSS）、宏观共振因子（MRS/GRS/IRS）、资金主体分层、情绪策略状态机（S_push/S_youzi_only/S_noise）与 8/6 层开平仓闸门、事件驱动型分钟级回测引擎、Optuna 超参寻优与 Walk-Forward 交叉验证、因子 IC/收益归因、实时决策日志等
+- **规划中能力**：Optuna 超参寻优与 Walk-Forward 交叉验证、因子 IC/收益归因、实时决策日志、Level-2 快照与宏观数据的真实数据源接入等
 
 ## 项目结构
 
@@ -33,28 +37,30 @@ quantitative_trading/
 │   ├── loader.py               # 基础数据加载（K线、指数；baostock + CSV 缓存 + 预热段）
 │   ├── l2_loader.py            # Level-2 快照与逐笔数据加载器（规划中）
 │   ├── macro_loader.py         # 全球宏观、隔夜外盘、商品与汇率加载器（规划中）
-│   ├── aligner.py              # 多源异构数据时钟对齐管道（严格防未来函数，规划中）
+│   ├── aligner.py              # 多源异构数据时钟对齐管道（T-1/T+1 防未来函数，已完成）
+│   ├── dataslice.py            # 标准数据切片 DataSlice：多数据帧容器 + 标准列常量
 │   ├── storage.py              # 统一本地数据访问层（parquet/csv/yaml 读写）
 │   └── mock_data/              # 历史数据缓存（可改用 parquet 格式提升性能）
 ├── indicators/                 # ── 特征工程与因子层 ──
 │   ├── basic.py                # 基础技术指标统一入口 compute_all + TQ/VC 打分 + 动态阈值
 │   ├── trend.py                # 趋势指标：MA / MACD / ADX
 │   ├── shock.py                # 波动指标：ATR / 布林带 / 残差波动率
-│   ├── agent_profiling.py      # 资金主体分层（小/中/大/超大单、北向、两融，规划中）
-│   ├── microstructure.py       # 微观结构因子（OFSS 盘口、CPS 筹码、PSS 价格结构，规划中）
-│   ├── environment.py          # 宏观与共振因子（MRS 大盘、GRS 全球风险、IRS 产业，规划中）
-│   └── feature_engine.py       # 统一特征计算与归一化调度器（规划中）
+│   ├── agent_profiling.py      # 资金主体分层（小/中/大/超大单净流、北向、两融）
+│   ├── microstructure.py       # 微观结构因子（OFSS 盘口、CPS 筹码、PSS 价格结构）
+│   ├── environment.py          # 宏观与共振因子（MRS 大盘、GRS 全球风险、IRS 产业）
+│   └── feature_engine.py       # 统一特征计算与归一化调度器 FeatureEngine
 ├── strategy/                   # ── 策略与状态机 ──
-│   ├── base.py                 # 策略抽象基类（规划中）
+│   ├── base.py                 # 策略抽象基类
+│   ├── signals.py              # 信号合成 + 多层闸门状态机（SignalSynthesizer / TradingStateMachine）
+│   ├── position.py             # 仓位管理：权重计算与持仓约束
 │   ├── sentiment_strategy.py   # Final v2.0 全生态情绪策略实现（规划中）
-│   ├── state_machine.py        # 有限状态机（S_push, S_youzi_only, S_noise，规划中）
-│   ├── gates.py                # 8层开仓硬闸门与6层平仓闸门判断逻辑（规划中）
-│   └── position.py             # 仓位管理：权重计算与持仓约束（已完成，规划扩展 MRS/Global_Mod）
+│   ├── state_machine.py        # 有限状态机外壳（核心逻辑已并入 signals.py）
+│   └── gates.py                # 8/6 层开平仓闸门外壳（核心逻辑已并入 signals.py）
 ├── engine/                     # ── 执行与撮合层 ──
-│   ├── backtest.py             # 事件驱动型分钟级回测引擎（规划中）
-│   ├── execution.py            # A股交易规则撮合器（T+1、VWAP滑点、涨跌停熔断拦截，规划中）
-│   ├── portfolio.py            # 账户持仓、资金流水与冻结资金管理（规划中）
-│   └── risk_control.py         # 盘中动态风控与大盘/外盘熔断机制（规划中）
+│   ├── backtest.py             # 事件驱动型分钟级回测引擎（TradeLog / EquityCurve）
+│   ├── execution.py            # A股交易成本与动态滑点模型（T+1、参与率冲击、涨跌停拦截）
+│   ├── portfolio.py            # 账户状态机：现金/持仓/T+1 可卖份额/成本价
+│   └── risk_control.py         # 动态仓位 Position_Size 公式 + 单股/总杠杆上限风控
 ├── optimizer/                  # ── 机器学习优化层 ──
 │   ├── search_space.py         # 超参数搜索空间定义（权重、阈值、窗口，规划中）
 │   ├── bayesian_opt.py         # 基于 Optuna 的多目标/带约束贝叶斯寻优（规划中）
@@ -67,10 +73,12 @@ quantitative_trading/
 │   ├── plotter.py              # 绘图模块：价格走势 / 震荡区间标注（已完成基础版）
 │   └── pictures/               # 生成的图片输出目录
 └── tests/
-    ├── test_data_aligner.py    # 测试时间对齐与防未来函数（规划中）
-    ├── test_factors.py         # 测试微观与环境因子计算（规划中）
-    ├── test_state_machine.py   # 测试状态机转换与闸门过滤（规划中）
-    └── test_backtest_engine.py # 测试 A 股撮合规则与 T+1 机制（规划中）
+    ├── test_data_aligner.py    # 时间对齐、防未来函数与 DataSlice 组装
+    ├── test_factors.py         # 微观结构与环境因子计算
+    ├── test_features.py        # 主体分层与 FeatureEngine 端到端
+    ├── test_state_machine.py   # 状态机转换与闸门过滤
+    ├── test_signals.py         # 信号合成公式与状态机全流程
+    └── test_backtest_engine.py # A 股撮合规则、T+1、成本滑点与风控
 ```
 
 ## 安装
@@ -160,11 +168,55 @@ cfg = storage.read_yaml("industry", "industry_mapping.yaml")
 
 规划方向：结合 MRS（大盘共振）与 Global_Mod（全球风险修正）的动态仓位。
 
+## 信号合成与状态机
+
+`strategy/signals.py` 提供 `SignalSynthesizer`（合成公式）与 `TradingStateMachine`（逐 Bar 状态机）：
+
+- **合成公式**：`Agent_MS = W_OFSS*OFSS + W_CPS*CPS + W_INST*sign(Inst_Flow) + W_NORTH*North_Sync`（权重和强制 == 1），`Final_MS = (Agent_MS + Chain_Mod) * (1 + Global_Mod)`，`Capital_Purity` 刻画资金纯净度
+- **状态机**：`S_push`（多证据进攻态，允许开仓/加仓）→ `S_youzi_only`（游资主导禁止开仓）→ `S_noise`（默认态）；已持仓时评估 6 层平仓闸门（状态反转 / 情绪分跌破 / 资金纯净度转负 / 入场 VWAP 止损 / 超时 / 大盘熔断）
+- **8 层开仓硬闸门**：全球层 → 系统层（MA20>MA60 + ADR）→ MRS → 产业层 → Alpha（RS/行业情绪）→ 个股层 → 流动性合规 → 交易时间窗
+- **防未来**：分钟级合成只用当前及历史 Bar；RS / Industry_MS 为日频因子，经 T-1 asof 对齐后进入分钟轴
+
+## 回测撮合引擎
+
+`engine/` 提供事件驱动型分钟级回测撮合，`Account` 状态机 + `BacktestEngine` 主循环 + `TradeLog` / `EquityCurve` 输出：
+
+- **下一 Bar 成交**：`Bar t` 的信号在 `Bar t+1` 开盘价成交（1 Bar 执行延迟，严格防未来函数）
+- **A 股规则**：T+1 双份额跟踪（当日买入锁定、次交易日解冻、SELL 遇锁定挂起次日强制卖出）；盘中触及涨停不可买入、触及跌停不可卖出；100 股整数倍取整
+- **成本与滑点**：佣金双边（默认万二，最低 5 元）+ 印花税仅卖出（千 0.5）+ 过户费双边；动态滑点 = 固定 2bp + 参与率 × 50bp（封顶 60bp），参与率 = 订单金额 / Bar 成交额
+- **动态仓位**：`Position_Size = Base_Position × MRS_Coefficient × (1 + Global_Mod) × Chain_Mod_Scale`，clip 到单股上限；成交前校验单股最大仓位与总账户杠杆上限
+- **资金分配**：信号按时间序先到先得，现金不足拒绝（`insufficient_cash`）；拒绝单同样入日志（`shares=0` + `reason`）
+
+```python
+from engine.backtest import BacktestEngine
+from engine.execution import ExecutionCost
+from engine.portfolio import Account
+from engine.risk_control import PositionSizer
+
+ds, signals = ...            # DataSlice（对齐后的行情）+ 状态机产出的 Signal 列表
+eng = BacktestEngine(
+    Account(initial_cash=1e8, max_leverage=1.0, max_single_position=0.3),
+    ExecutionCost(),         # 佣金 / 印花税 / 过户费 / 动态滑点
+    PositionSizer(),         # Position_Size 公式 + 单股/杠杆上限
+    ds, signals,
+)
+trade_log, equity_curve = eng.run()   # 完整成交日志 + 逐 Bar 净值曲线
+```
+
 ## 测试
 
 ```bash
 python -m pytest tests/ -v
 ```
+
+当前 90 项单元测试全部通过（合成 mock 数据，不联网）：
+
+| 测试文件 | 覆盖范围 |
+| --- | --- |
+| `tests/test_data_aligner.py` | 多源时间对齐、T-1/T+1 隔离、防未来函数校验、DataSlice 组装 |
+| `tests/test_factors.py` / `tests/test_features.py` | 微观结构/环境/主体分层因子与 FeatureEngine 端到端 |
+| `tests/test_state_machine.py` / `tests/test_signals.py` | 合成公式精确值、8/6 层闸门、状态机 BUY/ADD/SELL/HOLD 全流程 |
+| `tests/test_backtest_engine.py` | 下一 Bar 成交、T+1 挂起卖出、涨跌停拦截、成本滑点、仓位/杠杆风控、成交日志与净值曲线 |
 
 ## 开发状态
 
@@ -172,17 +224,19 @@ python -m pytest tests/ -v
 | --- | --- |
 | 数据加载 `data/loader.py` | ✅ 已完成 |
 | 数据访问抽象 `data/storage.py` + `config/data_sources.py` | ✅ 已完成 |
+| 时间对齐 `data/aligner.py` + 数据切片 `data/dataslice.py` | ✅ 已完成 |
 | 指标计算 `indicators/trend.py` `shock.py` `basic.py` | ✅ 已完成 |
-| 仓位管理 `strategy/position.py` | ✅ 已完成（规划扩展 MRS/Global_Mod） |
+| 因子体系 `indicators/`（agent_profiling / microstructure / environment / feature_engine） | ✅ 已完成 |
+| 仓位管理 `strategy/position.py` | ✅ 已完成 |
+| 信号合成与状态机 `strategy/signals.py`（含 8/6 层闸门） | ✅ 已完成 |
+| 回测撮合引擎 `engine/`（backtest / execution / portfolio / risk_control） | ✅ 已完成 |
 | 绘图 `analytics/plotter.py` | ✅ 已完成（基础版） |
-| 数据扩展 `data/l2_loader.py` `macro_loader.py` `aligner.py` | 🚧 规划中 |
-| 因子扩展 `indicators/microstructure.py` 等 | 🚧 规划中 |
-| 策略层 `strategy/`（base/gates/state_machine/sentiment） | 🚧 规划中 |
-| 回测引擎 `engine/` | 🚧 规划中 |
+| 单元测试 `tests/` | ✅ 90 项通过 |
+| 数据扩展 `data/l2_loader.py` `macro_loader.py` | 🚧 规划中 |
+| 策略壳 `strategy/`（sentiment / state_machine / gates 外壳） | 🚧 规划中（核心逻辑已并入 signals.py） |
 | 机器学习优化 `optimizer/` | 🚧 规划中 |
-| 评估归因 `analytics/`（metrics/attribution/ic/stream） | 🚧 规划中 |
+| 评估归因 `analytics/`（metrics / attribution / ic / stream） | 🚧 规划中 |
 | 项目入口 `main.py` / `run_optimization.py` | 🚧 规划中 |
-| 单元测试 `tests/` | 🚧 规划中 |
 
 ## 免责声明
 
