@@ -11,15 +11,15 @@ import os
 import matplotlib.pyplot as plt
 import pandas as pd
 
+from config.data_sources import get_data_path
+
 # 中文字体（Windows），避免图例/标题乱码
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
-# 默认图片保存目录：analytics/pictures/
-_PICTURES_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "analytics", "pictures",
-)
+# 默认图片保存目录：analytics/pictures/，可通过环境变量 QTDATA_PICTURES_PATH
+# 或 config/data_paths.yaml 的 pictures 项覆盖（见 config/data_sources.py）
+_PICTURES_DIR = str(get_data_path("pictures"))
 
 
 def _shock_blocks(is_trend: pd.Series) -> list:

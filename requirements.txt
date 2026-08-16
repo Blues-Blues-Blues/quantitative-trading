@@ -1,4 +1,19 @@
+# 行情数据获取
 baostock>=0.8.9
+
+# 数据处理与计算
 pandas>=1.5.0
 numpy>=1.23.0
+scipy>=1.10.0
+
+# 可视化
 matplotlib>=3.6.0
+
+# 高性能存储（高频与 L2 数据，Parquet 格式；如需可用 fastparquet 替代）
+pyarrow>=14.0.0
+
+# 配置文件解析
+PyYAML>=6.0
+
+# 超参数优化
+optuna>=3.5.0

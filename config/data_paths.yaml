@@ -1,0 +1,21 @@
+# 本地数据存储位置配置（可选覆盖文件）。
+#
+# 开发阶段尚未确定各数据资源的具体存放位置，默认使用项目根目录下的
+# 相对路径（见 config/data_sources.py 的 _DEFAULT_PATHS）。后续确定位置后，
+# 可在此填写真实路径（绝对路径，或相对项目根目录的路径），
+# 或通过环境变量 QTDATA_<KEY>_PATH 覆盖（优先级最高），业务代码无需修改。
+#
+# 可配置的逻辑数据源 KEY：
+#   daily_cache   日线行情缓存
+#   pictures      图片输出目录
+#   l2            Level-2 快照/逐笔数据
+#   macro         宏观/外盘/商品/汇率数据
+#   industry      产业链映射
+#   parquet       通用高性能 Parquet 存储
+#   strategy      策略参数与中间结果
+#   logs          结构化实时决策日志
+#
+# 示例（取消注释并填写真实路径后生效）：
+# l2: "D:/data/l2"
+# macro: "/mnt/storage/macro"
+# parquet: "data/external/parquet"

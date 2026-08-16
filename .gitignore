@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 数据与缓存（本地存储位置未确定，不入库）
+data/mock_data/
+data/l2/
+data/macro/
+data/parquet/
+data/strategy/
+data/logs/
+analytics/pictures/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

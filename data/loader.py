@@ -22,6 +22,8 @@ import pandas as pd
 
 import baostock as bs
 
+from config.data_sources import get_data_path
+
 # 复权标志
 ADJUST_BACKWARD = 1  # 后复权
 ADJUST_FORWARD = 2   # 前复权
@@ -57,11 +59,9 @@ _NUMERIC_COLS = [
     "amount", "turnover", "pctChg",
 ]
 
-# 缓存目录：项目下 data/mock_data/
-_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data", "mock_data",
-)
+# 缓存目录：默认 data/mock_data/，可通过环境变量 QTDATA_DAILY_CACHE_PATH
+# 或 config/data_paths.yaml 的 daily_cache 项覆盖（见 config/data_sources.py）
+_CACHE_DIR = str(get_data_path("daily_cache"))
 
 
 def _to_bs_code(symbol: str) -> str:
