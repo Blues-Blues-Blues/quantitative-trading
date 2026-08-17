@@ -242,13 +242,17 @@ class MicroStructure:
         """价格结构分：实体/影线比 + 近 N 分钟窗口百分位。
 
         窗口统计包含当前已收盘的 bar（属历史），不引入未来信息。
+        注意：kline 为含 symbol 列的长表（同一时间戳可有多行），索引非唯一，
+        须用 groupby.transform（保持原行序）而非 Series 索引对齐运算。
         """
         k = kline.copy()
         k["body"] = ((k["close"] - k["open"])
                      / (k["high"] - k["low"] + _EPS)).clip(-1, 1)
         grp = k.groupby(SYMBOL, group_keys=False)
-        hi = grp["high"].rolling(self.pss_window, min_periods=2).max()
-        lo = grp["low"].rolling(self.pss_window, min_periods=2).min()
+        hi = grp["high"].transform(
+            lambda s: s.rolling(self.pss_window, min_periods=2).max())
+        lo = grp["low"].transform(
+            lambda s: s.rolling(self.pss_window, min_periods=2).min())
         pct = (k["close"] - lo) / (hi - lo + _EPS)
         return (self.pss_body_w * k["body"]
                 + (1 - self.pss_body_w) * (2 * pct - 1)).clip(-1.0, 1.0)

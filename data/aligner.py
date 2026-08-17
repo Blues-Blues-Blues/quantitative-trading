@@ -221,7 +221,17 @@ class TimeAligner:
     def _sort_dedupe(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return df
-        return df[~df.index.duplicated(keep="first")].sort_index()
+        # 含 symbol 列的表为长表（同一时间戳对应多只标的），须按 (时间戳, symbol)
+        # 去重，否则会把同 ts 的其余标的整行误删（与 DataSlice.validate 语义一致）；
+        # 无 symbol 列的表按时间戳去重即可。
+        if SYMBOL in df.columns:
+            res = df.reset_index()
+            idx_col = res.columns[0]
+            keep = ~res.duplicated(subset=[idx_col, SYMBOL], keep="first").to_numpy()
+            df = df[keep]
+        else:
+            df = df[~df.index.duplicated(keep="first")]
+        return df.sort_index()
 
     @staticmethod
     def _with_adr(breadth: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:

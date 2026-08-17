@@ -131,9 +131,10 @@ class FeatureEngine:
         else:
             logger.warning("缺少 l2_snapshot 且缺少 tick_trades，OFSS 相关列置 NaN")
 
-        # PSS（与 kline 同 index 的 Series）
+        # PSS（与 kline 同 index 的 Series；长表按 [ts, symbol] 对齐补 symbol 列）
         pss = self.micro.pss(ds.kline).rename("pss").reset_index()
         pss = pss.rename(columns={"index": "ts"})
+        pss[SYMBOL] = ds.kline[SYMBOL].to_numpy()  # pss 与 kline 行序一致
         feat = feat.merge(pss, on=["ts", SYMBOL], how="left")
         return feat
 
