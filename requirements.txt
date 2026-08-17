@@ -17,3 +17,6 @@ PyYAML>=6.0
 
 # 超参数优化
 optuna>=3.5.0
+
+# 复盘清单 Excel 导出
+openpyxl>=3.1.0

@@ -2,7 +2,7 @@
 
 基于 [baostock](http://baostock.com/) 行情数据的 A 股量化交易回测框架。项目以「数据层 → 指标层 → 策略层 → 执行引擎层 → 评估与绘图」的分层结构组织代码。
 
-当前开发状态：**数据层、指标因子层、信号合成与状态机、回测撮合引擎均已实现并通过单元测试（90 项）**；机器学习寻优、绩效评估与归因、Level-2/宏观真实数据源接入、项目主入口等模块为规划中的占位实现。
+当前开发状态：**数据层、指标因子层、信号合成与状态机、回测撮合引擎、带多重非线性约束的贝叶斯超参数优化（Optuna + Walk-Forward 样本外验证）、绩效评估与收益归因（PerformanceAnalyzer / AttributionEngine / 实时流 StreamLogger）均已实现并通过单元测试（132 项）**；Level-2/宏观真实数据源接入、收益归因的 Brinson 基准分解、项目主入口等模块为规划中的占位实现。
 
 ## 功能特性
 
@@ -16,8 +16,16 @@
 - **信号合成与状态机**：Agent_MS/Final_MS/Capital_Purity 合成公式、`S_push / S_youzi_only / S_noise` 三态机、8 层开仓硬闸门与 6 层平仓闸门（`strategy/signals.py`）
 - **仓位管理**：权重映射、波动率/MDM/震荡市修正、最大持股数与总仓位上限约束
 - **回测撮合引擎**：事件驱动型分钟级撮合——T+1 双份额冻结、涨跌停盘中拦截、动态滑点（订单参与率冲击模型）、佣金/印花税/过户费、动态仓位 `Position_Size` 公式、单股与总杠杆上限风控，输出完整成交日志与净值曲线
+- **超参数优化**：Optuna 贝叶斯寻优（`StrategyOptimizer`），Dirichlet 式权重归一化（和为 1）、TPE 原生多重硬约束（回撤 < 15%、胜率 > 55%、盈亏比 > 1.5、有效交易 ≥ 30 笔）、样本内年化 Sharpe 最大化、优化历程收敛图
+- **Walk-Forward 交叉验证**：滚动/扩展训练段的滚动样本外（OOS）验证框架，每折独立寻优并在样本外回测，输出跨折 OOS 评估报告，避免前视偏差与过度拟合
+- **绩效指标**：年化收益率、年化夏普、卡玛（Calmar）、Sortino、最大回撤、平均持仓周期、胜率/盈亏比、日收益偏度/峰度（`analytics/metrics.py` + `PerformanceAnalyzer`）
+- **实时决策日志流**：`StreamLogger` 每 Bar × 每标的输出标准 JSON（Final_MS / Global_Mod / Chain_Mod / Capital_Purity / Action / State），JSONL 落盘 + 生成器双形态
+- **收益归因**：`AttributionEngine` 因子暴露分解——把每笔已实现盈亏按入场时点拆解到宏观共振（Global_Mod）/ 行业共振（Chain_Mod）/ 个股情绪（Agent_MS）
+- **因子预测能力检验**：因子 IC / Rank IC / IR 时序分析（横截面 Rank IC 与单标的时序相关双模式，前瞻窗口可配）+ IC 时间桶热力图
+- **多子图 Dashboard**：净值回撤图、动态仓位图、归因柱状图、参数敏感度热力图（`plot_report`）
+- **20 日人工复盘清单**：自动导出每笔交易触发前后 N 个交易日的日线指标切片 + 逐笔资金流清单（Excel 三 sheet / CSV）
 - **可视化**：价格走势 + 均线 + 震荡区间色带标注，自动输出图片
-- **规划中能力**：Optuna 超参寻优与 Walk-Forward 交叉验证、因子 IC/收益归因、实时决策日志、Level-2 快照与宏观数据的真实数据源接入等
+- **规划中能力**：Level-2 快照与宏观数据的真实数据源接入、Brinson 基准归因、项目主入口接线等
 
 ## 项目结构
 
@@ -26,7 +34,7 @@ quantitative_trading/
 ├── main.py                     # 项目主入口（支持回测/寻优/实盘模拟模式切换）
 ├── run_optimization.py         # 机器学习超参数寻优入口脚本
 ├── demo_plot.py                # 演示脚本：绘制回测段价格走势与震荡区间
-├── requirements.txt            # 依赖：baostock / pandas / numpy / scipy / matplotlib / pyarrow / pyyaml / optuna
+├── requirements.txt            # 依赖：baostock / pandas / numpy / scipy / matplotlib / pyarrow / pyyaml / optuna / openpyxl
 ├── config/                     # ── 全局配置 ──
 │   ├── settings.py             # 全局基础配置（回测起止日期等）
 │   ├── strategy_params.py      # 策略默认超参数（W_OFSS, TH_MS_BULL 等）
@@ -62,23 +70,28 @@ quantitative_trading/
 │   ├── portfolio.py            # 账户状态机：现金/持仓/T+1 可卖份额/成本价
 │   └── risk_control.py         # 动态仓位 Position_Size 公式 + 单股/总杠杆上限风控
 ├── optimizer/                  # ── 机器学习优化层 ──
-│   ├── search_space.py         # 超参数搜索空间定义（权重、阈值、窗口，规划中）
-│   ├── bayesian_opt.py         # 基于 Optuna 的多目标/带约束贝叶斯寻优（规划中）
-│   └── walk_forward.py         # 滚动样本外（OOS / Walk-Forward）交叉验证框架（规划中）
+│   ├── search_space.py         # 超参数搜索空间（权重 Dirichlet 归一化、阈值、窗口）
+│   ├── bayesian_opt.py         # 基于 Optuna 的带多重硬约束贝叶斯寻优 StrategyOptimizer
+│   └── walk_forward.py         # 滚动样本外（OOS / Walk-Forward）交叉验证框架
 ├── analytics/                  # ── 评估、归因与监控 ──
-│   ├── metrics.py              # 夏普比率、卡玛比率、最大回撤、胜率、盈亏比计算（规划中）
-│   ├── attribution.py          # 收益归因（赚宏观、产业还是微观情绪的钱，规划中）
-│   ├── ic_analyzer.py          # 因子 IC / Rank IC / IR 分析（规划中）
-│   ├── real_time_stream.py     # 结构化实时决策日志生成器（规划中）
+│   ├── metrics.py              # 绩效指标：年化夏普/Calmar/Sortino、回撤、胜率/盈亏比、
+│   │                           #   平均持仓周期、日收益偏度/峰度、FIFO 交易配对
+│   ├── performance.py          # PerformanceAnalyzer：指标总表、四子图 Dashboard、
+│   │                           #   参数敏感度热力图、20 日人工复盘清单导出（Excel/CSV）
+│   ├── attribution.py          # AttributionEngine：因子暴露分解归因（宏观/行业/个股情绪）、
+│   │                           #   因子 IC / Rank IC / IR 双模式与热力图
+│   ├── real_time_stream.py     # StreamLogger：实时/仿真决策日志流（标准 JSONL + 生成器）
 │   ├── plotter.py              # 绘图模块：价格走势 / 震荡区间标注（已完成基础版）
-│   └── pictures/               # 生成的图片输出目录
+│   └── pictures/               # 生成的图片输出目录（含 optimizer_history.png / dashboard.png）
 └── tests/
     ├── test_data_aligner.py    # 时间对齐、防未来函数与 DataSlice 组装
     ├── test_factors.py         # 微观结构与环境因子计算
     ├── test_features.py        # 主体分层与 FeatureEngine 端到端
     ├── test_state_machine.py   # 状态机转换与闸门过滤
     ├── test_signals.py         # 信号合成公式与状态机全流程
-    └── test_backtest_engine.py # A 股撮合规则、T+1、成本滑点与风控
+    ├── test_backtest_engine.py # A 股撮合规则、T+1、成本滑点与风控
+    ├── test_optimizer.py       # 贝叶斯寻优、硬约束、Walk-Forward 与收敛图
+    └── test_analytics.py       # 绩效/归因/IC/实时流/复盘清单导出
 ```
 
 ## 安装
@@ -209,7 +222,7 @@ trade_log, equity_curve = eng.run()   # 完整成交日志 + 逐 Bar 净值曲�
 python -m pytest tests/ -v
 ```
 
-当前 90 项单元测试全部通过（合成 mock 数据，不联网）：
+当前 132 项单元测试全部通过（合成 mock 数据，不联网）：
 
 | 测试文件 | 覆盖范围 |
 | --- | --- |
@@ -217,6 +230,8 @@ python -m pytest tests/ -v
 | `tests/test_factors.py` / `tests/test_features.py` | 微观结构/环境/主体分层因子与 FeatureEngine 端到端 |
 | `tests/test_state_machine.py` / `tests/test_signals.py` | 合成公式精确值、8/6 层闸门、状态机 BUY/ADD/SELL/HOLD 全流程 |
 | `tests/test_backtest_engine.py` | 下一 Bar 成交、T+1 挂起卖出、涨跌停拦截、成本滑点、仓位/杠杆风控、成交日志与净值曲线 |
+| `tests/test_optimizer.py` | 绩效指标纯函数、搜索空间归一化、StrategyOptimizer 端到端寻优、Walk-Forward OOS 报告 |
+| `tests/test_analytics.py` | 实时流 JSONL、绩效指标精确值、因子归因盈亏守恒、IC/Rank IC/IR 双模式、复盘清单导出、Dashboard |
 
 ## 开发状态
 
@@ -231,11 +246,14 @@ python -m pytest tests/ -v
 | 信号合成与状态机 `strategy/signals.py`（含 8/6 层闸门） | ✅ 已完成 |
 | 回测撮合引擎 `engine/`（backtest / execution / portfolio / risk_control） | ✅ 已完成 |
 | 绘图 `analytics/plotter.py` | ✅ 已完成（基础版） |
-| 单元测试 `tests/` | ✅ 90 项通过 |
+| 绩效指标 `analytics/metrics.py` + `performance.py`（PerformanceAnalyzer） | ✅ 已完成（含 Calmar/Sortino/持仓周期/复盘清单/Dashboard） |
+| 收益归因 `analytics/attribution.py`（因子暴露分解 + IC/Rank IC/IR） | ✅ 已完成 |
+| 实时流 `analytics/real_time_stream.py`（StreamLogger JSONL） | ✅ 已完成 |
+| 机器学习优化 `optimizer/`（search_space / bayesian_opt / walk_forward） | ✅ 已完成 |
+| 单元测试 `tests/` | ✅ 132 项通过 |
 | 数据扩展 `data/l2_loader.py` `macro_loader.py` | 🚧 规划中 |
 | 策略壳 `strategy/`（sentiment / state_machine / gates 外壳） | 🚧 规划中（核心逻辑已并入 signals.py） |
-| 机器学习优化 `optimizer/` | 🚧 规划中 |
-| 评估归因 `analytics/`（metrics / attribution / ic / stream） | 🚧 规划中 |
+| Brinson 基准归因 `analytics/attribution.py` | 🚧 规划中（当前为因子暴露分解，需基准收益） |
 | 项目入口 `main.py` / `run_optimization.py` | 🚧 规划中 |
 
 ## 免责声明

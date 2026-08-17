@@ -114,6 +114,36 @@ class DataSlice:
             idx = pd.DatetimeIndex(idx)
         return idx[~idx.duplicated()]
 
+    def subset(self, start: pd.Timestamp, end: pd.Timestamp) -> "DataSlice":
+        """按时间窗 [start, end]（含两端）裁剪全部数据表，返回新 DataSlice。
+
+        用于 Walk-Forward 的样本内/样本外切分：各表按各自时间索引
+        （kline 为分钟轴，日频表为 trade_date）做范围过滤。
+        """
+        start, end = pd.Timestamp(start), pd.Timestamp(end)
+        # 日级边界（00:00）语义为「含当日全天」：右端取次日的开区间，
+        # 否则分钟级表（行时间均晚于 00:00）会被 `ts <= end` 整日截掉
+        hi = end + pd.Timedelta(days=1) if end == end.normalize() else end
+        fields: Dict[str, Optional[pd.DataFrame]] = {}
+        for name in ("kline", "l2_snapshot", "tick_trades", "index_min",
+                     "breadth", "industry", "macro", "north_margin",
+                     "dragon_tiger", "factors"):
+            df: Optional[pd.DataFrame] = getattr(self, name)
+            if df is None or df.empty:
+                fields[name] = df
+                continue
+            # 事件表/日频表按自身日期键过滤：
+            # 龙虎榜用披露可用日 avail_date，macro/north_margin 用 trade_date，
+            # 其余表按索引时间过滤
+            if name == "dragon_tiger" and "avail_date" in df.columns:
+                ts = df["avail_date"]
+            elif "trade_date" in df.columns:
+                ts = df["trade_date"]
+            else:
+                ts = df.index
+            fields[name] = df[(ts >= start) & (ts < hi)]
+        return DataSlice(**fields, meta=dict(self.meta))
+
     # ---------- 校验 ----------
 
     def validate(self, required_cols: Optional[Dict[str, Iterable[str]]] = None) -> None:
@@ -141,8 +171,12 @@ class DataSlice:
             df = getattr(self, name)
             if df is None or df.empty:
                 continue
-            # 事件表/无固定 schema 的表跳过索引校验
-            if name not in ("dragon_tiger", "factors"):
+            # 事件表与日频外部表跳过索引校验：
+            # - 逐笔成交/龙虎榜为事件表（同秒多笔、同日多条属正常形态）
+            # - macro/north_margin 以 trade_date 列为主键（aligner 按列排序），
+            #   索引可为 RangeIndex；factor 缓存为特征长表（索引即时间）
+            if name not in ("dragon_tiger", "tick_trades", "factors",
+                            "macro", "north_margin"):
                 self._check_index(df, name)
             need = [c for c in rules[name] if c not in df.columns]
             if need:
@@ -161,8 +195,9 @@ class DataSlice:
             raise ValueError(f"{name} 的 index 未按时间升序，请先排序")
         if SYMBOL in df.columns:
             # 长表：同一时间戳可有多行（不同标的），但 (时间戳, symbol) 必须唯一
-            idx_col = df.index.name or "ts"
-            dup = df.reset_index().duplicated(subset=[idx_col, SYMBOL])
+            res = df.reset_index()
+            idx_col = res.columns[0]  # 索引列名（命名索引取原名，未命名取 "index"）
+            dup = res.duplicated(subset=[idx_col, SYMBOL])
             if dup.any():
                 raise ValueError(f"{name} 存在重复的 (时间戳, symbol) 行")
         elif df.index.has_duplicates:

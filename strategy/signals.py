@@ -116,6 +116,7 @@ class SignalSynthesizer:
         chase_window: int = 30,        # Retail_Chase 滚动窗口（分钟）
         rs_window: int = 20,           # RS 相对强度窗口（交易日）
         industry_window: int = 20,     # Industry_MS 窗口（交易日）
+        inst_window: int = 1,          # Inst_Flow 平滑窗口（分钟，1 = 不平滑）
         youzi_chase_th: float = 0.6,   # S_youzi_only 的 Retail_Chase 阈值（规则硬约束）
         # ---- 开仓闸门阈值 ----
         th_global_min: float = 0.0,    # ① 全球层
@@ -144,11 +145,14 @@ class SignalSynthesizer:
             raise ValueError(f"权重之和必须等于 1.0，当前和: {total}")
         if win_hold_max <= 0:
             raise ValueError(f"win_hold_max 必须为正整数，当前: {win_hold_max}")
+        if inst_window < 1:
+            raise ValueError(f"inst_window 必须 >= 1，当前: {inst_window}")
 
         self.w_ofss, self.w_cps, self.w_inst, self.w_north = map(float, weights)
         self.chase_window = chase_window
         self.rs_window = rs_window
         self.industry_window = industry_window
+        self.inst_window = inst_window
         self.youzi_chase_th = youzi_chase_th
 
         self.th_global_min = th_global_min
@@ -314,6 +318,11 @@ class SignalSynthesizer:
 
         out = features.copy()
         axis = features.index
+
+        # WIN_INST：Inst_Flow 平滑窗口（按标的滚动均值，transform 保持原行序）
+        if self.inst_window > 1:
+            out["inst_flow"] = out.groupby(SYMBOL)["inst_flow"].transform(
+                lambda s: s.rolling(self.inst_window, min_periods=1).mean())
 
         agent = self._agent_ms(out)
         out["agent_ms"] = agent
