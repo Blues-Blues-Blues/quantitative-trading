@@ -104,8 +104,10 @@ class AgentProfiling:
             .sum()
             .unstack("bucket")
         )
-        # 数据中可能缺失某些分档（如自定义阈值后无小单），补齐全部桶
-        g = g.reindex(columns=["small", "med", "large", "mega"], fill_value=0.0)
+        # 数据中可能缺失某些分档（如自定义阈值后无小单、或无 mega 大单），
+        # unstack 的交叉单元格为 NaN（该分钟该档无成交 = 净流 0，而非未知）
+        g = g.reindex(columns=["small", "med", "large", "mega"],
+                      fill_value=0.0).fillna(0.0)
         g = g.reset_index().rename(columns={"level_0": "ts"})
 
         retail = g["small"] + self.mid_split * g["med"]
@@ -152,6 +154,9 @@ class AgentProfiling:
     def margin_pressure(self, nm: pd.DataFrame) -> pd.DataFrame:
         """两融压力：融资5日变化率 - 融券5日变化率。
 
+        容错：数据无有效融券余额（如仅含融资余额）时降级为
+        「融资余额变化率」（视融券为 0），保证闸门可用。
+
         :param nm: 日频长表（DatetimeIndex + symbol/trade_date/
             margin_fin_balance/margin_sec_balance 列），已按可用时点对齐
         :return: [trade_date, symbol, margin_pressure]
@@ -159,8 +164,12 @@ class AgentProfiling:
         n = nm.sort_values([SYMBOL, TRADE_DATE]).copy()
         fin_chg = n.groupby(SYMBOL, group_keys=False)["margin_fin_balance"].pct_change(
             self.margin_days)
-        sec_chg = n.groupby(SYMBOL, group_keys=False)["margin_sec_balance"].pct_change(
-            self.margin_days)
+        if "margin_sec_balance" in n.columns and n["margin_sec_balance"].notna().any():
+            sec_chg = n.groupby(SYMBOL, group_keys=False)["margin_sec_balance"].pct_change(
+                self.margin_days)
+        else:
+            logger.warning("数据无有效融券余额，margin_pressure 降级为融资余额变化率")
+            sec_chg = 0.0
         out = n[[TRADE_DATE, SYMBOL]].copy()
         out["margin_pressure"] = fin_chg - sec_chg
         return out

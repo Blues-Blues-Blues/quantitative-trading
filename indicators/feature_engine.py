@@ -16,8 +16,12 @@
 入参注入，便于 Optuna 超参数寻优。
 """
 
+import hashlib
+import json
 import logging
-from typing import Dict, List, Optional
+import os
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -28,6 +32,23 @@ from indicators.environment import Environment
 from indicators.microstructure import MicroStructure
 
 logger = logging.getLogger("indicators.feature_engine")
+
+# ---- 特征持久化缓存（整区间 + 签名 key）----
+# 命中条件 = 参数签名 + 数据指纹 + 区间 + 标的，全部一致才复用，
+# 跳过高耗时的原始逐笔（tick/l2_snapshot）加载与因子重算。
+_CACHE_SCHEMA_VERSION = "3"   # FEATURE_COLS / 因子计算逻辑变化时递增（强制全部失效）
+                              # 1→2：特征数值列统一强制 float64（修复 object dtype 往返不一致）
+                              # 2→3：增量拼接去重改为按行键 (ts, symbol)（索引仅 ts，长表多标）
+                              #      （原按 index 去重会删掉同 ts 的第二个标的 → 数据减半）
+_ALIGN_VERSION = "1"          # TimeAligner 行为变化时递增
+_DEFAULT_CACHE_DIR = (Path(__file__).resolve().parent.parent
+                      / "data" / "feature_cache")
+# 数据指纹扫描目录（用户补充数据后指纹变化 → 旧缓存自动失效）
+_DEFAULT_FINGERPRINT_DIRS = (
+    Path(__file__).resolve().parent.parent / "data" / "data1" / "data",
+    Path(__file__).resolve().parent.parent / "data" / "data2",
+)
+_fingerprint_memo: Dict[str, str] = {}
 
 FEATURE_COLS: List[str] = [
     SYMBOL,
@@ -46,6 +67,9 @@ FEATURE_COLS: List[str] = [
 
 # 日频因子的值列（chip / 北向 / 两融）
 _CHIP_COLS = ["lock_ratio", "accum_delta", "panic_ratio", "drift"]
+
+# 数值特征列（symbol 除外）：缓存往返前统一强制 float64
+_NUMERIC_COLS = [c for c in FEATURE_COLS if c != SYMBOL]
 
 
 class FeatureEngine:
@@ -102,8 +126,12 @@ class FeatureEngine:
         # ---- 龙虎榜 T+1 因子 + 防未来断言 ----
         feat = self._dragon_tiger(feat, aligned, axis)
 
-        # 固定列顺序输出
-        return feat.set_index("ts").reindex(columns=FEATURE_COLS)
+        # 固定列顺序输出；数值列统一 float64——上游 object dtype
+        #（如快照量列）会破坏 parquet 缓存往返一致性，且拖慢下游计算
+        feat = feat.set_index("ts").reindex(columns=FEATURE_COLS)
+        feat[_NUMERIC_COLS] = feat[_NUMERIC_COLS].apply(
+            pd.to_numeric, errors="coerce")
+        return feat
 
     # ------------------------------------------------------------------
     # 分钟级因子
@@ -271,4 +299,186 @@ class FeatureEngine:
                                         name="dragon_tiger/dt_net")
         feat = feat.merge(out[["ts", SYMBOL, "dt_net"]], on=["ts", SYMBOL],
                           how="left")
+        return feat
+
+    # ------------------------------------------------------------------
+    # 持久化缓存（整区间 + 签名 key，命中跳过逐笔加载与因子重算）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serializable(obj: object) -> object:
+        """只保留可序列化的基本类型（过滤 logger 等运行时对象）。"""
+        if isinstance(obj, (int, float, str, bool, type(None))):
+            return obj
+        if isinstance(obj, (list, tuple, set)):
+            return [FeatureEngine._serializable(v) for v in obj]
+        if isinstance(obj, dict):
+            return {str(k): FeatureEngine._serializable(v)
+                    for k, v in obj.items()}
+        return str(obj)
+
+    def _params_signature(self) -> str:
+        """参数签名：agent / micro / env 构造参数 + 行业映射，排序序列化哈希。
+
+        任一窗口 / 阈值参数变化都会改变签名 → 缓存 key 变化 → 自动重算。
+        """
+        payload = {
+            "agent": self._serializable(vars(self.agent)),
+            "micro": self._serializable(vars(self.micro)),
+            "env": self._serializable(vars(self.env)),
+            "symbol_to_industry": self._serializable(dict(self.symbol_to_industry)),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:16]
+
+    @classmethod
+    def data_fingerprint(cls, dirs: Sequence[Path]) -> str:
+        """数据目录指纹：max(mtime_ns) + 总字节数 + 文件数。
+
+        用户补充/修改数据后 mtime 或大小变化 → 指纹变化 → 旧缓存失效。
+        同进程内结果记忆化，避免每次回测重复扫描 3 万文件。
+        """
+        dirs = tuple(str(d) for d in dirs)
+        if dirs in _fingerprint_memo:
+            return _fingerprint_memo[dirs]
+        max_mt, total, n = 0, 0, 0
+        for d in dirs:
+            root = Path(d)
+            if not root.is_dir():
+                continue
+            for base, _, files in os.walk(root):
+                for f in files:
+                    try:
+                        st = (Path(base) / f).stat()
+                    except OSError:
+                        continue
+                    max_mt = max(max_mt, st.st_mtime_ns)
+                    total += st.st_size
+                    n += 1
+        fp = f"{max_mt:x}_{total:x}_{n}"
+        _fingerprint_memo[dirs] = fp
+        return fp
+
+    def cache_file_name(self, start: str, end: str,
+                        symbols: Sequence[str], fp: str) -> str:
+        """结构化缓存文件名（可解析出 start/end，支持增量定位）。
+
+        feat.<schema>.<align>.<params16>.<start>.<end>.<sym8>.<fp16>.parquet
+        """
+        p16 = self._params_signature()
+        sym = hashlib.sha256(
+            ",".join(sorted(symbols)).encode()).hexdigest()[:8]
+        return (f"feat.{_CACHE_SCHEMA_VERSION}.{_ALIGN_VERSION}.{p16}."
+                f"{start}.{end}.{sym}.{fp}.parquet")
+
+    def cache_path(self, ds: DataSlice, fingerprint_dirs=None) -> Optional[Path]:
+        """计算当前 DataSlice 应命中的缓存路径（不含存在性判断）。"""
+        meta = ds.meta
+        start, end = str(meta.get("start", "")), str(meta.get("end", ""))
+        symbols = list(meta.get("symbols", []))
+        if not start or not end or not symbols:
+            return None
+        fp = self.data_fingerprint(fingerprint_dirs or _DEFAULT_FINGERPRINT_DIRS)
+        return (_DEFAULT_CACHE_DIR / self.cache_file_name(start, end, symbols, fp))
+
+    def cache_exists(self, start: str, end: str, symbols: Sequence[str],
+                     fingerprint_dirs=None) -> bool:
+        """预检：该区间+参数+数据指纹下是否存在精确命中缓存（供加载前跳过 tick）。"""
+        fp = self.data_fingerprint(fingerprint_dirs or _DEFAULT_FINGERPRINT_DIRS)
+        p = _DEFAULT_CACHE_DIR / self.cache_file_name(start, end, symbols, fp)
+        return p.exists()
+
+    @staticmethod
+    def _read_features(path: Path) -> pd.DataFrame:
+        feat = pd.read_parquet(path)
+        if "ts" in feat.columns:
+            feat = feat.set_index("ts")
+        # pandas 2.x 读回可能降为 datetime64[us]，与分钟轴（ns）强制对齐
+        feat.index = pd.DatetimeIndex(feat.index).as_unit("ns")
+        return feat.reindex(columns=FEATURE_COLS)
+
+    @staticmethod
+    def _write_features(feat: pd.DataFrame, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        feat.reset_index().rename(columns={"index": "ts"}).to_parquet(
+            path, index=False)
+
+    def _incremental_candidate(self, start: str, end: str,
+                               symbols: Sequence[str], fp: str) -> Optional[Path]:
+        """增量候选：同 参数/对齐/起点/标的/指纹、end 严格更小的旧缓存。
+
+        区间向后延长（同起点、end 变大）时复用旧段，只补算新段。
+        """
+        p16 = self._params_signature()
+        sym = hashlib.sha256(
+            ",".join(sorted(symbols)).encode()).hexdigest()[:8]
+        prefix = f"feat.{_CACHE_SCHEMA_VERSION}.{_ALIGN_VERSION}.{p16}.{start}."
+        best: Optional[Path] = None
+        best_end = ""
+        if _DEFAULT_CACHE_DIR.is_dir():
+            for f in _DEFAULT_CACHE_DIR.glob(f"{prefix}*.parquet"):
+                parts = f.name.split(".")
+                # feat, V, A, p16, start, end, sym, fp, parquet
+                if len(parts) != 9:
+                    continue
+                _, _v, _a, _p, _s, e, s8, f8, _ext = parts
+                if e >= end or s8 != sym or f8 != fp:
+                    continue
+                if e > best_end:
+                    best, best_end = f, e
+        return best
+
+    def compute_cached(self, ds: DataSlice,
+                       fingerprint_dirs: Optional[Sequence[Path]] = None,
+                       cache_dir: Optional[Path] = None) -> pd.DataFrame:
+        """compute() 的持久化缓存版本。
+
+        1. 冒烟数据（meta.smoke）不走缓存（秒级，无需落盘）
+        2. 精确命中（参数+指纹+区间+标的全一致）→ 直接读取，跳过逐笔计算
+        3. 增量命中（同起点向后延长）→ 复用旧段 + 补算新段，替换旧缓存
+        4. 未命中 → 全量计算并落盘
+
+        增量语义说明：日频因子（T-1 ffill）取值依赖整个对齐轴，且分钟
+        因子滚动窗口需要历史前缀，因此新段仍按全区间计算后截取——增量
+        省去的是旧段被重算导致的边界不一致与整表 I/O；计算量仍随总区间
+        增长（真正按日增量需因子层分区改造，后续可做）。
+        """
+        if ds.meta.get("smoke"):
+            return self.compute(ds)
+        meta = ds.meta
+        start, end = str(meta.get("start", "")), str(meta.get("end", ""))
+        symbols = sorted(meta.get("symbols", []))
+        if not start or not end or not symbols:
+            logger.warning("ds.meta 缺少 start/end/symbols，跳过特征缓存走全量计算")
+            return self.compute(ds)
+        fp = self.data_fingerprint(fingerprint_dirs or _DEFAULT_FINGERPRINT_DIRS)
+        cache_dir = Path(cache_dir) if cache_dir else _DEFAULT_CACHE_DIR
+        path = cache_dir / self.cache_file_name(start, end, symbols, fp)
+
+        if path.exists():
+            logger.info("特征缓存命中：%s（直接读取，跳过逐笔计算）", path.name)
+            return self._read_features(path)
+
+        incr = self._incremental_candidate(start, end, symbols, fp)
+        if incr is not None:
+            logger.info("特征缓存增量扩展：%s → %s（复用旧段，补算新段）",
+                        incr.name, path.name)
+            old = self._read_features(incr)
+            new = self.compute(ds)
+            merged = pd.concat([old, new[new.index > old.index.max()]])
+            # 长表行键是 (ts, symbol) 而非 ts：索引仅 ts 的多标表不能用
+            # index 去重（会删掉同 ts 的第二个标的）。按构造旧段与新段
+            # 时间不重叠，这里按行键去重仅为边界安全兜底
+            merged = merged[
+                ~merged.reset_index().duplicated(
+                    subset=["ts", SYMBOL], keep="first").to_numpy()]
+            merged = merged.sort_index()
+            self._write_features(merged, path)
+            incr.unlink(missing_ok=True)  # 新缓存取代旧缓存
+            return merged
+
+        logger.info("特征缓存未命中，全量计算并落盘：%s", path.name)
+        feat = self.compute(ds)
+        self._write_features(feat, path)
         return feat

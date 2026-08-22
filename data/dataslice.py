@@ -200,5 +200,12 @@ class DataSlice:
             dup = res.duplicated(subset=[idx_col, SYMBOL])
             if dup.any():
                 raise ValueError(f"{name} 存在重复的 (时间戳, symbol) 行")
+        elif "industry" in df.columns:
+            # 行业长表：同一时间戳可有多行（不同行业），按 (时间戳, industry) 排重
+            res = df.reset_index()
+            idx_col = res.columns[0]
+            dup = res.duplicated(subset=[idx_col, "industry"])
+            if dup.any():
+                raise ValueError(f"{name} 存在重复的 (时间戳, industry) 行")
         elif df.index.has_duplicates:
             raise ValueError(f"{name} 的 index 存在重复时间戳")

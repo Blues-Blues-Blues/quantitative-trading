@@ -23,6 +23,22 @@ data/strategy/
 data/logs/
 analytics/pictures/
 
+# 真实高频/日频数据（大体积，严禁入库）
+data/data1/
+data/data2/
+*.parquet
+*.h5
+*.pkl
+*.npz
+
+# 特征持久化缓存（整区间 + 签名 key，可随时删除重建）
+data/feature_cache/
+
+# 临时诊断脚本（不入库）
+_diag_*.py
+_probe_*.py
+_verify_*.py
+
 # IDE / 系统
 .idea/
 .vscode/

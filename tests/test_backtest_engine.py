@@ -25,7 +25,8 @@ from engine.execution import ExecutionCost
 from engine.portfolio import Account
 from engine.risk_control import PositionSizer
 from strategy.signals import (
-    ACT_ADD, ACT_BUY, ACT_SELL, SignalSynthesizer, TradingStateMachine,
+    ACT_ADD, ACT_BUY, ACT_DECAY_REDUCE, ACT_SELL, Signal,
+    SignalSynthesizer, TradingStateMachine,
 )
 
 # ----------------------------------------------------------------------
@@ -158,12 +159,12 @@ class TestNextBarFill:
         eng, (log, curve) = run_backtest(ds, signals)
         buys = log[log["reason"] == "filled"]
         buys_buy = buys[buys["side"] == ACT_BUY]
-        # 首个 BUY 信号在 D2 10:00，成交于下一 Bar 10:30 的 open
+        # 首个 BUY 信号在 D0 10:00，成交于下一 Bar 10:30 的 open
         assert not buys_buy.empty
         first = buys_buy.iloc[0]
-        assert first["ts"] == pd.Timestamp("2024-01-04 10:30")
+        assert first["ts"] == pd.Timestamp("2024-01-02 10:30")
         # 成交价 = open × (1 + 滑点)，滑点 > 0
-        open_price = 10.2 * 0.99  # D2 的 open
+        open_price = 10.0 * 0.99  # D0 的 open
         assert first["price"] > open_price
         assert first["shares"] % 100 == 0  # 一手取整
 
@@ -187,11 +188,18 @@ class TestNextBarFill:
 class TestTPlusOne:
 
     def test_t1_lock_then_next_day_sell(self):
-        # D2 10:00 BUY（成交 10:30 当日）；D2 10:30 SELL 信号 → 当日锁仓挂起，
-        # 次日（D3）开盘强制卖出；D3 全天链式因子为负 → 不再重新入场
-        ov = {"2024-01-04 10:30": {"chain_mod": -1.0}}
-        for t in cn_minutes(["2024-01-05"]):
-            ov[f"{t:%Y-%m-%d %H:%M}"] = {"chain_mod": -1.0}
+        # D0 10:00 BUY（成交 10:30 当日）；D0 10:30 SELL 信号 → 当日锁仓挂起，
+        # 次日（D1）开盘强制卖出；D1 起链式因子持续为负 → 不再重新入场。
+        # 注：新架构下需纯度转负（retail/youzi 转正 + inst 转负）才能使 XS<=0。
+        weak = {"chain_mod": -1.0, "inst_flow": -1e5,
+                "retail_flow": 1e8, "youzi_flow": 1e5}
+        ov = {}
+        # D0 10:30 起至最后一日全天弱化：SELL 后不再重新入场
+        for d in _D4:
+            for t in cn_minutes([d]):
+                t = pd.Timestamp(t)
+                if t >= pd.Timestamp("2024-01-02 10:30"):
+                    ov[f"{t:%Y-%m-%d %H:%M}"] = weak
         ds, signals = full_env(dates=_D4, overrides=ov)
         eng, (log, curve) = run_backtest(ds, signals)
 
@@ -200,8 +208,8 @@ class TestTPlusOne:
 
         deferred = log[log["reason"] == "t1_deferred_sell"]
         assert not deferred.empty
-        # 挂起卖出成交于次日（D3）开盘
-        assert deferred.iloc[0]["ts"] == pd.Timestamp("2024-01-05 09:30")
+        # 挂起卖出成交于次日（D1）开盘
+        assert deferred.iloc[0]["ts"] == pd.Timestamp("2024-01-03 09:30")
         assert deferred.iloc[0]["shares"] > 0
 
         # 次日卖出后不再持仓
@@ -233,8 +241,8 @@ class TestLimit:
 
     def test_limit_up_blocks_buy(self):
         ds, signals = full_env()
-        # 使 BUY 撮合 Bar（D2 10:30）盘中触及涨停 → 拒绝买入
-        ts = pd.Timestamp("2024-01-04 10:30")
+        # 使 BUY 撮合 Bar（D0 10:30）盘中触及涨停 → 拒绝买入
+        ts = pd.Timestamp("2024-01-02 10:30")
         ds.kline.loc[ds.kline.index == ts, "high"] = \
             ds.kline.loc[ds.kline.index == ts, "up_limit"]
         eng, (log, _) = run_backtest(ds, signals)
@@ -247,10 +255,12 @@ class TestLimit:
         assert "600000" in eng.account.positions
 
     def test_limit_down_blocks_sell(self):
-        # D3 10:00 SELL 信号（D2 买入已解冻）→ 撮合于 10:30，该 Bar 盘中触及跌停 → 拒绝卖出
+        # D1 10:00 SELL 信号（D0 买入已解冻）→ 撮合于 10:30，该 Bar 盘中触及跌停 → 拒绝卖出
+        weak = {"chain_mod": -1.0, "inst_flow": -1e5,
+                "retail_flow": 1e8, "youzi_flow": 1e5}
         ds, signals = full_env(dates=_D4,
-                               overrides={"2024-01-05 10:00": {"chain_mod": -1.0}})
-        ts = pd.Timestamp("2024-01-05 10:30")
+                               overrides={"2024-01-03 10:00": weak})
+        ts = pd.Timestamp("2024-01-03 10:30")
         ds.kline.loc[ds.kline.index == ts, "low"] = \
             ds.kline.loc[ds.kline.index == ts, "down_limit"]
         eng, (log, _) = run_backtest(ds, signals)
@@ -268,23 +278,34 @@ class TestLimit:
 class TestRiskControl:
 
     def test_insufficient_cash_fifo(self):
-        # 两标的同时 BUY，现金只够第一只 → 第二只拒绝（先到先得）
-        mapping = {"600000": "银行", "000001": "银行"}
-        ds, signals = full_env(symbols=("600000", "000001"), mapping=mapping)
-        sizer = PositionSizer(base_position=0.5, max_single_position=0.6, max_leverage=2.0)
+        # 4 标的同时 BUY（目标权重各 30%），现金只够前 3 只 → 第 4 只拒绝（先到先得）
+        syms = ("600000", "000001", "600036", "601988")
+        mapping = {s: "银行" for s in syms}
+        ds, _ = full_env(symbols=syms, mapping=mapping)
+        sizer = PositionSizer(base_position=0.3, max_single_position=0.3,
+                              max_leverage=2.0)
         account = Account(initial_cash=1e8, max_leverage=2.0)
-        eng, (log, _) = run_backtest(ds, signals, account=account, sizer=sizer)
+        ts = pd.Timestamp("2024-01-02 10:00")
+        sigs = [Signal(s, ts, ACT_BUY, "S_push", {"target_weight": 0.3})
+                for s in syms]
+        eng, (log, _) = run_backtest(ds, sigs, account=account, sizer=sizer)
 
         rejected = log[(log["reason"] == "insufficient_cash")]
         assert not rejected.empty
-        assert log["reason"].isin(["insufficient_cash"]).any()
+        assert rejected["symbol"].tolist() == ["601988"]  # 最后一个被拒
 
     def test_leverage_cap(self):
-        mapping = {"600000": "银行", "000001": "银行"}
-        ds, signals = full_env(symbols=("600000", "000001"), mapping=mapping)
-        sizer = PositionSizer(base_position=0.5, max_single_position=0.6, max_leverage=1.0)
-        account = Account(initial_cash=2e8, max_leverage=1.0)
-        eng, (log, _) = run_backtest(ds, signals, account=account, sizer=sizer)
+        # 4 标的同时 BUY（目标各 30%），无杠杆账户：第 4 只触发总杠杆上限
+        syms = ("600000", "000001", "600036", "601988")
+        mapping = {s: "银行" for s in syms}
+        ds, _ = full_env(symbols=syms, mapping=mapping)
+        sizer = PositionSizer(base_position=0.3, max_single_position=0.3,
+                              max_leverage=1.0)
+        account = Account(initial_cash=1e8, max_leverage=1.0)
+        ts = pd.Timestamp("2024-01-02 10:00")
+        sigs = [Signal(s, ts, ACT_BUY, "S_push", {"target_weight": 0.3})
+                for s in syms]
+        eng, (log, _) = run_backtest(ds, sigs, account=account, sizer=sizer)
 
         rejected = log[(log["reason"] == "leverage_cap")]
         assert not rejected.empty
@@ -391,19 +412,22 @@ class TestOutputs:
         assert log["ts"].is_monotonic_increasing
 
     def test_add_fills_to_target(self):
-        # min_add_interval=2 → 10:00 BUY、11:00 ADD 信号，ADD 成交于 11:30
+        # min_add_interval=2 → D0 10:00 BUY、11:00 ADD 信号；
+        # 11:00 特征增强（mrs/global_mod 抬升）→ target_weight 显著提高，
+        # ADD 差额调仓（Δ > 死区）成交于 11:30
         axis = cn_minutes(_D3)
         ds = DataSlice(kline=mk_kline(axis), index_min=mk_index(axis),
                        breadth=mk_breadth(axis), industry=mk_industry(axis),
                        meta={"symbols": ["600000"]})
-        features = mk_features(axis)
+        features = mk_features(axis, overrides={
+            "2024-01-02 11:00": {"mrs": 10.0, "global_mod": 1.0}})
         syn = SignalSynthesizer(symbol_to_industry=_MAPPING)
         sm = TradingStateMachine(synthesizer=syn, min_add_interval=2)
         signals = sm.run(ds, features)
         eng, (log, _) = run_backtest(ds, signals)
         adds = log[(log["side"] == ACT_ADD) & (log["reason"] == "filled")]
         assert not adds.empty
-        assert adds.iloc[0]["ts"] == pd.Timestamp("2024-01-04 11:30")
+        assert adds.iloc[0]["ts"] == pd.Timestamp("2024-01-02 11:30")
 
     def test_no_signals_flat_curve(self):
         ds, _ = full_env()
@@ -413,13 +437,113 @@ class TestOutputs:
         assert (curve["n_positions"] == 0).all()
 
     def test_full_buy_sell_cycle_reconciles(self):
-        # D2 10:00 BUY（成交 10:30）；D3 14:30 SELL 信号（已解冻）→ 15:00 卖出清仓
-        ds, signals = full_env(dates=_D4,
-                               overrides={"2024-01-05 14:30": {"chain_mod": -1.0}})
+        # D0 10:00 BUY（成交 10:30）；D1 14:30 SELL 信号（次日已解冻）→ 15:00 卖出清仓；
+        # D2/D3 全天弱化 → 不再重新入场。
+        # 新架构下需纯度转负（retail/youzi 转正 + inst 转负）才能使 XS<=0。
+        weak = {"chain_mod": -1.0, "inst_flow": -1e5,
+                "retail_flow": 1e8, "youzi_flow": 1e5}
+        ov = {"2024-01-03 14:30": weak}
+        for d in ("2024-01-04", "2024-01-05"):
+            for t in cn_minutes([d]):
+                ov[f"{t:%Y-%m-%d %H:%M}"] = weak
+        ds, signals = full_env(dates=_D4, overrides=ov)
         eng, (log, curve) = run_backtest(ds, signals)
         sells = log[(log["side"] == ACT_SELL) & (log["reason"] == "signal_sell")]
         assert not sells.empty
-        assert sells.iloc[0]["ts"] == pd.Timestamp("2024-01-05 15:00")
+        assert sells.iloc[0]["ts"] == pd.Timestamp("2024-01-03 15:00")
         assert eng.account.positions == {}
         # 最终权益 ≈ 初始权益（成本拖累，误差 < 0.5%）
         assert eng.account.total_equity == pytest.approx(1e8, rel=0.005)
+
+
+# ----------------------------------------------------------------------
+# 调仓死区（Deadzone Filter）
+# ----------------------------------------------------------------------
+
+class TestDeadzone:
+
+    def test_skips_small_delta_on_holding(self):
+        # 已持仓 ≈0.20，ADD 目标 0.21（|Δ|=0.01 < 死区 0.05）→ 跳过，无成交
+        ds, _ = full_env()
+        ts = pd.Timestamp("2024-01-02 10:00")
+        buy = Signal("600000", ts, ACT_BUY, "S_push", {"target_weight": 0.2})
+        add = Signal("600000", pd.Timestamp("2024-01-03 10:00"), ACT_ADD,
+                     "S_push", {"target_weight": 0.21})
+        eng, (log, _) = run_backtest(ds, [buy, add])
+        filled = log[(log["reason"] == "filled")]
+        assert (filled["side"] == ACT_ADD).sum() == 0  # 死区跳过 ADD
+        assert (filled["side"] == ACT_BUY).sum() == 1  # 建仓正常成交
+
+    def test_exempt_on_new_position(self):
+        # 从 0 建仓豁免死区：小目标权重（0.02 < 死区）也执行
+        ds, _ = full_env()
+        buy = Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY,
+                     "S_push", {"target_weight": 0.02})
+        eng, (log, _) = run_backtest(ds, [buy])
+        filled = log[(log["reason"] == "filled")]
+        assert not filled.empty
+        assert filled.iloc[0]["shares"] > 0
+
+    def test_deadzone_param_validation(self):
+        ds, _ = full_env()
+        with pytest.raises(ValueError):
+            BacktestEngine(Account(1e8), ExecutionCost(), PositionSizer(), ds, [],
+                           deadzone_th=-0.1)
+        with pytest.raises(ValueError):
+            BacktestEngine(Account(1e8), ExecutionCost(), PositionSizer(), ds, [],
+                           deadzone_th=1.5)
+
+
+# ----------------------------------------------------------------------
+# 差额调仓：T+1 顺延 / 跌停跳过
+# ----------------------------------------------------------------------
+
+class TestTargetRebalanceT1:
+
+    def test_sell_t1_deferral_carries_over(self):
+        # D0 10:00 BUY（成交 10:30，当日锁定）；11:00 SELL → T+1 拒绝且顺延；
+        # 次日 D1 解冻后按目标 0 卖出全部（reason t1_deferred_sell）
+        ds, _ = full_env(dates=_D4)
+        buy = Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY,
+                     "S_push", {"target_weight": 0.3})
+        sell = Signal("600000", pd.Timestamp("2024-01-02 11:00"), ACT_SELL,
+                      "S_push", {})
+        eng, (log, _) = run_backtest(ds, [buy, sell])
+        assert not log[(log["reason"] == "t1_lock")].empty
+        deferred = log[(log["reason"] == "t1_deferred_sell")]
+        assert not deferred.empty
+        assert deferred.iloc[0]["ts"] == pd.Timestamp("2024-01-03 09:30")
+        assert deferred.iloc[0]["shares"] > 0
+        assert eng.account.positions == {}
+
+    def test_reduce_t1_deferral_partial(self):
+        # D0 10:00 BUY（成交 10:30）；当日 11:00 DECAY_REDUCE（目标=当前×0.8）
+        # → 可卖 0 顺延；次日解冻后减到目标（非清仓）
+        ds, _ = full_env(dates=_D4)
+        buy = Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY,
+                     "S_push", {"target_weight": 0.3})
+        reduce_ = Signal("600000", pd.Timestamp("2024-01-02 11:00"),
+                         ACT_DECAY_REDUCE, "S_push",
+                         {"target_weight": 0.24, "reduce_fraction": 0.5})
+        eng, (log, _) = run_backtest(ds, [buy, reduce_])
+        assert not log[(log["reason"] == "t1_lock")].empty
+        deferred = log[(log["reason"] == "t1_deferred_sell")]
+        assert not deferred.empty
+        assert eng.account.positions["600000"].shares > 0  # 减仓非清仓
+
+    def test_limit_down_skips_no_pending(self):
+        # D0 10:00 BUY（成交 10:30）；D1 10:00 SELL 撮合于 10:30（跌停）
+        # → 拒绝且不挂起；无顺延卖出记录，持仓保留
+        ds, _ = full_env(dates=_D4)
+        buy = Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY,
+                     "S_push", {"target_weight": 0.3})
+        sell = Signal("600000", pd.Timestamp("2024-01-03 10:00"), ACT_SELL,
+                      "S_push", {})
+        ts_dl = pd.Timestamp("2024-01-03 10:30")
+        ds.kline.loc[ds.kline.index == ts_dl, "low"] = \
+            ds.kline.loc[ds.kline.index == ts_dl, "down_limit"]
+        eng, (log, _) = run_backtest(ds, [buy, sell])
+        assert not log[(log["side"] == ACT_SELL) &
+                       (log["reason"] == "limit_down")].empty
+        assert log[(log["reason"] == "t1_deferred_sell")].empty  # 不挂起
+        assert "600000" in eng.account.positions

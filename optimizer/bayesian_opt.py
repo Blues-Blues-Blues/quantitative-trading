@@ -93,13 +93,37 @@ class StrategyOptimizer:
             th_global_min=float(params["th_global_min"]),
             th_adr_min=float(params["th_adr_min"]),
             win_hold_max=int(params["win_hold_max"]),
+            # ---- 连续评分 ES（SearchSpace 采样，missing 时用默认值降级）----
+            w_es_ms=float(params.get("w_es_ms", 0.4)),
+            w_es_purity=float(params.get("w_es_purity", 0.3)),
+            w_es_mrs=float(params.get("w_es_mrs", 0.3)),
+            es_sigmoid_k=float(params.get("es_sigmoid_k", 3.0)),
+            th_es_entry=float(params.get("th_es_entry", 0.4)),
+            # ---- 连续评分 XS ----
+            th_xs_exit=float(params.get("th_xs_exit", 0.0)),
+            th_xs_reduce=float(params.get("th_xs_reduce", 0.2)),
+            # ---- 连续评分 PS ----
+            time_decay_base=float(params.get("time_decay_base", 0.95)),
+            momentum_exempt=float(params.get("momentum_exempt", 0.015)),
+            cancel_ratio_th=float(params.get("cancel_ratio_th", 0.25)),
+            fund_stability_penalty=float(params.get("fund_stability_penalty", 0.7)),
+            # ---- 状态 / 一票否决 ----
+            th_retail_chase=float(params.get("th_retail_chase", 0.65)),
+            # ---- 目标权重 Target_Weight ----
+            base_weight=float(params.get("base_weight", 0.20)),
+            reduce_step_ratio=float(params.get("reduce_step_ratio", 0.8)),
+            tw_gmod_clip=tuple(
+                float(x) for x in params.get("tw_gmod_clip", (0.2, 1.5))),
+            tw_cmod_clip=tuple(
+                float(x) for x in params.get("tw_cmod_clip", (0.5, 1.5))),
             symbol_to_industry=self.symbol_to_industry,
         )
         sm = TradingStateMachine(synthesizer=syn)
         signals = sm.run(ds, features)
 
         engine = BacktestEngine(
-            Account(**self.account_kwargs), self.cost, self.sizer, ds, signals)
+            Account(**self.account_kwargs), self.cost, self.sizer, ds, signals,
+            deadzone_th=float(params.get("deadzone_th", 0.05)))
         trade_log, equity_curve = engine.run()
         return evaluate(equity_curve, trade_log), engine
 

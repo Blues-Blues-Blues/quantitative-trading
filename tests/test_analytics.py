@@ -26,6 +26,10 @@ from analytics.performance import PerformanceAnalyzer  # noqa: E402
 from analytics.real_time_stream import (  # noqa: E402
     REQUIRED_FIELDS, StreamLogger, to_stream_frame,
 )
+from engine.backtest import BacktestEngine  # noqa: E402
+from engine.execution import ExecutionCost  # noqa: E402
+from engine.portfolio import Account  # noqa: E402
+from engine.risk_control import PositionSizer  # noqa: E402
 from optimizer.bayesian_opt import StrategyOptimizer  # noqa: E402
 from strategy.signals import Signal  # noqa: E402
 
@@ -34,12 +38,18 @@ _MAPPING = {"600000": "银行"}
 
 @pytest.fixture(scope="module")
 def pipeline():
-    """跑通端到端回测：返回 (equity_curve, trade_log)。"""
+    """跑通端到端回测：返回 (equity_curve, trade_log)。
+
+    opt.backtest() 内部已执行过一次 run()，返回的 engine 账户带残留持仓，
+    不能再次 run()。用全新 Account 重建引擎，保证 fixture 拿到干净的曲线与日志。
+    """
     ds = bull_slice()
     opt = StrategyOptimizer(data=ds, symbol_to_industry=_MAPPING,
                             account_kwargs={"initial_cash": 1e8})
     _, engine = opt.backtest(ds, TRADE_PARAMS)
-    log, curve = engine.run()
+    fresh = BacktestEngine(Account(initial_cash=1e8), ExecutionCost(),
+                           PositionSizer(), ds, engine.signals)
+    log, curve = fresh.run()
     return curve, log
 
 

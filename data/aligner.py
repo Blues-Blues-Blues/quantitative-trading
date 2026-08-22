@@ -10,6 +10,12 @@
    日志，绝不中断流程
 4. 提供 verify_no_lookahead 校验工具，可在因子/回测入口做回归断言
 
+「T 日 09:15 前完成切片 + ffill」语义：
+外部日频数据（美股收盘、大宗、美债、亚太）在 A 股 T 日开盘前（09:15）
+已完整披露。align_external 的严格 T-1 asof（external_date < T）即等价于
+「09:15 截断快照 + 向前填充」——T 日盘内任一分钟时点只使用 09:15 前
+已可获取的数据，当日披露值最早于次一交易日使用。
+
 对齐主键：A 股交易时间轴（分钟级 DatetimeIndex，取自 DataSlice.time_axis()）。
 """
 
@@ -66,7 +72,8 @@ class TimeAligner:
         return DataSlice(
             kline=self._sort_dedupe(ds.kline),
             l2_snapshot=self._sort_dedupe(ds.l2_snapshot),
-            tick_trades=self._sort_dedupe(ds.tick_trades),
+            # 逐笔成交为事件表：同秒多笔合法，只排序、不去重（去重会丢真实逐笔）
+            tick_trades=self._sort_only(ds.tick_trades),
             index_min=self._sort_dedupe(ds.index_min),
             breadth=self._with_adr(self._sort_dedupe(ds.breadth)),
             industry=self._sort_dedupe(ds.industry),
@@ -108,6 +115,18 @@ class TimeAligner:
             self.log.warning("外部数据为空，跳过对齐，返回全 NaN 表")
             return pd.DataFrame(index=index, columns=value_cols)
 
+        # 幂等分支：表已被对齐过（index=分钟 DatetimeIndex、无 date_col 列）时
+        # 直接校验值列并返回，避免 real_loader 与 FeatureEngine 双重对齐报 KeyError
+        if date_col not in external.columns and isinstance(
+            external.index, pd.DatetimeIndex
+        ):
+            missing = [c for c in value_cols if c not in external.columns]
+            if missing:
+                raise ValueError(
+                    f"已对齐外部表缺少值列: {missing}（应包含 {value_cols}）"
+                )
+            return external[value_cols].sort_index()
+
         ext = external.copy()
         ext[date_col] = pd.to_datetime(ext[date_col])
         # 整行无效（休市/缺数据）的记录不参与 asof，避免把 NaN 当有效值
@@ -115,6 +134,15 @@ class TimeAligner:
         if ext.empty:
             self.log.warning("外部数据无任何有效值，返回全 NaN 表")
             return pd.DataFrame(index=index, columns=value_cols)
+
+        # 严格数据类型：值列必须为数值（非数值列转换失败置 NaN 并告警）
+        for c in value_cols:
+            if c in ext.columns and not pd.api.types.is_numeric_dtype(ext[c]):
+                before = int(ext[c].notna().sum())
+                ext[c] = pd.to_numeric(ext[c], errors="coerce")
+                self.log.warning(
+                    "外部表列 %s 非数值（%d 行），已强制转数值，非法值置 NaN",
+                    c, before)
 
         ext = (
             ext.sort_values(date_col)
@@ -218,16 +246,30 @@ class TimeAligner:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _sort_only(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        """仅按时间升序排序（事件表用，不去重）。"""
+        if df is None or df.empty:
+            return df
+        return df.sort_index()
+
+    @staticmethod
     def _sort_dedupe(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return df
         # 含 symbol 列的表为长表（同一时间戳对应多只标的），须按 (时间戳, symbol)
         # 去重，否则会把同 ts 的其余标的整行误删（与 DataSlice.validate 语义一致）；
-        # 无 symbol 列的表按时间戳去重即可。
+        # 含 industry 列的表同理按 (时间戳, industry) 去重；
+        # 无 symbol/industry 列的表按时间戳去重即可。
         if SYMBOL in df.columns:
             res = df.reset_index()
             idx_col = res.columns[0]
             keep = ~res.duplicated(subset=[idx_col, SYMBOL], keep="first").to_numpy()
+            df = df[keep]
+        elif "industry" in df.columns:
+            res = df.reset_index()
+            idx_col = res.columns[0]
+            keep = ~res.duplicated(subset=[idx_col, "industry"],
+                                   keep="first").to_numpy()
             df = df[keep]
         else:
             df = df[~df.index.duplicated(keep="first")]

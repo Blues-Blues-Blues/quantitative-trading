@@ -6,18 +6,23 @@
 
 逐 Bar 推进顺序：
     1) T+1 解冻（roll_to_date）：上一交易日买入的份额转为可卖
-    2) 撮合 T+1 挂起卖出（次日开盘强制卖出；跌停则推迟到下一 Bar 再试）
+    2) 撮合 T+1 顺延减仓目标（每 Bar 按当前价换算；可卖不足保留、跌停暂停）
     3) 撮合上一 Bar 收集的信号（先卖后买释放现金；先到先得，现金不足拒绝）
     4) 收集当前 Bar 产生的新信号，留待下一 Bar 撮合
     5) 收盘 mark-to-market 并记录净值曲线
 
-撮合与风控规则：
+撮合与风控规则（基于 Target_Weight 差额调仓）：
+- 动作 → 目标权重：BUY/ADD → metrics['target_weight']；DECAY_REDUCE →
+  metrics['target_weight']（信号层 = simulated × reduce_step_ratio）；
+  SELL → 0（清仓）。HOLD 不触发调仓。
+- 调仓死区：已持仓且 |Target - Current| < deadzone_th 的微调跳过（避免摩擦）；
+  从 0 建仓与强制清仓豁免死区。
+- 目标股数 = (目标权重 × 总权益) 按 Bar 开盘价换算，向下取整 100 股整数倍；
+  加仓受现金（扣除佣金）约束；减仓/清仓以可卖份额为限（T+1），
+  可卖不足时仅卖出最大可卖量，剩余目标权重挂起顺延（每 Bar 再试，跌停暂停）。
 - 涨停（Bar high 触及 up_limit）不可买入；跌停（Bar low 触及 down_limit）不可卖出
-- 买入股数按 100 股整数倍向下取整（一手）
 - 成交价 = open × (1 ± 动态滑点)，成本含佣金/印花税/过户费（见 engine.execution）
 - 单股最大仓位上限与总账户杠杆上限（见 engine.risk_control / engine.portfolio）
-- T+1：当日买入份额当日不可卖；SELL 信号遇 T+1 锁定时挂起，次日开盘强制卖出
-- 平仓卖出以可卖份额为限（当日加仓的份额仍锁定）
 
 输出：完整成交日志 TradeLog 与逐 Bar 持仓净值曲线 EquityCurve。
 """
@@ -33,7 +38,8 @@ from data.dataslice import SYMBOL, DataSlice
 from engine.execution import ExecutionCost
 from engine.portfolio import Account
 from engine.risk_control import PositionSizer
-from strategy.signals import ACT_ADD, ACT_BUY, ACT_SELL, Signal
+from strategy.signals import (
+    ACT_ADD, ACT_BUY, ACT_DECAY_REDUCE, ACT_HOLD, ACT_SELL, Signal)
 
 logger = logging.getLogger("engine.backtest")
 
@@ -85,10 +91,15 @@ class BacktestEngine:
     :param sizer:    PositionSizer 动态仓位与风控
     :param data:     对齐后的 DataSlice（提供 kline 的 open/high/low/amount/涨跌停价）
     :param signals:  Signal 列表（须按 (timestamp, symbol) 升序，来自信号层状态机）
+    :param deadzone_th: 调仓死区（已持仓 |Δ权重| < 该值跳过微调；建仓/清仓豁免）
     """
 
     def __init__(self, account: Account, cost: ExecutionCost, sizer: PositionSizer,
-                 data: DataSlice, signals: Sequence[Signal]) -> None:
+                 data: DataSlice, signals: Sequence[Signal],
+                 deadzone_th: float = 0.05) -> None:
+        if not 0.0 <= deadzone_th < 1.0:
+            raise ValueError(f"deadzone_th 必须在 [0, 1) 区间，当前: {deadzone_th}")
+        self.deadzone_th = deadzone_th
         self.account = account
         self.cost = cost
         self.sizer = sizer
@@ -135,7 +146,7 @@ class BacktestEngine:
         log = TradeLog()
         curve = EquityCurve()
         pending_signals: List[Signal] = []   # 上一 Bar 收集、本 Bar 撮合
-        pending_sells: Dict[str, pd.Timestamp] = {}  # T+1 挂起卖出（symbol → 首次 SELL 时点）
+        pending_targets: Dict[str, float] = {}  # T+1 顺延减仓目标（symbol → 目标权重）
 
         for ts in self._axis:
             date = pd.Timestamp(ts).normalize()
@@ -144,32 +155,26 @@ class BacktestEngine:
             # 1) T+1 解冻：上一交易日买入的份额可卖
             self.account.roll_to_date(date)
 
-            # 2) 撮合 T+1 挂起卖出（次日开盘强制卖出；跌停保留到下个 Bar）
-            for sym in list(pending_sells):
+            # 2) 撮合 T+1 顺延减仓目标（每 Bar 按当前价换算；可卖不足/跌停保留）
+            for sym in list(pending_targets):
                 pos = self.account.positions.get(sym)
                 if pos is None or pos.shares <= 0:
-                    del pending_sells[sym]  # 已无持仓，撤销挂起
+                    del pending_targets[sym]  # 已无持仓，撤销顺延
                     continue
                 if pos.sellable_shares <= 0:
-                    continue  # 当日买入仍未解冻（T+1），保留挂起
+                    continue  # 当日买入仍未解冻（T+1），保留顺延
                 if bar is None or sym not in bar.index:
-                    continue  # 无报价，保留挂起
+                    continue  # 无报价，保留顺延
                 brow = bar.loc[sym]
                 if brow["low"] <= brow["down_limit"]:
-                    log.add(ts=ts, symbol=sym, side=ACT_SELL, price=0.0, shares=0,
-                            amount=0.0, commission=0.0, stamp_duty=0.0,
-                            transfer_fee=0.0, slippage_bps=0.0,
-                            cash_after=self.account.cash,
-                            equity_after=self.account.total_equity,
-                            reason="limit_down")
-                    continue  # 跌停不可卖，继续挂起
-                self._execute_sell(sym, ts, brow, pos.sellable_shares,
-                                   reason="t1_deferred_sell", log=log)
-                del pending_sells[sym]
+                    continue  # 跌停暂停，保留顺延
+                self._execute_sell_to_target(
+                    sym, pending_targets[sym], ts, brow,
+                    pending_targets, log, reason="t1_deferred_sell")
 
             # 3) 撮合上一 Bar 的信号（下一 Bar 开盘价；先到先得）
             for sig in pending_signals:
-                self._execute(sig, ts, bar, pending_sells, log)
+                self._execute(sig, ts, bar, pending_targets, log)
             pending_signals = []
 
             # 4) 收集本 Bar 新信号 → 下一 Bar 撮合
@@ -197,69 +202,121 @@ class BacktestEngine:
         return log.to_frame(), curve.to_frame()
 
     # ------------------------------------------------------------------
-    # 信号撮合
+    # 信号撮合（基于 Target_Weight 差额调仓）
     # ------------------------------------------------------------------
 
     def _execute(self, sig: Signal, ts: pd.Timestamp, bar: Optional[pd.DataFrame],
-                 pending_sells: Dict[str, pd.Timestamp], log: TradeLog) -> None:
-        """撮合单个信号（成交于 Bar ts 的开盘价）。"""
+                 pending_targets: Dict[str, float], log: TradeLog) -> None:
+        """撮合单个信号（成交于 Bar ts 的开盘价）。
+
+        HOLD 不触发调仓；BUY/ADD/DECAY_REDUCE/SELL 映射为目标权重后差额调仓。
+        """
         sym = sig.symbol
         if bar is None or sym not in bar.index:
             self._log_reject(log, ts, sym, sig.action, "no_quote")
             return
+        if sig.action == ACT_HOLD:
+            return  # HOLD：目标权重仅作监控，不调仓
         brow = bar.loc[sym]
+        pos = self.account.positions.get(sym)
+        current_weight = (pos.shares * float(brow["open"]) / self.account.total_equity
+                          if pos is not None and pos.shares > 0 else 0.0)
+        target = self._target_for(sig, current_weight)
+        self._rebalance(sym, target, sig.action, ts, brow, pending_targets, log)
 
+    def _target_for(self, sig: Signal, current_weight: float) -> float:
+        """动作 → 目标权重。
+
+        - SELL → 0（清仓）
+        - BUY/ADD/DECAY_REDUCE → metrics['target_weight']
+          （信号层已按 ES/PS 与 simulated_weight 计算）
+        - 缺失降级：BUY/ADD 用 PositionSizer 公式；DECAY_REDUCE 用
+          与信号层一致的减仓比例（reduce_step_ratio，默认 0.8）按当前权重
+          折减，保证外部信号链路不中断。
+        """
+        if sig.action == ACT_SELL:
+            return 0.0
+        metrics = sig.metrics or {}
+        tw = metrics.get("target_weight")
+        if tw is not None and not pd.isna(tw):
+            return float(tw)
         if sig.action in (ACT_BUY, ACT_ADD):
-            self._execute_buy(sig, ts, brow, log)
-        elif sig.action == ACT_SELL:
-            self._execute_sell_signal(sig, ts, brow, pending_sells, log)
-        # ACT_HOLD：无操作，不记录
+            return self.sizer.target_ratio(metrics)
+        if sig.action == ACT_DECAY_REDUCE:
+            ratio = float(metrics.get("reduce_step_ratio", 0.8))
+            return max(0.0, current_weight * ratio)
+        return current_weight
+
+    def _rebalance(self, sym: str, target: float, action: str, ts: pd.Timestamp,
+                   brow: pd.Series, pending_targets: Dict[str, float],
+                   log: TradeLog) -> None:
+        """把该标的目标权重收敛到 target（死区 / 涨跌停 / T+1 约束）。"""
+        equity = self.account.total_equity
+        pos = self.account.positions.get(sym)
+        open_price = float(brow["open"])
+        current_weight = (pos.shares * open_price / equity
+                          if pos is not None and pos.shares > 0 else 0.0)
+        delta = target - current_weight
+
+        # 调仓死区：已持仓的微调（|Δ| < deadzone_th）跳过，避免交易摩擦；
+        # 从 0 建仓（current==0）与强制清仓（target==0）豁免。
+        if target > 0.0 and current_weight > 0.0 and abs(delta) < self.deadzone_th:
+            return
+
+        if delta > 0.0:  # 建仓 / 加仓
+            if brow["high"] >= brow["up_limit"]:
+                self._log_reject(log, ts, sym, action, "limit_up")
+                return
+            self._execute_buy_to_target(sym, target, action, ts, brow, log)
+        elif delta < 0.0:  # 减仓 / 清仓
+            if brow["low"] <= brow["down_limit"]:
+                self._log_reject(log, ts, sym, action, "limit_down")
+                return
+            reason = "signal_sell" if action == ACT_SELL else "decay_reduce"
+            self._execute_sell_to_target(sym, target, ts, brow, pending_targets,
+                                         log, reason=reason)
 
     # ------------------------------------------------------------------
     # 买入 / 加仓
     # ------------------------------------------------------------------
 
-    def _execute_buy(self, sig: Signal, ts: pd.Timestamp, brow: pd.Series,
-                     log: TradeLog) -> None:
-        sym = sig.symbol
+    def _execute_buy_to_target(self, sym: str, target: float, action: str,
+                               ts: pd.Timestamp, brow: pd.Series,
+                               log: TradeLog) -> None:
+        """按目标权重加仓：目标市值 = target × equity，补足差额（100 股整数倍）。
+
+        受单股上限 / 总杠杆 / 当前可用现金（扣除佣金过户费）约束。
+        """
         open_price = float(brow["open"])
         bar_amount = float(brow["amount"])
-
-        # 涨跌停：盘中触及涨停不可买入
-        if brow["high"] >= brow["up_limit"]:
-            self._log_reject(log, ts, sym, sig.action, "limit_up")
-            return
-
         equity = self.account.total_equity
-        target = self.sizer.target_value(equity, sig.metrics or {})
-
-        # 加仓 = 补足目标市值差额；新建仓 = 目标市值
+        target_value = target * equity
         pos = self.account.positions.get(sym)
         current_value = pos.shares * open_price if pos is not None else 0.0
-        order_value = max(0.0, target - current_value)
+        order_value = max(0.0, target_value - current_value)
         if order_value <= 1e-6:
-            return  # 已满仓，无需加仓
+            return  # 已满目标，无需加仓
 
         # 单股上限：超过则裁剪至上限
         ok, reason = self.sizer.check_single_position(equity, current_value, order_value)
         if not ok:
             order_value = max(0.0, self.sizer.max_single_position * equity - current_value)
             if order_value <= 1e-6:
-                self._log_reject(log, ts, sym, sig.action, reason)
+                self._log_reject(log, ts, sym, action, reason)
                 return
 
         # 总杠杆上限
         ok, reason = self.sizer.check_leverage(
             equity, self.account.position_value, order_value)
         if not ok:
-            self._log_reject(log, ts, sym, sig.action, reason)
+            self._log_reject(log, ts, sym, action, reason)
             return
 
-        # 动态滑点成交价
+        # 动态滑点成交价 + 100 股整数倍
         price0 = self.cost.buy_price(open_price, order_value, bar_amount)
-        shares = int(order_value / (price0 * 100.0)) * 100  # 100 股整数倍
+        shares = int(order_value / (price0 * 100.0)) * 100
         if shares <= 0:
-            self._log_reject(log, ts, sym, sig.action, "small_order")
+            self._log_reject(log, ts, sym, action, "small_order")
             return
 
         amount = shares * price0
@@ -268,11 +325,11 @@ class BacktestEngine:
 
         # 现金检查（先到先得：现金不足直接拒绝）
         if total_cost > self.account.cash + 1e-6:
-            self._log_reject(log, ts, sym, sig.action, "insufficient_cash")
+            self._log_reject(log, ts, sym, action, "insufficient_cash")
             return
 
         self.account.buy(sym, ts, price0, shares, total_cost)
-        log.add(ts=ts, symbol=sym, side=sig.action, price=price0, shares=shares,
+        log.add(ts=ts, symbol=sym, side=action, price=price0, shares=shares,
                 amount=amount, commission=commission, stamp_duty=0.0,
                 transfer_fee=transfer,
                 slippage_bps=self.cost.slippage_bps(order_value, bar_amount),
@@ -283,27 +340,40 @@ class BacktestEngine:
     # 卖出
     # ------------------------------------------------------------------
 
-    def _execute_sell_signal(self, sig: Signal, ts: pd.Timestamp, brow: pd.Series,
-                             pending_sells: Dict[str, pd.Timestamp], log: TradeLog) -> None:
-        sym = sig.symbol
+    def _execute_sell_to_target(self, sym: str, target: float, ts: pd.Timestamp,
+                                brow: pd.Series, pending_targets: Dict[str, float],
+                                log: TradeLog, reason: str = "signal_sell") -> None:
+        """按目标权重减仓：目标股数 = target × equity 换算，卖出差额。
+
+        A 股 T+1：卖出以可卖份额为限（当日买入不可卖）；可卖不足时
+        仅卖出最大可卖量，剩余目标权重挂起顺延（每 Bar 再试）。
+        """
         pos = self.account.positions.get(sym)
         if pos is None or pos.shares <= 0:
+            pending_targets.pop(sym, None)
             self._log_reject(log, ts, sym, ACT_SELL, "no_position")
             return
 
-        # T+1：当日买入份额不可卖 → 挂起，次日开盘强制卖出
-        if pos.sellable_shares <= 0:
-            pending_sells[sym] = sig.timestamp
+        open_price = float(brow["open"])
+        target_shares = int(target * self.account.total_equity
+                            / (open_price * 100.0)) * 100  # 100 股整数倍
+        sell_shares = pos.shares - target_shares
+        if sell_shares <= 0:
+            pending_targets.pop(sym, None)  # 已达成目标，撤销顺延
+            return
+
+        sell_shares = min(sell_shares, pos.sellable_shares)
+        if sell_shares <= 0:
+            pending_targets[sym] = target  # T+1 锁定 → 顺延
             self._log_reject(log, ts, sym, ACT_SELL, "t1_lock")
             return
 
-        # 跌停不可卖出（不挂起：后续若再有 SELL 信号会重新触发）
-        if brow["low"] <= brow["down_limit"]:
-            self._log_reject(log, ts, sym, ACT_SELL, "limit_down")
-            return
-
-        # 平仓：卖出全部可卖份额（当日加仓的锁定份额保留）
-        self._execute_sell(sym, ts, brow, pos.sellable_shares, reason="signal_sell", log=log)
+        self._execute_sell(sym, ts, brow, sell_shares, reason=reason, log=log)
+        after = self.account.positions.get(sym)
+        if after is not None and after.shares > target_shares:
+            pending_targets[sym] = target  # 仍有锁定份额未减 → 顺延
+        else:
+            pending_targets.pop(sym, None)
 
     def _execute_sell(self, sym: str, ts: pd.Timestamp, brow: pd.Series,
                       shares: int, reason: str, log: TradeLog) -> None:

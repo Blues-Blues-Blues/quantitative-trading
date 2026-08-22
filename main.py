@@ -21,7 +21,7 @@ import logging
 import os
 import time
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -67,6 +67,20 @@ SMOKE_PARAMS: Dict[str, object] = {
 }
 
 INITIAL_CASH = 1e8
+
+# 真实数据（data1+data2）回测区间与参数：
+# - 与 SMOKE_PARAMS 相同，仅放宽两个环境层闸门——真实数据下
+#   MRS 有真实正负变化（伪指数 z-score），th_mrs_min 放宽到 -0.3；
+#   行业 money_flow 为 T-1 恒定值 → IRS≈0，th_industry_min 放宽到 -0.5 放行。
+REAL_START = "2023-01-03"
+REAL_END = "2024-12-31"
+REAL_PARAMS: Dict[str, object] = {
+    **SMOKE_PARAMS,
+    "th_mrs_min": -0.3,
+    "th_industry_min": -0.5,
+}
+# 真实数据回测股票子集（空列表 = 全部 20 只；指定代码可大幅缩短运行时间）
+REAL_SYMBOLS: List[str] = ["600171", "600460"]
 
 
 # ----------------------------------------------------------------------
@@ -249,43 +263,67 @@ def _tick(t0: float, label: str) -> float:
     return time.perf_counter()
 
 
-def run_smoke() -> None:
-    """执行冒烟测试主流程（各环节串行并打印耗时与状态）。"""
+def run_pipeline(ds: DataSlice, params: Dict[str, object],
+                 symbol_to_industry: Dict[str, str], label: str,
+                 rank_gate=None) -> None:
+    """全链路主流程（数据 → 特征 → 状态机 → 回测 → 绩效 → 绘图 → 检查）。"""
     logger.info("=" * 78)
-    logger.info("全链路冒烟测试启动：%d 个交易日 × %d 只股票（%s）",
-                len(DATES), len(SYMBOLS), "牛→熊 剧情")
+    logger.info("%s全链路启动：%d 只股票（%s）", label, len(ds.symbols()),
+                ds.meta.get("source", "?"))
     logger.info("=" * 78)
     start = time.perf_counter()
     t0 = start
 
-    # ---- 环节 1：Mock 数据构建 ----
-    ds = build_smoke_slice()
+    # ---- 环节 1：数据就绪 ----
     ds.validate()  # schema + 时间索引质量显式校验
-    t0 = _tick(t0, f"Mock 数据构建 + DataSlice.validate（{len(ds.kline)} 根 K 线）")
+    t0 = _tick(t0, f"数据就绪 + DataSlice.validate（{len(ds.kline)} 根 K 线）")
 
     # ---- 环节 2：特征工程（Agent Profiling / Microstructure / Environment）----
     fe = FeatureEngine(
-        micro=MicroStructure(chip_window=int(SMOKE_PARAMS["chip_window"])),
-        symbol_to_industry=SYMBOL_TO_INDUSTRY,
+        micro=MicroStructure(chip_window=int(params["chip_window"])),
+        symbol_to_industry=symbol_to_industry,
     )
-    features = fe.compute(ds)
+    features = fe.compute_cached(ds)
     feat_nan = int(features.isna().sum().sum())
     logger.info("特征工程输出：%d 行 × %d 列，NaN 元素 %d 个（T-1 对齐导致的预期缺失）",
                 len(features), len(FEATURE_COLS), feat_nan)
-    t0 = _tick(t0, "特征工程 FeatureEngine.compute")
+    t0 = _tick(t0, "特征工程 FeatureEngine.compute_cached")
 
     # ---- 环节 3：信号合成 + 多层闸门状态机 ----
     syn = SignalSynthesizer(
-        weights=tuple(SMOKE_PARAMS["weights"]),
-        inst_window=int(SMOKE_PARAMS["inst_window"]),
-        th_ms_bull=float(SMOKE_PARAMS["th_ms_bull"]),
-        th_ms_exit=float(SMOKE_PARAMS["th_ms_exit"]),
-        th_lock=float(SMOKE_PARAMS["th_lock"]),
-        th_purity=float(SMOKE_PARAMS["th_purity"]),
-        th_global_min=float(SMOKE_PARAMS["th_global_min"]),
-        th_adr_min=float(SMOKE_PARAMS["th_adr_min"]),
-        win_hold_max=int(SMOKE_PARAMS["win_hold_max"]),
-        symbol_to_industry=SYMBOL_TO_INDUSTRY,
+        weights=tuple(params["weights"]),
+        inst_window=int(params["inst_window"]),
+        th_ms_bull=float(params["th_ms_bull"]),
+        th_ms_exit=float(params["th_ms_exit"]),
+        th_lock=float(params["th_lock"]),
+        th_purity=float(params["th_purity"]),
+        th_global_min=float(params["th_global_min"]),
+        th_adr_min=float(params["th_adr_min"]),
+        th_mrs_min=float(params.get("th_mrs_min", 0.0)),
+        th_industry_min=float(params.get("th_industry_min", 0.0)),
+        win_hold_max=int(params["win_hold_max"]),
+        # ---- 连续评分 ES / XS / PS 与目标权重（与 StrategyOptimizer 口径一致，
+        #      实盘参数含这些键时透传；SMOKE_PARAMS 缺省走默认值）----
+        w_es_ms=float(params.get("w_es_ms", 0.4)),
+        w_es_purity=float(params.get("w_es_purity", 0.3)),
+        w_es_mrs=float(params.get("w_es_mrs", 0.3)),
+        es_sigmoid_k=float(params.get("es_sigmoid_k", 3.0)),
+        th_es_entry=float(params.get("th_es_entry", 0.4)),
+        th_xs_exit=float(params.get("th_xs_exit", 0.0)),
+        th_xs_reduce=float(params.get("th_xs_reduce", 0.2)),
+        time_decay_base=float(params.get("time_decay_base", 0.95)),
+        momentum_exempt=float(params.get("momentum_exempt", 0.015)),
+        cancel_ratio_th=float(params.get("cancel_ratio_th", 0.25)),
+        fund_stability_penalty=float(params.get("fund_stability_penalty", 0.7)),
+        th_retail_chase=float(params.get("th_retail_chase", 0.65)),
+        base_weight=float(params.get("base_weight", 0.20)),
+        reduce_step_ratio=float(params.get("reduce_step_ratio", 0.8)),
+        tw_gmod_clip=tuple(
+            float(x) for x in params.get("tw_gmod_clip", (0.2, 1.5))),
+        tw_cmod_clip=tuple(
+            float(x) for x in params.get("tw_cmod_clip", (0.5, 1.5))),
+        symbol_to_industry=symbol_to_industry,
+        rank_gate=rank_gate,
     )
     sm = TradingStateMachine(synthesizer=syn)
     signals = sm.run(ds, features)
@@ -336,8 +374,111 @@ def run_smoke() -> None:
     if not all(ok for ok, _ in checks):
         raise SystemExit("冒烟测试未通过，请查看上方 FAIL 项")
     logger.info("=" * 78)
-    logger.info("冒烟测试全部通过 ✅（总耗时 %.3f s）", time.perf_counter() - start)
+    logger.info("%s全链路全部通过 ✅（总耗时 %.3f s）", label,
+                time.perf_counter() - start)
     logger.info("可视化输出：%s", ", ".join(chart_paths))
+
+
+def run_smoke() -> None:
+    """冒烟模式：内置 Mock 数据跑通全链路。"""
+    run_pipeline(build_smoke_slice(), SMOKE_PARAMS,
+                 SYMBOL_TO_INDUSTRY, "冒烟测试")
+
+
+def run_real() -> None:
+    """真实数据模式：data1（万得 L2）+ data2（日频 CSV）→ 全链路回测。
+
+    回测标的由 REAL_SYMBOLS 指定（空列表 = 全部标的）。
+    """
+    from data.real_loader import RealDataLoader
+    loader = RealDataLoader()
+    symbols = loader.discover_symbols()
+    if REAL_SYMBOLS:
+        symbols = [s for s in symbols if s in REAL_SYMBOLS]
+        logger.info("回测股票子集：%s（共 %d 只）", REAL_SYMBOLS, len(symbols))
+    logger.info("真实数据发现 %d 只标的：%s", len(symbols),
+                ", ".join(symbols[:6]) + ("..." if len(symbols) > 6 else ""))
+    # 特征缓存预检（与 run_pipeline 中 FeatureEngine 构造参数一致）：
+    # 命中 → 跳过逐笔成交/快照加载，特征表直接复用
+    fe_probe = FeatureEngine(
+        micro=MicroStructure(chip_window=int(REAL_PARAMS["chip_window"])),
+        symbol_to_industry=loader.symbol_to_industry,
+    )
+    cache_hit = fe_probe.cache_exists(REAL_START, REAL_END, symbols)
+    if cache_hit:
+        logger.info("特征缓存预检命中：跳过 tick/l2_snapshot 加载（%s ~ %s）",
+                    REAL_START, REAL_END)
+    ds = loader.load_slice(symbols, REAL_START, REAL_END, skip_tick=cache_hit)
+    run_pipeline(ds, REAL_PARAMS, loader.symbol_to_industry, "真实数据",
+                 rank_gate=_build_rank_gate(REAL_PARAMS))
+
+
+def _build_rank_gate(params: Dict[str, object]):
+    """按 params 配置构造横截面排序闸门（未配置 → None，闸门关闭）。"""
+    factor = params.get("rank_gate_factor")
+    if not factor:
+        return None
+    from strategy.gates import CrossSectionalRankGate
+    gate = CrossSectionalRankGate(
+        factor=str(factor),
+        top_quantile=float(params.get("rank_gate_top", 0.2)))
+    logger.info("横截面排序闸门开启：%s 需处于昨日全池前 %.0f%%",
+                gate.factor, gate.top_quantile * 100)
+    return gate
+
+
+def run_ic_flow(start: str, end: str,
+                symbols: Optional[List[str]] = None) -> None:
+    """真实数据横截面因子有效性分析（Rank IC / Normal IC / IC_IR / Q1~Q5 分层）。
+
+    需要全股票池（横截面）与逐笔数据（合成因子依赖 tick 因子），
+    未命中特征缓存时计算并落盘，后续重复分析直接复用。
+    """
+    from analytics.ic_analyzer import run_ic_analysis
+    from data.real_loader import RealDataLoader
+    from pathlib import Path
+
+    loader = RealDataLoader()
+    pool = symbols or loader.discover_symbols()
+    logger.info("=" * 78)
+    logger.info("横截面因子有效性分析：%d 只股票（%s ~ %s）", len(pool), start, end)
+    logger.info("=" * 78)
+
+    fe = FeatureEngine(
+        micro=MicroStructure(chip_window=int(REAL_PARAMS["chip_window"])),
+        symbol_to_industry=loader.symbol_to_industry,
+    )
+    if not fe.cache_exists(start, end, pool):
+        logger.info("特征缓存未命中，需加载逐笔数据计算（%s ~ %s）", start, end)
+    ds = loader.load_slice(pool, start, end,
+                           skip_tick=fe.cache_exists(start, end, pool))
+    features = fe.compute_cached(ds)
+
+    res = run_ic_analysis(
+        ds, features, loader.symbol_to_industry, REAL_PARAMS,
+        stock_basic=loader.macro.load_stock_basic_full())
+
+    ic = res["ic_summary"]
+    logger.info("— IC 汇总（Rank IC / IC_IR / t 值 / 胜率）：")
+    for _, r in ic.iterrows():
+        logger.info("  %-13s %-7s IC=%+.4f IC_IR=%+.3f t=%+5.2f 胜率=%3.0f%% 期数=%d",
+                    r["factor"], r["horizon"], r["rank_ic"], r["ic_ir"],
+                    r["t_stat"], r["win_rate"] * 100, r["n_days"])
+
+    q = res["quantile_summary"]
+    logger.info("— Q1~Q5 分层（日频等权，fwd_1d 与 fwd_30m）：")
+    for _, r in q.iterrows():
+        logger.info("  %-13s %-7s Q1=%+.4f Q2=%+.4f Q3=%+.4f Q4=%+.4f Q5=%+.4f "
+                    "spread=%+.4f 单调=%+.2f",
+                    r["factor"], r["horizon"], r["Q1"], r["Q2"], r["Q3"],
+                    r["Q4"], r["Q5"], r["spread"], r["monotonic"])
+
+    out_dir = Path("analytics") / "pictures"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ic.to_csv(out_dir / "ic_summary.csv", index=False)
+    q.to_csv(out_dir / "quantile_summary.csv", index=False)
+    logger.info("IC 结果已导出：%s, %s",
+                out_dir / "ic_summary.csv", out_dir / "quantile_summary.csv")
 
 
 def _plot_smoke_charts(ds: DataSlice) -> List[str]:
@@ -406,26 +547,59 @@ def _status_checks(ds: DataSlice, features: pd.DataFrame,
 
 
 def _verify_no_lookahead(ds: DataSlice, features: pd.DataFrame) -> bool:
-    """日频因子 T-1 可见性二次校验：
-    特征行使用时间必须晚于该行所对应的日频数据可用日（次日 00:00）。"""
-    ts = features.index
-    day_available = ts.normalize()  # T-1 对齐后，当日行只能使用前一交易日数据
-    # 简化复核：首日（无 T-1 数据）的任何日频因子必须全 NaN；
-    # 次日（可用日）起允许出现值。等价于"当日因子不可见当日数据"。
-    first_day = ts.normalize() == ts.normalize()[0]
+    """日频因子 T-1 可见性二次校验。
+
+    口径：T-1 对齐（allow_exact_matches=False）下，A 股时点 T 只能使用
+    外部记录日期严格早于 T 的数据。若数据表含早于窗口起始的历史记录
+    （真实数据通常如此），首日出现日频值是合法的 T-1 值；只有当天
+    无法追溯到更早记录时出现值，才是未来函数。
+    """
+    first_day = pd.Timestamp(features.index.normalize()[0])
+    first_mask = features.index.normalize() == first_day
     daily_cols = ["north_sync", "margin_pressure", "cps", "dt_net"]
     for col in daily_cols:
-        if col in features.columns:
-            v = features.loc[first_day, col]
-            if pd.notna(v).any():
-                return False
+        if col not in features.columns:
+            continue
+        v = features.loc[first_mask, col]
+        if not pd.notna(v).any():
+            continue
+        if not _has_prior_daily_record(ds, col, first_day):
+            return False
     return True
 
 
+def _has_prior_daily_record(ds: DataSlice, col: str, first_day: pd.Timestamp) -> bool:
+    """日频因子 col 在 first_day 出现值，是否有严格早于 first_day 的可用记录。"""
+    if col in ("north_sync", "margin_pressure"):
+        table = ds.north_margin
+    elif col == "dt_net":
+        table = ds.dragon_tiger
+    else:  # cps：由窗口内 tick/kline 计算并经 T-1 对齐，窗口首日不可能有更早数据
+        return False
+    if table is None or table.empty or TRADE_DATE not in table.columns:
+        return False
+    return bool((pd.to_datetime(table[TRADE_DATE]) < first_day).any())
+
+
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="量化交易全链路入口")
+    ap.add_argument("--data", choices=("smoke", "real"), default="smoke",
+                    help="数据来源：smoke=内置 Mock；real=data1+data2 真实数据")
+    ap.add_argument("--analyze-ic", action="store_true",
+                    help="真实数据横截面因子有效性分析（IC/IC_IR/Q1~Q5 分层）")
+    ap.add_argument("--ic-start", default=REAL_START, help="IC 分析起始日")
+    ap.add_argument("--ic-end", default=REAL_END, help="IC 分析结束日")
+    args = ap.parse_args()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-    run_smoke()
+    if args.data == "real":
+        if args.analyze_ic:
+            run_ic_flow(args.ic_start, args.ic_end)
+        else:
+            run_real()
+    else:
+        run_smoke()

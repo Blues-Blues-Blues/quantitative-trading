@@ -147,6 +147,11 @@ class MicroStructure:
             g["big_flow"] = g["big_net"] / (g["turnover"] + _EPS)
             parts.append(g[["ts", SYMBOL, "big_flow"]])
 
+        if not parts:
+            # l2_snapshot 与 tick_trades 均缺失：返回空成分表，
+            # 下游左连接自然得到全 NaN，符合"缺失降级不中断"约定
+            return pd.DataFrame(columns=["ts", SYMBOL, "obi", "ar",
+                                         "cancel_ratio", "big_flow"])
         out = parts[0]
         for p in parts[1:]:
             out = out.merge(p, on=["ts", SYMBOL], how="outer")

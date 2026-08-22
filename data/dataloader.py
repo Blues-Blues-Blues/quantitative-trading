@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from data import storage
-from data.dataslice import DataSlice
+from data.dataslice import DataSlice, SYMBOL, TRADE_DATE
 
 logger = logging.getLogger("data.dataloader")
 
@@ -38,6 +38,10 @@ def _canonicalize_index(df: pd.DataFrame, ts_col: str = "ts") -> pd.DataFrame:
     """把 index/ts 列规整为升序、去重的 DatetimeIndex（index 方式）。
 
     同时将 symbol 列统一为字符串（CSV 回读可能推断为 int）。
+    日频表处理（契约见 DataSlice.validate）：
+    - 无 symbol 的全局日频表（macro 等）以 trade_date 列为 DatetimeIndex；
+    - symbol + trade_date 的日频长表（north_margin/dragon_tiger）保留原索引，
+      日期过滤由 _slice 按 trade_date 列完成（按 index 去重会误删同日多行）。
     """
     if df is None or df.empty:
         return df
@@ -46,8 +50,12 @@ def _canonicalize_index(df: pd.DataFrame, ts_col: str = "ts") -> pd.DataFrame:
         if ts_col in out.columns:
             out[ts_col] = pd.to_datetime(out[ts_col])
             out = out.set_index(ts_col)
-        else:
-            out.index = pd.to_datetime(out.index)
+        elif TRADE_DATE in out.columns:
+            if SYMBOL not in out.columns:
+                # 全局日频表：以 trade_date 作 DatetimeIndex
+                out[TRADE_DATE] = pd.to_datetime(out[TRADE_DATE])
+                out = out.set_index(TRADE_DATE)
+            # symbol+trade_date 长表：保留原索引（避免被去重误删）
     out = out[~out.index.duplicated(keep="first")].sort_index()
     if "symbol" in out.columns:
         out["symbol"] = out["symbol"].astype(str)
@@ -211,8 +219,12 @@ class FileDataLoader(DataLoader):
             return df
         out = _canonicalize_index(df)
         s, e = pd.Timestamp(start), pd.Timestamp(end)
-        # 按自然日过滤：end 是当天 00:00，需用日期（normalize）比较以保留盘中数据
-        dates = out.index.normalize()
+        # 按自然日过滤：end 是当天 00:00，需用日期（normalize）比较以保留盘中数据；
+        # 日频表以 trade_date 列为主键过滤（索引可为 RangeIndex）
+        if TRADE_DATE in out.columns:
+            dates = pd.to_datetime(out[TRADE_DATE]).dt.normalize()
+        else:
+            dates = out.index.normalize()
         out = out[(dates >= s) & (dates <= e)]
         if by_symbol and symbols and "symbol" in out.columns:
             # CSV 回读可能把纯数字代码推断为 int，统一转字符串再比较

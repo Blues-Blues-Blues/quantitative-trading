@@ -223,12 +223,13 @@ def _summarize_attribution(trades_df: pd.DataFrame) -> pd.DataFrame:
     for factor in ATTRIBUTION_FACTORS + ["other"]:
         name = ATTRIBUTION_NAMES.get(factor, "other")
         if factor == "other":
-            mask = trades_df["factor"] == "other"
+            # 无平仓交易时 trades_df 为空（零列），须先短路避免取列 KeyError
+            mask = trades_df["factor"] == "other" if len(trades_df) else None
             pnl = float(trades_df.loc[mask, "pnl"].sum()) if len(trades_df) else 0.0
-            n = int(mask.sum())
+            n = int(mask.sum()) if mask is not None else 0
         else:
             pnl = float(trades_df[f"pnl_{factor}"].sum()) if len(trades_df) else 0.0
-            n = int((trades_df["factor"] == factor).sum())
+            n = int((trades_df["factor"] == factor).sum()) if len(trades_df) else 0
         rows.append({"factor": name, "pnl": pnl,
                      "weight": (pnl / total if total != 0.0 else float("nan")),
                      "n_trades": n})
