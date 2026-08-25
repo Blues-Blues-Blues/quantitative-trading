@@ -17,8 +17,10 @@
     python main.py
 """
 
+import hashlib
 import logging
 import os
+import pickle
 import time
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
@@ -68,16 +70,34 @@ SMOKE_PARAMS: Dict[str, object] = {
 
 INITIAL_CASH = 1e8
 
+def _signals_cache_path(ds: DataSlice, params: Dict[str, object],
+                        label: str) -> str:
+    """信号落盘缓存路径：以 区间+标的+参数 为键（任一变化即失效）。"""
+    meta = getattr(ds, "meta", {}) or {}
+    key = hashlib.md5(
+        f"{label}|{meta.get('start')}|{meta.get('end')}"
+        f"|{','.join(sorted(meta.get('symbols', ['?'])))}"
+        f"|{sorted((str(k), repr(v)) for k, v in params.items())}"
+        .encode("utf-8")).hexdigest()[:16]
+    return os.path.join("data", "feature_cache", f"signals_{key}.pkl")
+
+
+def _window_end_str(params: Dict[str, object]) -> str:
+    """reversal_window_end 透传：直接给定则原样；给定 reversal_window_span
+    （09:30 起分钟数，寻优用）则换算为 HH:MM。"""
+    if "reversal_window_end" in params:
+        return str(params["reversal_window_end"])
+    span = int(params.get("reversal_window_span", 30))
+    total = 9 * 60 + 30 + span
+    return f"{total // 60:02d}:{total % 60:02d}"
+
 # 真实数据（data1+data2）回测区间与参数：
-# - 与 SMOKE_PARAMS 相同，仅放宽两个环境层闸门——真实数据下
-#   MRS 有真实正负变化（伪指数 z-score），th_mrs_min 放宽到 -0.3；
-#   行业 money_flow 为 T-1 恒定值 → IRS≈0，th_industry_min 放宽到 -0.5 放行。
+# （旧"放宽环境层闸门"（th_mrs_min/th_industry_min）已随二值化闸门废除而移除，
+#   与寻优链路参数集合保持一致，保证寻优结果可在实盘复现。）
 REAL_START = "2023-01-03"
 REAL_END = "2024-12-31"
 REAL_PARAMS: Dict[str, object] = {
     **SMOKE_PARAMS,
-    "th_mrs_min": -0.3,
-    "th_industry_min": -0.5,
 }
 # 真实数据回测股票子集（空列表 = 全部 20 只；指定代码可大幅缩短运行时间）
 REAL_SYMBOLS: List[str] = ["600171", "600460"]
@@ -293,15 +313,17 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
     syn = SignalSynthesizer(
         weights=tuple(params["weights"]),
         inst_window=int(params["inst_window"]),
-        th_ms_bull=float(params["th_ms_bull"]),
-        th_ms_exit=float(params["th_ms_exit"]),
-        th_lock=float(params["th_lock"]),
-        th_purity=float(params["th_purity"]),
-        th_global_min=float(params["th_global_min"]),
-        th_adr_min=float(params["th_adr_min"]),
+        # 兼容参数（旧二值化闸门，决策链不再读取；SearchSpace 已停止采样，
+        # 此处 .get 兜底仅保历史配置/外部脚本兼容）
+        th_ms_bull=float(params.get("th_ms_bull", 0.0)),
+        th_ms_exit=float(params.get("th_ms_exit", -0.1)),
+        th_lock=float(params.get("th_lock", 0.5)),
+        th_purity=float(params.get("th_purity", 0.0)),
+        th_global_min=float(params.get("th_global_min", 0.0)),
+        th_adr_min=float(params.get("th_adr_min", 1.0)),
         th_mrs_min=float(params.get("th_mrs_min", 0.0)),
         th_industry_min=float(params.get("th_industry_min", 0.0)),
-        win_hold_max=int(params["win_hold_max"]),
+        win_hold_max=int(params.get("win_hold_max", 240)),
         # ---- 连续评分 ES / XS / PS 与目标权重（与 StrategyOptimizer 口径一致，
         #      实盘参数含这些键时透传；SMOKE_PARAMS 缺省走默认值）----
         w_es_ms=float(params.get("w_es_ms", 0.4)),
@@ -309,10 +331,17 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
         w_es_mrs=float(params.get("w_es_mrs", 0.3)),
         es_sigmoid_k=float(params.get("es_sigmoid_k", 3.0)),
         th_es_entry=float(params.get("th_es_entry", 0.4)),
-        th_xs_exit=float(params.get("th_xs_exit", 0.0)),
-        th_xs_reduce=float(params.get("th_xs_reduce", 0.2)),
-        time_decay_base=float(params.get("time_decay_base", 0.95)),
-        momentum_exempt=float(params.get("momentum_exempt", 0.015)),
+        th_xs_exit=float(params.get("th_xs_exit", -0.3)),
+        th_xs_reduce_high=float(params.get("th_xs_reduce_high", 0.2)),
+        th_xs_crash=float(params.get("th_xs_crash", -0.6)),
+        th_reversal_gap=float(params.get("th_reversal_gap", -0.015)),
+        th_reversal_ofss=float(params.get("th_reversal_ofss", 0.2)),
+        reversal_add_mult=float(params.get("reversal_add_mult", 0.5)),
+        reversal_window_end=_window_end_str(params),
+        base_decay_rate=float(params.get("base_decay_rate", 0.95)),
+        win_decay_grace=int(params.get("win_decay_grace", 30)),
+        pnl_decay_profit_mult=float(params.get("pnl_decay_profit_mult", 0.5)),
+        pnl_decay_loss_mult=float(params.get("pnl_decay_loss_mult", 2.0)),
         cancel_ratio_th=float(params.get("cancel_ratio_th", 0.25)),
         fund_stability_penalty=float(params.get("fund_stability_penalty", 0.7)),
         th_retail_chase=float(params.get("th_retail_chase", 0.65)),
@@ -326,7 +355,24 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
         rank_gate=rank_gate,
     )
     sm = TradingStateMachine(synthesizer=syn)
-    signals = sm.run(ds, features)
+    cache_path = _signals_cache_path(ds, params, label)
+    signals = None
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                signals = pickle.load(f)
+            logger.info("信号缓存命中：%s（%d 个信号）", cache_path, len(signals))
+        except Exception as exc:  # noqa: BLE001 缓存损坏则重算
+            logger.warning("信号缓存读取失败，将重新计算：%s", exc)
+            signals = None
+    if signals is None:
+        signals = sm.run(ds, features)
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump(signals, f)
+            logger.info("信号缓存已写入：%s", cache_path)
+        except Exception as exc:  # noqa: BLE001 缓存写失败不影响回测
+            logger.warning("信号缓存写入失败（不影响回测）：%s", exc)
     act_cnt = Counter(s.action for s in signals)
     logger.info("状态机输出：%d 个信号 → %s", len(signals),
                 {k: act_cnt[k] for k in (ACT_BUY, ACT_ADD, ACT_SELL, "HOLD")})
@@ -519,20 +565,51 @@ def _status_checks(ds: DataSlice, features: pd.DataFrame,
         _verify_no_lookahead(ds, features),
         "无未来函数（龙虎榜 T+1 断言 + 日频因子 T-1 对齐二次校验）"))
 
-    # 3) 无 T+1 违规：SELL 成交不得发生在买入当日（当日买入份额必须冻结）。
+    # 3) 无 T+1 违规：当日卖出总量不得超过当日开盘可卖持仓
+    #   （当日买入份额必须冻结；允许"当日卖旧仓 + 当日买新仓"——
+    #    旧口径按「当日有买入又有卖出」粗判会误报）。
     sells = filled[filled["side"] == "SELL"]
     t1_ok = True
-    for _, row in sells.iterrows():
-        buys = filled[(filled["side"].isin(("BUY", "ADD"))) &
-                      (filled["symbol"] == row["symbol"]) &
-                      (filled["ts"] <= row["ts"])]
-        if buys.empty:
-            continue
-        last_buy_day = pd.Timestamp(buys["ts"].max()).normalize()
-        if pd.Timestamp(row["ts"]).normalize() == last_buy_day:
-            t1_ok = False
-            break
-    checks.append((t1_ok, "无 T+1 违规（SELL 均发生在买入次日起）"))
+    t1_detail: Optional[str] = None
+    t_trace: Dict[str, List[str]] = {}
+
+    def _trace(sym: str, s: str) -> None:
+        lst = t_trace.setdefault(sym, [])
+        lst.append(s)
+        del lst[:-20]
+
+    hold: Dict[str, int] = {}          # 累计持仓（按成交重放）
+    open_hold: Dict[str, int] = {}     # 当日开盘可卖 = 前一日收盘持仓
+    sold_today: Dict[str, int] = {}    # 当日已卖出
+    cur_day: Optional[pd.Timestamp] = None
+    for _, tr in filled.sort_values("ts").iterrows():
+        sym = str(tr["symbol"])
+        day = pd.Timestamp(tr["ts"]).normalize()
+        if day != cur_day:
+            cur_day, open_hold, sold_today = day, dict(hold), {}
+        side = str(tr["side"])
+        shares = int(tr["shares"])
+        if side in ("BUY", "ADD"):
+            hold[sym] = hold.get(sym, 0) + shares
+            _trace(sym, f"{tr['ts']} {side}+{shares}→hold{hold[sym]}")
+        elif side == "SELL":
+            sold_today[sym] = sold_today.get(sym, 0) + shares
+            if sold_today[sym] > open_hold.get(sym, 0):
+                t1_ok = False
+                rows = filled[(filled["symbol"] == sym)]
+                rows = rows[rows.index <= tr.name].sort_values("ts")
+                rows_text = "; ".join(
+                    f"{r['ts']} {r['side']} {int(r['shares'])}"
+                    for _, r in rows.tail(40).iterrows())
+                t1_detail = (f"{tr['ts']} {sym} SELL {shares} 股，当日已卖 "
+                             f"{sold_today[sym]} > 开盘可卖 "
+                             f"{int(open_hold.get(sym, 0))}（{sym} 成交轨迹: {rows_text}）")
+                break
+            hold[sym] = hold.get(sym, 0) - shares
+            _trace(sym, f"{tr['ts']} {side}-{shares}→hold{hold[sym]}"
+                        f"/日卖{sold_today[sym]}")
+    checks.append((t1_ok, "无 T+1 违规（当日卖出 ≤ 当日开盘可卖持仓）"
+                   + ("" if t1_ok else f"；首违：{t1_detail}")))
 
     # 4) 无空指针/空引用：关键产物非空且列完整
     checks.append((len(equity_curve) > 0 and {"cash", "total_equity"} <=
@@ -591,10 +668,17 @@ if __name__ == "__main__":
     ap.add_argument("--ic-start", default=REAL_START, help="IC 分析起始日")
     ap.add_argument("--ic-end", default=REAL_END, help="IC 分析结束日")
     args = ap.parse_args()
+    # 统一日志目录（data/logs 已在 .gitignore 排除）：控制台 + 追加写入 run.log，
+    # 目录不存在自动创建；日志格式与内容与原来一致。
+    _log_dir = os.path.join("data", "logs")
+    os.makedirs(_log_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(),
+                  logging.FileHandler(os.path.join(_log_dir, "run.log"),
+                                      encoding="utf-8")],
     )
     if args.data == "real":
         if args.analyze_ic:

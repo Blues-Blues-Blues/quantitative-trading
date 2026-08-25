@@ -17,7 +17,7 @@ best() 会回退为按目标值（年化 Sharpe）最优的 trial 兜底返回�
 """
 
 import logging
-
+import os
 import optuna
 
 from analytics.metrics import constraint_violations
@@ -36,15 +36,11 @@ N_TRIALS = 3  # 冒烟版仅跑 2~3 次 Trial
 
 
 def _build_search_space() -> SearchSpace:
-    """窄搜索空间：适配 6 天冒烟数据（chip_window 小 → CPS 更快可用；
-    th_ms_bull 放宽 → 保证部分 trial 能产生真实成交）。"""
+    """窄搜索空间：适配 6 天冒烟数据（chip_window 小 → CPS 更快可用）。"""
     return SearchSpace(
         w_ofss=(0.2, 0.6), w_cps=(0.1, 0.5),
         w_inst=(0.0, 0.4), w_north=(0.0, 0.3),
-        th_ms_bull=(0.0, 0.5), th_ms_exit=(-0.4, -0.05),
-        th_lock=(0.2, 0.8), th_purity=(-0.2, 0.3),
-        th_global_min=(-0.8, -0.2), th_adr_min=(0.3, 0.7),
-        win_inst=(1, 3), win_chip_old=(1, 3), win_hold_max=(10, 120),
+        win_inst=(1, 3), win_chip_old=(1, 3),
     )
 
 
@@ -66,12 +62,8 @@ def _print_trial_detail(study: optuna.Study, opt: StrategyOptimizer,
                     tuple(round(w, 4) for w in weights),
                     f"{sum(weights):.6f}",
                     f"{w_north_derived:.4f}", feasible)
-        logger.info("    阈值注入：th_ms_bull=%.3f th_ms_exit=%.3f th_lock=%.3f "
-                    "th_purity=%.3f th_global_min=%.3f th_adr_min=%.3f",
-                    params["th_ms_bull"], params["th_ms_exit"], params["th_lock"],
-                    params["th_purity"], params["th_global_min"], params["th_adr_min"])
-        logger.info("    窗口注入：inst_window=%d chip_window=%d win_hold_max=%d",
-                    params["inst_window"], params["chip_window"], params["win_hold_max"])
+        logger.info("    窗口注入：inst_window=%d chip_window=%d",
+                    params["inst_window"], params["chip_window"])
         logger.info("    回测评估：有效交易=%d 笔 胜率=%.0f%% 盈亏比=%s 回撤=%.2f%% "
                     "总盈亏=%+.0f 元",
                     metrics["n_trades"],
@@ -123,7 +115,7 @@ def run_optimization_smoke() -> None:
                 {k: round(v, 4) for k, v in best_params.items()
                  if k.startswith("th_")},
                 {k: v for k, v in best_params.items() if k.endswith("_window")
-                 or k == "win_hold_max" or k == "inst_window"})
+                 or k == "inst_window"})
     logger.info("最优指标：Sharpe=%s 有效交易=%d 笔 胜率=%.0f%%",
                 "NaN" if best_metrics["sharpe"] != best_metrics["sharpe"]
                 else f"{best_metrics['sharpe']:.4f}",
@@ -139,9 +131,15 @@ def run_optimization_smoke() -> None:
 
 if __name__ == "__main__":
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    # 统一日志目录（data/logs 已在 .gitignore 排除）：控制台 + 追加写入 run.log
+    log_dir = os.path.join("data", "logs")
+    os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(),
+                  logging.FileHandler(os.path.join(log_dir, "run.log"),
+                                      encoding="utf-8")],
     )
     run_optimization_smoke()

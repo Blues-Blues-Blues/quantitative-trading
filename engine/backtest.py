@@ -254,8 +254,16 @@ class BacktestEngine:
         equity = self.account.total_equity
         pos = self.account.positions.get(sym)
         open_price = float(brow["open"])
+        # 减仓动作防转增仓：空仓无可减直接返回；目标裁剪不超过当前权重。
+        # （信号层 target_weight 基于 simulated_weight，引擎空仓后它仍 >0，
+        #   若放行会被 delta>0 分支误判成「买入回补」——正是 SELL 后
+        #   DECAY_REDUCE 又买回的 T+1 违规根因。）
+        if action == ACT_DECAY_REDUCE and (pos is None or pos.shares <= 0):
+            return
         current_weight = (pos.shares * open_price / equity
                           if pos is not None and pos.shares > 0 else 0.0)
+        if action == ACT_DECAY_REDUCE:
+            target = min(target, current_weight)  # 减仓目标不得超过当前权重
         delta = target - current_weight
 
         # 调仓死区：已持仓的微调（|Δ| < deadzone_th）跳过，避免交易摩擦；
@@ -267,7 +275,8 @@ class BacktestEngine:
             if brow["high"] >= brow["up_limit"]:
                 self._log_reject(log, ts, sym, action, "limit_up")
                 return
-            self._execute_buy_to_target(sym, target, action, ts, brow, log)
+            self._execute_buy_to_target(sym, target, action, ts, brow,
+                                        pending_targets, log)
         elif delta < 0.0:  # 减仓 / 清仓
             if brow["low"] <= brow["down_limit"]:
                 self._log_reject(log, ts, sym, action, "limit_down")
@@ -282,6 +291,7 @@ class BacktestEngine:
 
     def _execute_buy_to_target(self, sym: str, target: float, action: str,
                                ts: pd.Timestamp, brow: pd.Series,
+                               pending_targets: Dict[str, float],
                                log: TradeLog) -> None:
         """按目标权重加仓：目标市值 = target × equity，补足差额（100 股整数倍）。
 
@@ -312,13 +322,15 @@ class BacktestEngine:
             self._log_reject(log, ts, sym, action, reason)
             return
 
-        # 动态滑点成交价 + 100 股整数倍
-        price0 = self.cost.buy_price(open_price, order_value, bar_amount)
-        shares = int(order_value / (price0 * 100.0)) * 100
+        # 动态滑点：先按滑点前开盘价折 100 股整数倍（与卖出侧同基准），
+        # 再以"实际股数 × 滑点前价"作为参与率与费用基准。
+        shares = int(order_value / (open_price * 100.0)) * 100
         if shares <= 0:
             self._log_reject(log, ts, sym, action, "small_order")
             return
 
+        base_amount = shares * open_price  # 滑点前估值（卖侧 est_amount 同口径）
+        price0 = self.cost.buy_price(open_price, base_amount, bar_amount)
         amount = shares * price0
         commission, transfer = self.cost.buy_fees(amount)
         total_cost = amount + commission + transfer
@@ -329,10 +341,11 @@ class BacktestEngine:
             return
 
         self.account.buy(sym, ts, price0, shares, total_cost)
+        pending_targets.pop(sym, None)  # 加仓成交 → 旧顺延清仓目标已失效，撤销
         log.add(ts=ts, symbol=sym, side=action, price=price0, shares=shares,
                 amount=amount, commission=commission, stamp_duty=0.0,
                 transfer_fee=transfer,
-                slippage_bps=self.cost.slippage_bps(order_value, bar_amount),
+                slippage_bps=self.cost.slippage_bps(base_amount, bar_amount),
                 cash_after=self.account.cash,
                 equity_after=self.account.total_equity, reason="filled")
 
@@ -349,9 +362,10 @@ class BacktestEngine:
         仅卖出最大可卖量，剩余目标权重挂起顺延（每 Bar 再试）。
         """
         pos = self.account.positions.get(sym)
+        reject_side = ACT_DECAY_REDUCE if reason == "decay_reduce" else ACT_SELL
         if pos is None or pos.shares <= 0:
             pending_targets.pop(sym, None)
-            self._log_reject(log, ts, sym, ACT_SELL, "no_position")
+            self._log_reject(log, ts, sym, reject_side, "no_position")
             return
 
         open_price = float(brow["open"])
@@ -365,7 +379,7 @@ class BacktestEngine:
         sell_shares = min(sell_shares, pos.sellable_shares)
         if sell_shares <= 0:
             pending_targets[sym] = target  # T+1 锁定 → 顺延
-            self._log_reject(log, ts, sym, ACT_SELL, "t1_lock")
+            self._log_reject(log, ts, sym, reject_side, "t1_lock")
             return
 
         self._execute_sell(sym, ts, brow, sell_shares, reason=reason, log=log)

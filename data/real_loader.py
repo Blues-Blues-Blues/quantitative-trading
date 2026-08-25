@@ -168,10 +168,26 @@ class RealDataLoader:
         k["vwap"] = k["amount"] / denom
         k["vwap"] = k["vwap"].fillna(k["close"])
         k["float_market_cap"] = k["close"] * 1e9  # 假想 10 亿流通股本（相对值即可）
-        k["up_limit"] = (k["close"] * 1.1).round(4)
-        k["down_limit"] = (k["close"] * 0.9).round(4)
+        # 涨跌停价：A 股规则 = T-1 收盘价 × 幅度，T 日内恒定；
+        # 幅度按 ST（±5%）、创业板 300-302 / 科创板 688（±20%）、主板（±10%）区分。
         basic = self.macro.load_stock_basic()
         k["is_st"] = k[SYMBOL].map(lambda s: bool(basic.get(s, False)))
+        # 昨收按 (symbol, 交易日) 取前一日最后收盘（ts 为 index；索引对该 order 独立）
+        kd = k[[SYMBOL, "close"]].copy()
+        kd["date"] = kd.index.normalize()
+        day_last = kd.groupby([SYMBOL, "date"])["close"].last().reset_index()
+        day_last["prev_close"] = day_last.groupby(SYMBOL)["close"].shift(1)
+        _key = pd.MultiIndex.from_arrays([day_last[SYMBOL], day_last["date"]])
+        _pvm = pd.Series(day_last["prev_close"].to_numpy(), index=_key)
+        k_idx = pd.MultiIndex.from_arrays([k[SYMBOL], k.index.normalize()])
+        prev = _pvm.reindex(k_idx).to_numpy()
+        ratio = np.where(
+            k["is_st"], 0.05,
+            np.where(k[SYMBOL].str[:3].isin(("300", "301", "302"))
+                     | k[SYMBOL].str.startswith("688"), 0.20, 0.10))
+        prev = np.where(np.isfinite(prev), prev, k["close"].to_numpy())  # 首日近似
+        k["up_limit"] = np.round(prev * (1.0 + ratio), 2)
+        k["down_limit"] = np.round(prev * (1.0 - ratio), 2)
         return k[KLINE_COLS]
 
     # ------------------------------------------------------------------

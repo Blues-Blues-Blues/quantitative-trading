@@ -40,25 +40,26 @@ class SearchSpace:
         w_cps: Tuple[float, float] = (0.1, 0.5),
         w_inst: Tuple[float, float] = (0.0, 0.4),
         w_north: Tuple[float, float] = (0.0, 0.3),
-        th_ms_bull: Tuple[float, float] = (0.3, 0.8),
-        th_ms_exit: Tuple[float, float] = (-0.4, 0.0),
-        th_lock: Tuple[float, float] = (0.4, 0.8),
-        th_purity: Tuple[float, float] = (0.1, 0.5),
-        th_global_min: Tuple[float, float] = (-0.8, -0.2),
-        th_adr_min: Tuple[float, float] = (0.3, 0.7),
         win_inst: Tuple[int, int] = (1, 20),
         win_chip_old: Tuple[int, int] = (5, 20),
-        win_hold_max: Tuple[int, int] = (10, 120),
         # ---- 连续评分（ES/PS/XS）----
         w_es_ms: Tuple[float, float] = (0.2, 0.6),
         w_es_purity: Tuple[float, float] = (0.1, 0.5),
         w_es_mrs: Tuple[float, float] = (0.1, 0.5),
         es_sigmoid_k: Tuple[float, float] = (1.0, 5.0),
         th_es_entry: Tuple[float, float] = (0.2, 0.6),
-        th_xs_exit: Tuple[float, float] = (-0.2, 0.1),
-        th_xs_reduce: Tuple[float, float] = (0.1, 0.4),
-        time_decay_base: Tuple[float, float] = (0.85, 0.99),
-        momentum_exempt: Tuple[float, float] = (0.005, 0.03),
+        th_xs_exit: Tuple[float, float] = (-0.6, 0.0),
+        th_xs_reduce_high: Tuple[float, float] = (0.1, 0.4),
+        th_xs_crash: Tuple[float, float] = (-0.8, -0.65),
+        # ---- 次日低开反包 ----
+        th_reversal_gap: Tuple[float, float] = (-0.05, -0.005),
+        th_reversal_ofss: Tuple[float, float] = (0.0, 0.4),
+        reversal_add_mult: Tuple[float, float] = (0.3, 1.0),
+        reversal_window_span: Tuple[int, int] = (0, 30),
+        base_decay_rate: Tuple[float, float] = (0.85, 0.99),
+        win_decay_grace: Tuple[int, int] = (15, 60),
+        pnl_decay_profit_mult: Tuple[float, float] = (0.25, 0.75),
+        pnl_decay_loss_mult: Tuple[float, float] = (1.5, 3.0),
         cancel_ratio_th: Tuple[float, float] = (0.1, 0.5),
         fund_stability_penalty: Tuple[float, float] = (0.5, 0.9),
         th_retail_chase: Tuple[float, float] = (0.5, 0.8),
@@ -74,18 +75,23 @@ class SearchSpace:
     ) -> None:
         self.w_ofss, self.w_cps = w_ofss, w_cps
         self.w_inst, self.w_north = w_inst, w_north
-        self.th_ms_bull, self.th_ms_exit = th_ms_bull, th_ms_exit
-        self.th_lock, self.th_purity = th_lock, th_purity
-        self.th_global_min, self.th_adr_min = th_global_min, th_adr_min
         self.win_inst, self.win_chip_old = win_inst, win_chip_old
-        self.win_hold_max = win_hold_max
         # 连续评分
         self.w_es_ms, self.w_es_purity = w_es_ms, w_es_purity
         self.w_es_mrs, self.es_sigmoid_k = w_es_mrs, es_sigmoid_k
         self.th_es_entry = th_es_entry
-        self.th_xs_exit, self.th_xs_reduce = th_xs_exit, th_xs_reduce
-        self.time_decay_base = time_decay_base
-        self.momentum_exempt = momentum_exempt
+        self.th_xs_exit = th_xs_exit
+        self.th_xs_reduce_high = th_xs_reduce_high
+        self.th_xs_crash = th_xs_crash
+        # 反包
+        self.th_reversal_gap = th_reversal_gap
+        self.th_reversal_ofss = th_reversal_ofss
+        self.reversal_add_mult = reversal_add_mult
+        self.reversal_window_span = reversal_window_span
+        self.base_decay_rate = base_decay_rate
+        self.win_decay_grace = win_decay_grace
+        self.pnl_decay_profit_mult = pnl_decay_profit_mult
+        self.pnl_decay_loss_mult = pnl_decay_loss_mult
         self.cancel_ratio_th = cancel_ratio_th
         self.fund_stability_penalty = fund_stability_penalty
         self.th_retail_chase = th_retail_chase
@@ -114,13 +120,6 @@ class SearchSpace:
         params: Dict[str, object] = {
             # 策略层（SignalSynthesizer）
             "weights": (w_ofss, w_cps, w_inst, w_north),
-            "th_ms_bull": trial.suggest_float("th_ms_bull", *self.th_ms_bull),
-            "th_ms_exit": trial.suggest_float("th_ms_exit", *self.th_ms_exit),
-            "th_lock": trial.suggest_float("th_lock", *self.th_lock),
-            "th_purity": trial.suggest_float("th_purity", *self.th_purity),
-            "th_global_min": trial.suggest_float("th_global_min", *self.th_global_min),
-            "th_adr_min": trial.suggest_float("th_adr_min", *self.th_adr_min),
-            "win_hold_max": trial.suggest_int("win_hold_max", *self.win_hold_max),
             # 窗口：WIN_INST → inst_window；WIN_CHIP_OLD → chip_window（因子层）
             "inst_window": trial.suggest_int("win_inst", *self.win_inst),
             "chip_window": trial.suggest_int("win_chip_old", *self.win_chip_old),
@@ -132,12 +131,28 @@ class SearchSpace:
             "th_es_entry": trial.suggest_float("th_es_entry", *self.th_es_entry),
             # 连续评分：XS
             "th_xs_exit": trial.suggest_float("th_xs_exit", *self.th_xs_exit),
-            "th_xs_reduce": trial.suggest_float("th_xs_reduce", *self.th_xs_reduce),
+            "th_xs_reduce_high": trial.suggest_float(
+                "th_xs_reduce_high", *self.th_xs_reduce_high),
+            "th_xs_crash": trial.suggest_float(
+                "th_xs_crash", *self.th_xs_crash),
+            # 次日低开反包
+            "th_reversal_gap": trial.suggest_float(
+                "th_reversal_gap", *self.th_reversal_gap),
+            "th_reversal_ofss": trial.suggest_float(
+                "th_reversal_ofss", *self.th_reversal_ofss),
+            "reversal_add_mult": trial.suggest_float(
+                "reversal_add_mult", *self.reversal_add_mult),
+            "reversal_window_span": trial.suggest_int(
+                "reversal_window_span", *self.reversal_window_span),
             # 连续评分：PS
-            "time_decay_base": trial.suggest_float(
-                "time_decay_base", *self.time_decay_base),
-            "momentum_exempt": trial.suggest_float(
-                "momentum_exempt", *self.momentum_exempt),
+            "base_decay_rate": trial.suggest_float(
+                "base_decay_rate", *self.base_decay_rate),
+            "win_decay_grace": trial.suggest_int(
+                "win_decay_grace", *self.win_decay_grace),
+            "pnl_decay_profit_mult": trial.suggest_float(
+                "pnl_decay_profit_mult", *self.pnl_decay_profit_mult),
+            "pnl_decay_loss_mult": trial.suggest_float(
+                "pnl_decay_loss_mult", *self.pnl_decay_loss_mult),
             "cancel_ratio_th": trial.suggest_float(
                 "cancel_ratio_th", *self.cancel_ratio_th),
             "fund_stability_penalty": trial.suggest_float(

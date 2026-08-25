@@ -28,10 +28,24 @@ BIG_THIN_TH = 0.05           # 盘口变薄：|big_flow| 阈值（近似）
 W_XS_MS = 0.5            # Final_MS 权重
 W_XS_PURITY = 0.3        # Capital_Purity 权重
 W_XS_DRAWDOWN = 0.2      # 回撤权重
-TH_XS_EXIT = 0.0         # XS <= 此值 → 清仓
-TH_XS_REDUCE = 0.2       # XS < 此值 → 阶梯减仓
+TH_XS_EXIT = -0.3           # XS <= 此值 → 常规清仓
+TH_XS_REDUCE_HIGH = 0.2     # XS >= 此值 → 正常持仓按 PS 调仓
+TH_XS_CRASH = -0.6          # XS <= 此值（或一票否决）→ 极速清仓
 REDUCE_FRACTION = 0.5    # 阶梯减仓比例（每步卖出可卖份额的比例）
+
+# ---- 次日低开反包（Reversal / Counter-Attack）----
+TH_REVERSAL_GAP = -0.015   # 深度低开/下探跌幅门槛（<= 此值触发）
+TH_REVERSAL_OFSS = 0.2     # 盘口承接分 OFSS 门槛（委买聚集+主动买盘）
+REVERSAL_ADD_MULT = 0.5    # 反包加仓系数（增量 = base*ES*mult）
+REVERSAL_WINDOW_END = "10:00"  # 反包判定截止时间（受开仓 time 闸门共同约束）
 CIRCUIT_INDEX_DROP = 0.015  # 指数盘中跌破 VWAP 比例（1.5%）
+
+# ---- 持仓分 PS ----
+BASE_DECAY_RATE = 0.95            # 基准衰减率（每 time_decay_interval 分钟）
+TIME_DECAY_INTERVAL = 10.0        # 衰减计算周期（分钟）
+WIN_DECAY_GRACE = 30              # 衰减保护期（前 N 分钟 Time_Decay=1.0）
+PNL_DECAY_PROFIT_MULT = 0.5       # 浮盈态衰减倍率（默认减半 → 0.975）
+PNL_DECAY_LOSS_MULT = 2.0         # 浮亏态衰减倍率（默认加倍 → 0.90）
 
 # ---- 状态 / 一票否决共用 ----
 TH_RETAIL_CHASE = 0.65   # S_youzi_only 与 XS 一票否决共用的追涨阈值
@@ -48,7 +62,7 @@ DEADZONE_TH = 0.05   # 调仓死区：已持仓 |Δ权重| < 该值跳过微调�
 
 # ---- A 股硬过滤层 ----
 TH_AMOUNT = 1e7          # 分钟成交额门槛（元）
-START_TIME = "09:45"     # 开仓时间窗起点
+START_TIME = "10:00"     # 开仓时间窗起点（10:00 整之前禁买）
 END_TIME = "14:50"       # 开仓时间窗终点
 
 # ---- 历史兼容参数（旧二值化闸门阈值，新决策不再使用，仅保留构造兼容）----

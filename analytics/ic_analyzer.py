@@ -278,15 +278,16 @@ def run_ic_analysis(ds, features: pd.DataFrame,
     syn = SignalSynthesizer(
         weights=tuple(params["weights"]),
         inst_window=int(params["inst_window"]),
-        th_ms_bull=float(params["th_ms_bull"]),
-        th_ms_exit=float(params["th_ms_exit"]),
-        th_lock=float(params["th_lock"]),
-        th_purity=float(params["th_purity"]),
-        th_global_min=float(params["th_global_min"]),
-        th_adr_min=float(params["th_adr_min"]),
+        # 兼容参数（旧二值化闸门，决策链零读取；.get 兜底防 KeyError）
+        th_ms_bull=float(params.get("th_ms_bull", 0.0)),
+        th_ms_exit=float(params.get("th_ms_exit", -0.1)),
+        th_lock=float(params.get("th_lock", 0.5)),
+        th_purity=float(params.get("th_purity", 0.0)),
+        th_global_min=float(params.get("th_global_min", 0.0)),
+        th_adr_min=float(params.get("th_adr_min", 1.0)),
         th_mrs_min=float(params.get("th_mrs_min", 0.0)),
         th_industry_min=float(params.get("th_industry_min", 0.0)),
-        win_hold_max=int(params["win_hold_max"]),
+        win_hold_max=int(params.get("win_hold_max", 240)),
         symbol_to_industry=symbol_to_industry,
     )
     syn_features = syn.synthesize(ds, features)

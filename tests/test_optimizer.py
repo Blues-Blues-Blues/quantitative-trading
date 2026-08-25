@@ -274,9 +274,9 @@ class TestSearchSpace:
             p = ss.suggest(self._trial())
             assert 1 <= p["inst_window"] <= 20
             assert 5 <= p["chip_window"] <= 20
-            assert 10 <= p["win_hold_max"] <= 120
-            assert -0.8 <= p["th_global_min"] <= -0.2
-            assert 0.3 <= p["th_adr_min"] <= 0.7
+            # 旧二值化闸门参数已从搜索空间移除（P0-1/P1-3 清理）
+            for dead_k in ("win_hold_max", "th_global_min", "th_adr_min"):
+                assert dead_k not in p
 
     def test_is_feasible_rejects_out_of_range(self):
         ss = SearchSpace()

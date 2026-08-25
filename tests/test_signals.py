@@ -302,21 +302,55 @@ class TestEntryScore:
 
 class TestPositionScore:
 
-    def test_time_decay_formula(self):
-        syn = SignalSynthesizer()
-        # avg_cost 对齐 close=10.2（无浮盈）→ 不触发动量豁免，纯衰减生效
-        pos = _pos(bars_held=10, avg_cost=10.2, high_price_watermark=10.2)
-        assert syn.time_decay(bull_eval_row(syn), pos) == pytest.approx(0.95)
-        pos.bars_held = 30
-        assert syn.time_decay(bull_eval_row(syn), pos) == pytest.approx(0.95 ** 3)
+    def test_time_decay_grace_period(self):
+        """衰减保护期：bars_held <= win_decay_grace(30) → Time_Decay = 1.0。
+        覆盖：持仓 < 30 分钟。"""
+        syn = SignalSynthesizer()  # 默认 win_decay_grace=30
+        row = bull_eval_row(syn).copy()
+        row["close"] = 9.8  # 即使浮亏也不衰减（保护期内冻结）
+        for held in (0, 1, 29, 30):
+            pos = _pos(bars_held=held, avg_cost=10.0)
+            assert syn.time_decay(row, pos) == pytest.approx(1.0)
 
-    def test_time_decay_momentum_exempt(self):
-        """浮盈拉开安全垫（>1.5%）→ 时间衰减豁免 = 1.0。"""
+    def test_time_decay_profit_asymmetric(self):
+        """浮盈态慢衰减：>30 分钟 且 pnl_ratio>0 → factor=0.975。
+        覆盖：持仓 > 30 分钟且浮盈。"""
         syn = SignalSynthesizer()
         row = bull_eval_row(syn).copy()
-        row["close"] = 10.3  # (10.3-10.0)/10.0 = 3% > 1.5%
-        pos = _pos(bars_held=200)
-        assert syn.time_decay(row, pos) == pytest.approx(1.0)
+        row["close"] = 10.3  # (10.3-10.0)/10.0 = 3% > 0 → 浮盈
+        pos = _pos(bars_held=40, avg_cost=10.0)  # effective=10
+        # factor = 1-(1-0.95)*0.5 = 0.975；TD = 0.975^(10/10) = 0.975
+        assert syn.time_decay(row, pos) == pytest.approx(0.975)
+        pos.bars_held = 50  # effective=20 → 0.975^2
+        assert syn.time_decay(row, pos) == pytest.approx(0.975 ** 2)
+
+    def test_time_decay_loss_asymmetric(self):
+        """浮亏态快衰减：>30 分钟 且 pnl_ratio<=0 → factor=0.90。
+        覆盖：持仓 > 30 分钟且浮亏。"""
+        syn = SignalSynthesizer()
+        row = bull_eval_row(syn).copy()
+        row["close"] = 9.8  # -2% → 浮亏
+        pos = _pos(bars_held=40, avg_cost=10.0)  # effective=10
+        # factor = 1-(1-0.95)*2.0 = 0.90；TD = 0.90^(10/10) = 0.90
+        assert syn.time_decay(row, pos) == pytest.approx(0.90)
+        pos.bars_held = 50  # effective=20 → 0.90^2
+        assert syn.time_decay(row, pos) == pytest.approx(0.90 ** 2)
+
+    def test_time_decay_floor_clip(self):
+        """下限保护：长期浮亏衰减不跌破 0.1。"""
+        syn = SignalSynthesizer()
+        row = bull_eval_row(syn).copy()
+        row["close"] = 9.0  # 深亏
+        pos = _pos(bars_held=30 + 30 * 9, avg_cost=10.0)  # effective=270
+        assert syn.time_decay(row, pos) == pytest.approx(0.1)
+
+    def test_time_decay_nan_fallback(self):
+        """pnl_ratio 无法计算（close 缺失）→ fallback 基准衰减率（中性）。"""
+        syn = SignalSynthesizer()
+        row = bull_eval_row(syn).copy()
+        row["close"] = np.nan
+        pos = _pos(bars_held=40)  # effective=10
+        assert syn.time_decay(row, pos) == pytest.approx(0.95)
 
     def test_fund_stability_cancel_ratio(self):
         syn = SignalSynthesizer()
@@ -484,7 +518,7 @@ class TestStateMachine:
         sigs = sm.run(ds, features)
         first = self._first_buy(sigs)
         # 新架构：ES 无日频因子依赖，硬过滤通过即开仓 → 首个 BUY 于 D0 10:00
-        #（D0 09:30/09:45 在时间窗外 09:45 之前，不可开仓）
+        #（D0 09:30/09:45 在时间窗 10:00 之前，不可开仓）
         assert first.timestamp == pd.Timestamp("2024-01-02 10:00")
         assert first.action == ACT_BUY and first.state == S_PUSH
         assert first.metrics["es"] >= 0.4
@@ -540,18 +574,17 @@ class TestStateMachine:
         assert sig.metrics["reduce_fraction"] == 0.5
         assert "600000" in sm.positions  # 减仓不清仓
 
-    def test_sell_when_purity_turns_negative(self):
-        """资金纯净度转负 + Final_MS 走弱 → XS <= 0 → SELL 清仓。"""
+    def test_reduce_when_purity_turns_negative(self):
+        """资金纯净度转负 + Final_MS 走弱 → XS 落减仓带（th_xs_exit, th_xs_reduce_high）
+        → 容错阶梯减仓（新语义：不再一刀切直接清仓）。"""
         sm, ds, features = self._run(overrides={
             "2024-01-04 10:30": {"chain_mod": -1.0,
                                  "retail_flow": 1e8, "youzi_flow": 1e5}})
         sigs = sm.run(ds, features)
         sell = next(s for s in sigs
                     if s.timestamp == pd.Timestamp("2024-01-04 10:30"))
-        assert sell.action == ACT_SELL
-        assert sell.metrics["xs"] <= 0.0
-        if "600000" in sm.positions:
-            assert sm.positions["600000"].entry_time > sell.timestamp
+        assert sell.action == ACT_DECAY_REDUCE
+        assert sm.syn.th_xs_exit < sell.metrics["xs"] < sm.syn.th_xs_reduce_high
 
     def test_sell_on_circuit_breaker(self):
         # 大盘跳水（指数跌破 VWAP-1.5%）→ 一票否决 → SELL
@@ -577,17 +610,16 @@ class TestStateMachine:
         assert a.action == ACT_HOLD
         assert b.action == ACT_ADD
 
-    def test_sell_after_add_resumes_position(self):
-        # 加仓后 Final_MS 走弱 + 纯净度转负 → SELL 清仓
+    def test_reduce_after_add_resumes_position(self):
+        # 加仓后 Final_MS 走弱 + 纯净度转负 → XS 落减仓带 → 容错阶梯减仓（不清仓）
         sm, ds, features = self._run(overrides={
             "2024-01-04 11:30": {"chain_mod": -1.0,
                                  "retail_flow": 1e8, "youzi_flow": 1e5}})
         sigs = sm.run(ds, features)
         sell = next(s for s in sigs
                     if s.timestamp == pd.Timestamp("2024-01-04 11:30"))
-        assert sell.action == ACT_SELL
-        if "600000" in sm.positions:
-            assert sm.positions["600000"].entry_time > sell.timestamp
+        assert sell.action == ACT_DECAY_REDUCE
+        assert sm.syn.th_xs_exit < sell.metrics["xs"] < sm.syn.th_xs_reduce_high
 
     def test_buy_with_industry_mapping(self):
         sm, ds, features = self._run(syn=bull_syn())
@@ -638,6 +670,24 @@ class TestTargetWeights:
         syn, row = self._tw(ts=pd.Timestamp("2024-01-04 09:30"))
         assert syn.generate_target_weights(row, None) == 0.0
 
+    def test_test_holding_negative_xs_reduce_not_exit(self):
+        """负 XS（如 -0.16，落入 (th_xs_exit, th_xs_reduce_high)）→ 只容错阶梯减仓，不清仓。
+        覆盖用户要求：XS=-0.1 时只会触发阶梯减仓而不会被直接清仓。"""
+        syn, row = self._tw(final_ms=-0.4, capital_purity=-0.2)
+        pos = _pos(simulated_weight=0.2)
+        xs = syn.calculate_exit_score(row, pos)
+        assert syn.th_xs_exit < xs < syn.th_xs_reduce_high  # 落减仓带
+        assert xs < 0.0  # 负 XS 也仅减仓
+        assert syn.generate_target_weights(row, pos) \
+            == pytest.approx(0.2 * syn.reduce_step_ratio)  # 目标=×0.8，不清仓（≠0）
+
+    def test_holding_crash_zero(self):
+        """XS 破极速清仓线（<= th_xs_crash）→ 目标权重 0（极速清仓）。"""
+        syn, row = self._tw(final_ms=-2.0, capital_purity=-1.0)
+        pos = _pos()
+        assert syn.calculate_exit_score(row, pos) <= syn.th_xs_crash
+        assert syn.generate_target_weights(row, pos) == 0.0
+
     def test_holding_exit_zero(self):
         syn, row = self._tw(final_ms=-2.0, capital_purity=-1.0)
         assert syn.generate_target_weights(row, _pos()) == 0.0
@@ -645,14 +695,14 @@ class TestTargetWeights:
     def test_holding_reduce_step(self):
         syn, row = self._tw(final_ms=0.2, capital_purity=0.3)
         pos = _pos(simulated_weight=0.2)
-        assert 0.0 < syn.calculate_exit_score(row, pos) < syn.th_xs_reduce
+        assert 0.0 < syn.calculate_exit_score(row, pos) < syn.th_xs_reduce_high
         assert syn.generate_target_weights(row, pos) \
             == pytest.approx(0.2 * syn.reduce_step_ratio)
 
     def test_holding_rebalance_by_ps(self):
         syn, row = self._tw()
         pos = _pos()
-        assert syn.calculate_exit_score(row, pos) >= syn.th_xs_reduce
+        assert syn.calculate_exit_score(row, pos) >= syn.th_xs_reduce_high
         ps = syn.calculate_position_score(row, pos)
         scale = (np.clip(1.0 + float(row["global_mod"]), *syn.tw_gmod_clip)
                  * np.clip(1.0 + float(row["chain_mod"]), *syn.tw_cmod_clip))
@@ -696,7 +746,7 @@ class TestTargetWeights:
         pos = _pos(simulated_weight=0.2, last_reduce_bar=0)
         sig = sm._on_holding(row, pos)
         assert sig.action == ACT_DECAY_REDUCE
-        assert 0.0 < sig.metrics["xs"] < syn.th_xs_reduce
+        assert 0.0 < sig.metrics["xs"] < syn.th_xs_reduce_high
         assert sig.metrics["target_weight"] == pytest.approx(0.16)
         assert pos.simulated_weight == pytest.approx(0.16)  # 触发后持久化
 
@@ -728,3 +778,104 @@ class TestTargetWeights:
             SignalSynthesizer(tw_gmod_clip=(1.5, 0.2))
         with pytest.raises(ValueError):
             SignalSynthesizer(tw_gmod_clip=(0.0, 1.5))
+
+
+class TestReversal:
+    """次日低开反包（Reversal / Counter-Attack）机制。"""
+
+    def _row(self, ts, **mut):
+        """评估行副本 + 行级 override（直调 _on_holding 用）。
+        放宽 start_time=09:30 以激活 09:30~10:00 反包窗口
+        （默认 start_time=10:00 时反包受 time 闸门限制不触发）。"""
+        syn = bull_syn(start_time="09:30")
+        row = bull_eval_row(syn).copy()
+        row["ts"] = pd.Timestamp(ts)
+        for k, v in mut.items():
+            row[k] = v
+        return syn, row
+
+    def _pos_next_day(self, **mut):
+        base = dict(bars_held=10, entry_time=pd.Timestamp("2024-01-04 10:00"),
+                    avg_cost=10.0, high_price_watermark=10.6,
+                    simulated_weight=0.2, last_add_bar=0)
+        base.update(mut)
+        return _pos(**base)
+
+    def test_reversal_add_freeze_exit(self):
+        """次日低开 -2% 且 OFSS=0.4、big_flow>0、purity>0：
+        ① 不触发止损卖出（豁免 XS 清仓）② 正确反包加仓 ③ 不突破 30% 上限。"""
+        syn, row = self._row("2024-01-05 09:45",
+                             close=9.7, prev_close=10.0, ofss=0.4,
+                             big_flow=5e6, capital_purity=0.2, final_ms=-1.5)
+        pos = self._pos_next_day()
+        # 前置：XS 已破清仓线（若无反包将 SELL）
+        assert syn.calculate_exit_score(row, pos) <= syn.th_xs_exit
+        assert syn.reversal_active(row, pos) is True
+        assert syn.reversal_overridden(row) is False
+        sm = TradingStateMachine(synthesizer=syn, min_add_interval=0)
+        sig = sm._on_holding(row, pos)
+        assert sig.action == ACT_ADD  # 反包加仓而非清仓
+        assert bool(sig.metrics.get("reversal_add"))  # metrics 序列化 bool→1.0
+        es = syn.calculate_entry_score(row)
+        expect = min(0.2 + syn.base_weight * es * syn.reversal_add_mult,
+                     syn.max_single_position)
+        assert sig.metrics["target_weight"] == pytest.approx(expect)
+        assert sig.metrics["target_weight"] <= syn.max_single_position
+        assert pos.simulated_weight == pytest.approx(expect)
+
+    def test_reversal_no_add_beyond_cap(self):
+        """加仓后累计目标不得突破 max_single_position（0.3）。"""
+        syn, row = self._row("2024-01-05 09:40",
+                             close=9.6, prev_close=10.0, ofss=0.4,
+                             big_flow=5e6, capital_purity=0.2)
+        pos = self._pos_next_day(simulated_weight=0.28,
+                                 high_price_watermark=10.5)
+        sm = TradingStateMachine(synthesizer=syn, min_add_interval=0)
+        sig = sm._on_holding(row, pos)
+        assert sig.action == ACT_ADD
+        assert sig.metrics["target_weight"] == pytest.approx(syn.max_single_position)
+        assert pos.simulated_weight == pytest.approx(syn.max_single_position)
+
+    def test_reversal_freeze_overridden_by_flight(self):
+        """反包承接中触发大盘熔断（沪深300 跌破 VWAP-1.5%）→ 冻结失效 → 强制清仓。"""
+        syn, row = self._row("2024-01-05 09:45",
+                             close=9.7, prev_close=10.0, ofss=0.4,
+                             big_flow=5e6, capital_purity=0.2,
+                             index_close=2900.0, index_vwap=3000.0)
+        pos = self._pos_next_day()
+        assert syn.reversal_active(row, pos) is True  # 承接中（big>0）
+        assert syn.reversal_overridden(row) is True  # 但大盘跳水解除保护
+        sm = TradingStateMachine(synthesizer=syn, min_add_interval=0)
+        sm.positions["600000"] = pos  # SELL 分支会 del positions[sym]
+        sig = sm._on_holding(row, pos)
+        assert sig.action == ACT_SELL  # 冻结解除 → 强制清仓
+
+    def test_reversal_freeze_frozen_within_interval(self):
+        """反包冻结期内未达加仓节奏 → HOLD 维持仓位（target=simulated）。"""
+        syn, row = self._row("2024-01-05 09:45",
+                             close=9.7, prev_close=10.0, ofss=0.4,
+                             big_flow=5e6, capital_purity=0.2, final_ms=-1.5)
+        pos = self._pos_next_day()
+        sm = TradingStateMachine(synthesizer=syn, min_add_interval=10)
+        sig = sm._on_holding(row, pos)  # bars_held-last_add=10>=10 → 可加仓
+        assert sig.action == ACT_ADD
+        pos2 = self._pos_next_day(last_add_bar=9)  # 10-9=1 < 10 → 冻结 HOLD
+        sig2 = sm._on_holding(row, pos2)
+        assert sig2.action == ACT_HOLD
+        assert sig2.metrics["target_weight"] == pytest.approx(pos2.simulated_weight)
+
+    def test_reversal_inactive_outside_window(self):
+        """超 reversal_window_end（10:00 后）→ 反包不激活。"""
+        syn, row = self._row("2024-01-05 10:05",
+                             close=9.7, prev_close=10.0, ofss=0.4,
+                             big_flow=5e6, capital_purity=0.2, final_ms=-1.5)
+        pos = self._pos_next_day()
+        assert syn.reversal_active(row, pos) is False
+
+    def test_reversal_requires_next_day(self):
+        """非跨日（同日）→ 不激活。"""
+        syn, row = self._row("2024-01-04 09:45",
+                             close=9.7, prev_close=10.0, ofss=0.4,
+                             big_flow=5e6, capital_purity=0.2)
+        pos = self._pos_next_day(entry_time=pd.Timestamp("2024-01-04 09:30"))
+        assert syn.reversal_active(row, pos) is False

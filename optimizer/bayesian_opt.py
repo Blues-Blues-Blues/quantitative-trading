@@ -18,6 +18,16 @@
     oos_log, oos_curve = optimizer.backtest(oos_ds, params)  # 样本外回测
 """
 
+
+def _window_end_str(params):  # 定义于 import 之前，避免类型注解前向求值问题
+    """reversal_window_end 透传：直接给定则原样；给定 reversal_window_span
+    （09:30 起分钟数，寻优用）则换算为 HH:MM。"""
+    if "reversal_window_end" in params:
+        return str(params["reversal_window_end"])
+    span = int(params.get("reversal_window_span", 30))
+    total = 9 * 60 + 30 + span
+    return f"{total // 60:02d}:{total % 60:02d}"
+
 import logging
 import os
 from typing import Dict, List, Optional, Tuple
@@ -86,13 +96,14 @@ class StrategyOptimizer:
         syn = SignalSynthesizer(
             weights=tuple(float(w) for w in params["weights"]),
             inst_window=int(params["inst_window"]),
-            th_ms_bull=float(params["th_ms_bull"]),
-            th_ms_exit=float(params["th_ms_exit"]),
-            th_lock=float(params["th_lock"]),
-            th_purity=float(params["th_purity"]),
-            th_global_min=float(params["th_global_min"]),
-            th_adr_min=float(params["th_adr_min"]),
-            win_hold_max=int(params["win_hold_max"]),
+            # 兼容参数（旧二值化闸门，决策链不再读取；SearchSpace 已停止采样）
+            th_ms_bull=float(params.get("th_ms_bull", 0.0)),
+            th_ms_exit=float(params.get("th_ms_exit", -0.1)),
+            th_lock=float(params.get("th_lock", 0.5)),
+            th_purity=float(params.get("th_purity", 0.0)),
+            th_global_min=float(params.get("th_global_min", 0.0)),
+            th_adr_min=float(params.get("th_adr_min", 1.0)),
+            win_hold_max=int(params.get("win_hold_max", 240)),
             # ---- 连续评分 ES（SearchSpace 采样，missing 时用默认值降级）----
             w_es_ms=float(params.get("w_es_ms", 0.4)),
             w_es_purity=float(params.get("w_es_purity", 0.3)),
@@ -100,11 +111,19 @@ class StrategyOptimizer:
             es_sigmoid_k=float(params.get("es_sigmoid_k", 3.0)),
             th_es_entry=float(params.get("th_es_entry", 0.4)),
             # ---- 连续评分 XS ----
-            th_xs_exit=float(params.get("th_xs_exit", 0.0)),
-            th_xs_reduce=float(params.get("th_xs_reduce", 0.2)),
+            th_xs_exit=float(params.get("th_xs_exit", -0.3)),
+            th_xs_reduce_high=float(params.get("th_xs_reduce_high", 0.2)),
+            th_xs_crash=float(params.get("th_xs_crash", -0.6)),
+            # ---- 次日低开反包 ----
+            th_reversal_gap=float(params.get("th_reversal_gap", -0.015)),
+            th_reversal_ofss=float(params.get("th_reversal_ofss", 0.2)),
+            reversal_add_mult=float(params.get("reversal_add_mult", 0.5)),
+            reversal_window_end=_window_end_str(params),
             # ---- 连续评分 PS ----
-            time_decay_base=float(params.get("time_decay_base", 0.95)),
-            momentum_exempt=float(params.get("momentum_exempt", 0.015)),
+            base_decay_rate=float(params.get("base_decay_rate", 0.95)),
+            win_decay_grace=int(params.get("win_decay_grace", 30)),
+            pnl_decay_profit_mult=float(params.get("pnl_decay_profit_mult", 0.5)),
+            pnl_decay_loss_mult=float(params.get("pnl_decay_loss_mult", 2.0)),
             cancel_ratio_th=float(params.get("cancel_ratio_th", 0.25)),
             fund_stability_penalty=float(params.get("fund_stability_penalty", 0.7)),
             # ---- 状态 / 一票否决 ----

@@ -19,8 +19,13 @@
         MRS_c      = clip(MRS, ±mrs_clip) / mrs_clip                 （有界化）
         S_youzi_only 状态衰减：ES *= es_youzi_decay（默认 0.5）
     持仓分 PS = ES * Time_Decay * Fund_Stability ∈ [0, 1]
-        Time_Decay   = time_decay_base ** (bars_held / time_decay_interval)
-                      （浮盈拉开安全垫 > momentum_exempt 时豁免 = 1.0）
+        Time_Decay：前 win_decay_grace 分钟为保护期 = 1.0（防刚入场被误判减仓）；
+            此后按浮盈亏非对称衰减（effective_bars = bars_held - win_decay_grace）：
+            pnl_ratio = (close - avg_cost) / avg_cost
+            浮盈(pnl_ratio>0)：factor = 1-(1-base_decay_rate)*pnl_decay_profit_mult
+            浮亏(pnl_ratio<=0)：factor = 1-(1-base_decay_rate)*pnl_decay_loss_mult
+            Time_Decay = clip(factor ** (effective_bars / time_decay_interval),
+                              0.1, 1.0)
         Fund_Stability = 撤单率 > cancel_ratio_th 或盘口变薄 → 惩罚系数，否则 1.0
     出局分 XS = w_xs_ms*Final_MS_c + w_xs_purity*Capital_Purity
                 - w_xs_drawdown*Drawdown_From_High ∈ [-1, 1]
@@ -31,9 +36,13 @@
         未持仓且硬过滤全过且 ES>=th_es_entry
             = base_weight * ES * clip(1+Global_Mod, tw_gmod_clip)
                                 * clip(1+Chain_Mod, tw_cmod_clip)，否则 0
-        持仓：XS<=th_xs_exit → 0；th_xs_exit<XS<th_xs_reduce
-            → simulated_weight * reduce_step_ratio（阶梯减仓目标）；
-            XS>=th_xs_reduce → base_weight * PS * 乘子
+        持仓（XS 四分判定链）：
+            XS >= th_xs_reduce_high      → base_weight * PS * 乘子（正常持仓调仓）
+            th_xs_exit < XS < th_xs_reduce_high
+                                         → simulated_weight * reduce_step_ratio
+                                            （容错阶梯减仓，不清仓）
+            th_xs_crash < XS <= th_xs_exit → 0（常规清仓）
+            XS <= th_xs_crash 或一票否决   → 0（极速清仓 Crash / Panic Exit）
         simulated_weight 由状态机动作维护（BUY 建仓 / DECAY_REDUCE 触发 ×0.8 /
         ADD 重算），与引擎真实成交仓位相互独立。
 
@@ -41,12 +50,14 @@
     前置：A 股硬过滤层（ST 禁买 / 涨跌停禁买卖 / 交易时间窗 / 成交额门槛），
           一票否决条件，全部与连续评分无关，独立生效。
     未持仓：硬过滤全过 且 ES >= th_es_entry → BUY
-    持仓：
-        XS <= th_xs_exit 或一票否决            → SELL（清仓）
-        th_xs_exit < XS < th_xs_reduce        → DECAY_REDUCE（阶梯减仓，
-                                                reduce_fraction 比例，受
-                                                min_reduce_interval 节奏约束）
-        XS >= th_xs_reduce                    → ADD（S_push 且满足间隔）/ HOLD
+    持仓（XS 四分判定链）：
+        XS >= th_xs_reduce_high          → ADD（S_push 且满足间隔）/ HOLD
+        th_xs_exit < XS < th_xs_reduce_high
+                                         → DECAY_REDUCE（容错阶梯减仓，
+                                            ×reduce_step_ratio，受
+                                            min_reduce_interval 节奏约束）
+        th_xs_crash < XS <= th_xs_exit   → SELL（常规清仓）
+        XS <= th_xs_crash 或一票否决      → SELL（极速清仓 Crash / Panic Exit）
 
 历史接口兼容（不删除，避免破坏 attribution / 旧测试语义）：
     entry_gates / entry_all / exit_triggers / exit_any 保留，内部映射为
@@ -170,7 +181,7 @@ class SignalSynthesizer:
         youzi_chase_th: Optional[float] = None,  # 旧参数名兼容（映射到 th_retail_chase）
         # ---- A 股硬过滤层（一票否决前置条件，独立于评分）----
         th_amount: float = 1e7,        # ⑦ 分钟成交额（元）
-        start_time: str = "09:45",     # ⑧ 开仓时间窗
+        start_time: str = "10:00",     # ⑧ 开仓时间窗（10:00 整之前禁买，SELL/减仓不受限）
         end_time: str = "14:50",
         # ---- 入场分 ES ----
         w_es_ms: float = 0.4,          # Final_MS 权重
@@ -182,9 +193,11 @@ class SignalSynthesizer:
         es_youzi_decay: float = 0.5,   # S_youzi_only 状态衰减系数
         th_es_entry: float = 0.4,      # 开仓 ES 门槛
         # ---- 持仓分 PS ----
-        time_decay_base: float = 0.95, # 每 time_decay_interval 分钟衰减基数
-        time_decay_interval: float = 10.0,
-        momentum_exempt: float = 0.015,   # 浮盈安全垫（超此则时间衰减豁免）
+        base_decay_rate: float = 0.95,     # 基准衰减率（每 time_decay_interval 分钟）
+        time_decay_interval: float = 10.0, # 衰减计算周期（分钟）
+        win_decay_grace: int = 30,         # 衰减保护期（前 N 分钟 Time_Decay=1.0）
+        pnl_decay_profit_mult: float = 0.5,  # 浮盈态衰减倍率（默认减半 → 0.975）
+        pnl_decay_loss_mult: float = 2.0,    # 浮亏态衰减倍率（默认加倍 → 0.90）
         cancel_ratio_th: float = 0.25,    # 撤单率阈值（超过 → 资金不稳定）
         fund_stability_penalty: float = 0.7,  # 资金不稳定惩罚系数
         obi_thin_th: float = 0.05,      # 盘口变薄：|OBI| 阈值（近似）
@@ -193,8 +206,14 @@ class SignalSynthesizer:
         w_xs_ms: float = 0.5,          # Final_MS 权重
         w_xs_purity: float = 0.3,      # Capital_Purity 权重
         w_xs_drawdown: float = 0.2,    # 回撤权重
-        th_xs_exit: float = 0.0,       # XS <= 此值 → 清仓
-        th_xs_reduce: float = 0.2,     # XS < 此值 → 阶梯减仓
+        th_xs_exit: float = -0.3,          # XS <= 此值 → 常规清仓
+        th_xs_reduce_high: float = 0.2,    # XS >= 此值 → 正常持仓按 PS 调仓
+        th_xs_crash: float = -0.6,         # XS <= 此值（或一票否决）→ 极速清仓
+        # ---- 次日低开反包（Reversal / Counter-Attack，已持仓承接加仓）----
+        th_reversal_gap: float = -0.015,  # 深度低开/下探跌幅门槛（<= 此值触发）
+        th_reversal_ofss: float = 0.2,    # 盘口承接分 OFSS 门槛（委买聚集+主动买盘）
+        reversal_add_mult: float = 0.5,   # 反包加仓系数（增量 = base*ES*mult）
+        reversal_window_end: str = "10:00",  # 反包判定截止时间（受开仓 time 闸门共同约束）
         reduce_fraction: float = 0.5,  # 旧减仓比例参数（保留构造兼容；新决策统一用 reduce_step_ratio）
         circuit_index_drop: float = 0.015,  # 指数盘中跌破 VWAP 比例（1.5%）
         # ---- 目标权重 Target_Weight（驱动撮合引擎差额调仓）----
@@ -235,11 +254,43 @@ class SignalSynthesizer:
                 raise ValueError(f"{name} 必须 >= 0，当前: {val}")
         if not 0.0 < th_es_entry <= 1.0:
             raise ValueError(f"th_es_entry 必须在 (0, 1] 区间，当前: {th_es_entry}")
-        if not (th_xs_exit < th_xs_reduce):
-            raise ValueError(f"th_xs_exit 必须小于 th_xs_reduce，当前: "
-                             f"{th_xs_exit} / {th_xs_reduce}")
-        if not 0.0 < time_decay_base <= 1.0:
-            raise ValueError(f"time_decay_base 必须在 (0, 1] 区间，当前: {time_decay_base}")
+        if not (th_xs_crash < th_xs_exit < th_xs_reduce_high):
+            raise ValueError(
+                f"th_xs_crash 必须小于 th_xs_exit 且 th_xs_exit 必须小于 "
+                f"th_xs_reduce_high，当前: "
+                f"{th_xs_crash} / {th_xs_exit} / {th_xs_reduce_high}")
+        if not 0.0 < base_decay_rate <= 1.0:
+            raise ValueError(f"base_decay_rate 必须在 (0, 1] 区间，当前: {base_decay_rate}")
+        if win_decay_grace < 0:
+            raise ValueError(f"win_decay_grace 不能为负，当前: {win_decay_grace}")
+        if pnl_decay_profit_mult <= 0 or pnl_decay_loss_mult <= 0:
+            raise ValueError(
+                f"衰减倍率必须为正，当前 profit: {pnl_decay_profit_mult}, "
+                f"loss: {pnl_decay_loss_mult}")
+        # 防 factor = 1-(1-base)*mult <= 0 → 非整数幂得 NaN 并沿 PS 传播
+        if (1.0 - base_decay_rate) * max(pnl_decay_profit_mult,
+                                         pnl_decay_loss_mult) >= 1.0:
+            raise ValueError(
+                f"(1-base_decay_rate)*mult 必须 < 1（防 factor<=0 → NaN），"
+                f"当前 base={base_decay_rate}, profit={pnl_decay_profit_mult}, "
+                f"loss={pnl_decay_loss_mult}")
+        if final_ms_clip <= 0 or mrs_clip <= 0:
+            raise ValueError(f"final_ms_clip/mrs_clip 必须为正（有界化分母防除零），"
+                             f"当前: {final_ms_clip} / {mrs_clip}")
+        if time_decay_interval <= 0:
+            raise ValueError(f"time_decay_interval 必须为正（指数分母防除零），"
+                             f"当前: {time_decay_interval}")
+        if th_reversal_gap >= 0:
+            raise ValueError(f"th_reversal_gap 必须为负（低开跌幅），当前: {th_reversal_gap}")
+        if th_reversal_ofss < 0:
+            raise ValueError(f"th_reversal_ofss 不能为负，当前: {th_reversal_ofss}")
+        if reversal_add_mult <= 0:
+            raise ValueError(f"reversal_add_mult 必须为正，当前: {reversal_add_mult}")
+        try:
+            pd.Timestamp(reversal_window_end).time()
+        except Exception:
+            raise ValueError(
+                f"reversal_window_end 必须为 HH:MM 时间串，当前: {reversal_window_end}")
         if not 0.0 < fund_stability_penalty <= 1.0:
             raise ValueError(f"fund_stability_penalty 必须在 (0, 1] 区间，"
                              f"当前: {fund_stability_penalty}")
@@ -288,9 +339,11 @@ class SignalSynthesizer:
         self.th_es_entry = th_es_entry
 
         # PS
-        self.time_decay_base = time_decay_base
+        self.base_decay_rate = base_decay_rate
         self.time_decay_interval = time_decay_interval
-        self.momentum_exempt = momentum_exempt
+        self.win_decay_grace = win_decay_grace
+        self.pnl_decay_profit_mult = pnl_decay_profit_mult
+        self.pnl_decay_loss_mult = pnl_decay_loss_mult
         self.cancel_ratio_th = cancel_ratio_th
         self.fund_stability_penalty = fund_stability_penalty
         self.obi_thin_th = obi_thin_th
@@ -301,7 +354,13 @@ class SignalSynthesizer:
         self.w_xs_purity = w_xs_purity
         self.w_xs_drawdown = w_xs_drawdown
         self.th_xs_exit = th_xs_exit
-        self.th_xs_reduce = th_xs_reduce
+        self.th_xs_reduce_high = th_xs_reduce_high
+        self.th_xs_crash = th_xs_crash
+        # 反包
+        self.th_reversal_gap = th_reversal_gap
+        self.th_reversal_ofss = th_reversal_ofss
+        self.reversal_add_mult = reversal_add_mult
+        self.reversal_window_end = pd.Timestamp(reversal_window_end).time()
         self.reduce_fraction = reduce_fraction
         self.circuit_index_drop = circuit_index_drop
 
@@ -571,13 +630,30 @@ class SignalSynthesizer:
         return float(np.clip(es * td * fs, 0.0, 1.0))
 
     def time_decay(self, row: pd.Series, pos: Position) -> float:
-        """时间衰减：0.95^(bars_held/10)；浮盈拉开安全垫（相对加权成本）时豁免 1.0。"""
-        if pos.avg_cost > 0:
-            close = row.get("close", np.nan)
-            if pd.notna(close) and (float(close) - pos.avg_cost) / pos.avg_cost \
-                    > self.momentum_exempt:
-                return 1.0
-        return float(self.time_decay_base ** (pos.bars_held / self.time_decay_interval))
+        """时间衰减（衰减保护期 + 浮盈亏非对称衰减）。
+
+        - 前 win_decay_grace 分钟（bars_held <= win_decay_grace）：Time_Decay = 1.0，
+          给予建仓后的发酵窗口，避免刚入场横盘就被误判减仓。
+        - 此后 effective_bars = bars_held - win_decay_grace，按 pnl_ratio 选衰减系数：
+            浮盈(pnl_ratio > 0)：factor = 1-(1-base_decay_rate)*pnl_decay_profit_mult
+            浮亏/持平(pnl_ratio <= 0)：factor = 1-(1-base_decay_rate)*pnl_decay_loss_mult
+          Time_Decay = clip(factor ** (effective_bars / time_decay_interval), 0.1, 1.0)
+        - pnl_ratio 无法计算（close 缺失 / avg_cost<=0）：fallback 基准衰减率（中性）。
+        """
+        if pos.bars_held <= self.win_decay_grace:
+            return 1.0
+        held = pos.bars_held - self.win_decay_grace
+        close = row.get("close", np.nan)
+        if pd.notna(close) and pos.avg_cost > 0:
+            pnl = (float(close) - pos.avg_cost) / pos.avg_cost
+            if pnl > 0:
+                factor = 1.0 - (1.0 - self.base_decay_rate) * self.pnl_decay_profit_mult
+            else:
+                factor = 1.0 - (1.0 - self.base_decay_rate) * self.pnl_decay_loss_mult
+        else:
+            factor = self.base_decay_rate
+        td = factor ** (held / self.time_decay_interval)
+        return float(np.clip(td, 0.1, 1.0))
 
     def fund_stability(self, row: pd.Series) -> float:
         """资金稳定性：撤单率 > 阈值 或 盘口变薄 → 惩罚系数；否则 1.0。
@@ -690,13 +766,13 @@ class SignalSynthesizer:
             A 股硬过滤全过 且 ES >= th_es_entry
                 → base_weight * ES * clip(1+Global_Mod) * clip(1+Chain_Mod)
             否则 → 0.0
-        持仓：
-            XS <= th_xs_exit                    → 0.0（清仓目标）
-            th_xs_exit < XS < th_xs_reduce      → simulated_weight * reduce_step_ratio
-                                                  （阶梯减仓目标，不持久化；
-                                                    持久化由状态机在 DECAY_REDUCE
-                                                    触发时按节奏执行）
-            XS >= th_xs_reduce                  → base_weight * PS * 乘子（持仓分调仓）
+        持仓（XS 四分判定链）：
+            XS >= th_xs_reduce_high      → base_weight * PS * 乘子（正常持仓按 PS 调仓）
+            th_xs_exit < XS < th_xs_reduce_high
+                                         → simulated_weight * reduce_step_ratio
+                                            （容错阶梯减仓，不清仓）
+            th_xs_crash < XS <= th_xs_exit → 0.0（常规清仓）
+            XS <= th_xs_crash 或一票否决   → 0.0（极速清仓 Crash / Panic Exit）
         统一 clip(0, max_single_position) 兜底。
         """
         if pos is None:
@@ -707,9 +783,11 @@ class SignalSynthesizer:
                 tw = 0.0
         else:
             xs = self.calculate_exit_score(row, pos)
-            if xs <= self.th_xs_exit:
-                tw = 0.0
-            elif xs < self.th_xs_reduce:
+            if xs <= self.th_xs_crash or self.veto(row):
+                tw = 0.0  # 极速清仓
+            elif xs <= self.th_xs_exit:
+                tw = 0.0  # 常规清仓
+            elif xs < self.th_xs_reduce_high:
                 tw = pos.simulated_weight * self.reduce_step_ratio
             else:
                 ps = self.calculate_position_score(row, pos)
@@ -750,17 +828,19 @@ class SignalSynthesizer:
         """兼容接口：原 6 层平仓闸门明细。
 
         新语义：state/ms/purity/stop/hold_time 统一由「XS <= th_xs_exit」（清仓线）
-        表达；circuit 由一票否决（熔断/溃逃）表达。
+        表达；crash/circuit 由极速清仓线（XS <= th_xs_crash）或一票否决表达。
         """
         xs = self.calculate_exit_score(row, pos)
         exit_ = xs <= self.th_xs_exit
+        crash = bool(xs <= self.th_xs_crash or self.veto(row))
         return {
             "state": exit_,
             "ms": exit_,
             "purity": exit_,
             "stop": exit_,
             "hold_time": exit_,
-            "circuit": bool(exit_ or self.veto(row)),
+            "crash": crash,
+            "circuit": bool(exit_ or crash),
         }
 
     def exit_any(self, row: pd.Series, pos: Position) -> bool:
@@ -792,6 +872,63 @@ class SignalSynthesizer:
             return False
         return self.start_time <= cur <= self.end_time
 
+    # ------------------------------------------------------------------
+    # 次日低开反包（Reversal / Counter-Attack）
+    # ------------------------------------------------------------------
+
+    def reversal_active(self, row: pd.Series, pos: "Position") -> bool:
+        """反包激活判定（ALL MUST BE TRUE）：
+
+        ① 已有持仓且跨入次日（T >= T+1）
+        ② 时间窗 [start_time, reversal_window_end]——受开仓 time 闸门共同约束，
+           默认 start_time=10:00 时反包窗口仅剩 10:00 整（禁买时段不触发）
+        ③ 深度低开/下探：(Current - Prev_Close) / Prev_Close <= th_reversal_gap
+        ④ 盘口承接：OFSS > th_reversal_ofss
+        ⑤ 大资金逆势承接：Capital_Purity > 0 且 big_flow > 0
+        任一输入缺失 → 对应条件不触发（保守不误判）。
+        """
+        if pos is None:
+            return False
+        cur_ts = row.get("ts", row.name)
+        if cur_ts is None:
+            return False
+        cur = pd.Timestamp(cur_ts)
+        # ① 跨入次日
+        if cur.date() <= pd.Timestamp(pos.entry_time).date():
+            return False
+        # ② 时间窗（含开仓 time 闸门约束）
+        cur_t = cur.time()
+        if not (self.start_time <= cur_t <= self.reversal_window_end):
+            return False
+        # ③ 深度低开/下探
+        prev = row.get("prev_close", np.nan)
+        close = row.get("close", np.nan)
+        gap_ok = (pd.notna(prev) and float(prev) > 0 and pd.notna(close)
+                  and (float(close) - float(prev)) / float(prev) <= self.th_reversal_gap)
+        # ④ 盘口承接分
+        ofss = row.get("ofss", np.nan)
+        ofss_ok = bool(pd.notna(ofss) and float(ofss) > self.th_reversal_ofss)
+        # ⑤ 大资金逆势承接
+        purity = row.get("capital_purity", np.nan)
+        big = row.get("big_flow", np.nan)
+        money_ok = bool(pd.notna(purity) and float(purity) > 0.0
+                        and pd.notna(big) and float(big) > 0.0)
+        return bool(gap_ok and ofss_ok and money_ok)
+
+    def reversal_overridden(self, row: pd.Series) -> bool:
+        """反包保护立即失效（强制清仓）：
+        ① 大盘熔断（沪深300 跌破 VWAP*(1-circuit_index_drop)）
+        ② 游资出逃：big_flow < -0.5
+        """
+        big = row.get("big_flow", np.nan)
+        flight = bool(pd.notna(big) and float(big) < -0.5)
+        idx_close = row.get("index_close", np.nan)
+        idx_vwap = row.get("index_vwap", np.nan)
+        dive = bool(pd.notna(idx_close) and pd.notna(idx_vwap)
+                    and float(idx_close)
+                    < float(idx_vwap) * (1.0 - self.circuit_index_drop))
+        return bool(flight or dive)
+
 
 class TradingStateMachine:
     """连续评分 + A 股硬过滤的交易状态机（有状态）。
@@ -799,9 +936,11 @@ class TradingStateMachine:
     逐 Bar / 逐标的推进：
     - 状态判定（S_push / S_youzi_only / S_noise）由 SignalSynthesizer.state_of 完成
     - 开仓：未持仓 且 A 股硬过滤全过 且 ES >= th_es_entry → BUY
-    - 平仓：已持仓 且 XS <= th_xs_exit 或 一票否决 → SELL（清仓）
-    - 阶梯减仓：th_xs_exit < XS < th_xs_reduce 且 满足最小减仓间隔 → DECAY_REDUCE
-    - 加仓：已持仓 且 XS >= th_xs_reduce 且 S_push 且（可选）全部开仓闸门
+    - 平仓：XS <= th_xs_exit（常规清仓）或 XS <= th_xs_crash / 一票否决
+            （极速清仓 Crash / Panic Exit）→ SELL
+    - 容错阶梯减仓：th_xs_exit < XS < th_xs_reduce_high 且 满足最小减仓间隔
+            → DECAY_REDUCE
+    - 加仓：已持仓 且 XS >= th_xs_reduce_high 且 S_push 且（可选）全部开仓闸门
             且 满足最小加仓间隔 → ADD
     - 其余 → HOLD（每根 Bar / 每标的均输出一个 Signal）
 
@@ -886,6 +1025,20 @@ class TradingStateMachine:
         k = k[[c for c in k_cols if c in k.columns]]
         ev = ev.merge(k, on=["ts", SYMBOL], how="left")
 
+        # 昨收 prev_close（反包 gap 判定）：override 特征列优先；否则按 symbol
+        # 每日最后收盘价 shift 补齐（每周期首日 NaN，反包要求跨日天然规避；
+        # 只用历史收盘，防未来安全）
+        if "prev_close" not in ev.columns:
+            ev = ev.copy()
+            ev["date"] = ev["ts"].dt.normalize()
+            kd = k[["ts", SYMBOL, "close"]].copy()
+            kd["date"] = kd["ts"].dt.normalize()
+            day_close = kd.groupby([SYMBOL, "date"])["close"].last().reset_index()
+            day_close["prev_close"] = day_close.groupby(SYMBOL)["close"].shift(1)
+            ev = ev.merge(day_close[[SYMBOL, "date", "prev_close"]],
+                          on=[SYMBOL, "date"], how="left")
+            ev = ev.drop(columns=["date"])
+
         # 市场列（指数 VWAP 熔断）：取首个指数代码
         if ds.index_min is not None and not ds.index_min.empty:
             idx = ds.index_min.copy()
@@ -914,6 +1067,8 @@ class TradingStateMachine:
         if pos is not None:
             scores["ps"] = self.syn.calculate_position_score(row, pos)
             scores["xs"] = self.syn.calculate_exit_score(row, pos)
+            scores["xs_crash"] = bool(
+                scores["xs"] <= self.syn.th_xs_crash or self.syn.veto(row))
             scores["time_decay"] = self.syn.time_decay(row, pos)
             scores["fund_stability"] = self.syn.fund_stability(row)
             scores["drawdown"] = self.syn.drawdown_from_high(row, pos)
@@ -942,6 +1097,21 @@ class TradingStateMachine:
                       row["state"],
                       self._metrics(row, entry_gates=gates, scores=scores))
 
+    @staticmethod
+    def _rebase_avg_cost(row: pd.Series, pos: Position,
+                         sim_old: float, target: float) -> None:
+        """加仓后按市价重算加权成本 avg_cost（对齐 Position 注释）。
+
+        new = (old_cost × sim_old + 当前价 × Δ) / (sim_old + Δ)，Δ = target - sim_old。
+        close 缺失/非法或未加仓（Δ<=0）时保持旧成本（保守不恶化基准）。
+        """
+        price = row.get("close", np.nan)
+        delta = target - sim_old
+        if (pd.notna(price) and float(price) > 0 and delta > 0
+                and sim_old > 0 and pos.avg_cost > 0):
+            pos.avg_cost = ((pos.avg_cost * sim_old + float(price) * delta)
+                            / (sim_old + delta))
+
     def _on_holding(self, row: pd.Series, pos: Position) -> Signal:
         """已持仓：先递增持仓分钟数与最高价，再按 XS / PS 决策。"""
         pos.bars_held += 1
@@ -952,7 +1122,28 @@ class TradingStateMachine:
         xs = self.syn.calculate_exit_score(row, pos)
         scores = self._scores(row, pos)  # 含 target_weight（对应各 XS 分支的目标权重）
 
-        # 清仓：XS 破清仓线 或 一票否决
+        # 次日低开反包：冻结 XS 清仓/阶梯减仓 + 承接加仓（受 time 闸门/窗口约束）
+        if self.syn.reversal_active(row, pos) \
+                and not self.syn.reversal_overridden(row):
+            target = pos.simulated_weight
+            added = False
+            if pos.bars_held - pos.last_add_bar >= self.min_add_interval:
+                es = self.syn.calculate_entry_score(row)
+                sim_old = pos.simulated_weight
+                target = min(sim_old
+                             + self.syn.base_weight * es * self.syn.reversal_add_mult,
+                             self.syn.max_single_position)
+                self._rebase_avg_cost(row, pos, sim_old, target)
+                pos.simulated_weight = target
+                pos.last_add_bar = pos.bars_held
+                scores["reversal_add"] = True
+                added = True
+            scores["target_weight"] = target
+            return Signal(row[SYMBOL], pd.Timestamp(row["ts"]),
+                          ACT_ADD if added else ACT_HOLD, row["state"],
+                          self._metrics(row, scores=scores))
+
+        # 清仓：常规清仓（XS <= th_xs_exit）或 极速清仓（XS <= th_xs_crash / 一票否决）
         if xs <= self.syn.th_xs_exit or self.syn.veto(row):
             del self.positions[row[SYMBOL]]
             return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_SELL,
@@ -961,8 +1152,8 @@ class TradingStateMachine:
                                         exit_triggers=self.syn.exit_triggers(row, pos),
                                         scores=scores))
 
-        # 阶梯减仓：XS 落入 (th_xs_exit, th_xs_reduce) 且满足减仓节奏
-        if xs < self.syn.th_xs_reduce:
+        # 容错阶梯减仓：XS 落入 (th_xs_exit, th_xs_reduce_high) 且满足减仓节奏
+        if xs < self.syn.th_xs_reduce_high:
             if pos.bars_held - pos.last_reduce_bar >= self.min_reduce_interval:
                 pos.last_reduce_bar = pos.bars_held
                 pos.simulated_weight = float(scores["target_weight"])  # = 当前 × 0.8
@@ -977,7 +1168,10 @@ class TradingStateMachine:
             add_ok = add_ok and self.syn.entry_all(row)
         if add_ok and (pos.bars_held - pos.last_add_bar >= self.min_add_interval):
             pos.last_add_bar = pos.bars_held
-            pos.simulated_weight = float(scores["target_weight"])  # = base × PS × 乘子
+            sim_old = pos.simulated_weight
+            target = float(scores["target_weight"])  # = base × PS × 乘子
+            self._rebase_avg_cost(row, pos, sim_old, target)
+            pos.simulated_weight = target
             return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_ADD,
                           row["state"], self._metrics(row, scores=scores))
         return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_HOLD,
