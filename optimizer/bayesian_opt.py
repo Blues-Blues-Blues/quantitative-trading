@@ -2,10 +2,12 @@
 
 - 搜索空间：optimizer.search_space.SearchSpace
   （权重 Dirichlet 式归一化和为 1、阈值、窗口，含因子层 WIN_CHIP_OLD）
-- 目标：最大化样本内年化夏普比率（日频重采样，见 analytics.metrics）
+- 目标：最大化合成口径 = 样本内年化夏普比率 − 软惩罚
+  （回撤超线 / 年化换手超线的平滑惩罚，硬约束线之内即开始生效，给 TPE
+  更光滑的引导；见 objective()）
 - 硬约束：TPESampler(constraints_func=...) 原生约束 —— 采样阶段优先探索满足
   约束的 trial：
-      最大回撤 < 15%、胜率 > 55%、盈亏比 > 1.5、有效交易 >= 30 笔
+      最大回撤、胜率、盈亏比、有效交易笔数、年化换手（参数化，见 constraint_kwargs）
 - 流水线（每次 trial）：DataSlice → FeatureEngine（含 chip_window）→
   TradingStateMachine → BacktestEngine → metrics
 - 输出：Optuna Study（最优参数 + 全部 trial 记录）、优化历程收敛图、
@@ -53,6 +55,8 @@ logger = logging.getLogger("optimizer.bayesian_opt")
 _NAN_OBJECTIVE = -1e6
 # 约束函数中 NaN 指标的违反量
 _NAN_VIOLATION = 1e9
+# 断点续跑恢复时，按目标值降序最多重算候选的个数（补足未落盘的指标）
+_MAX_RE_EVAL = 5
 
 
 class StrategyOptimizer:
@@ -68,6 +72,9 @@ class StrategyOptimizer:
         sizer: Optional[PositionSizer] = None,
         n_trials: int = 200,
         seed: int = 42,
+        use_feature_cache: bool = False,
+        constraint_kwargs: Optional[Dict[str, object]] = None,
+        penalty_kwargs: Optional[Dict[str, object]] = None,
     ) -> None:
         self.data = data
         self.search_space = search_space or SearchSpace()
@@ -77,6 +84,19 @@ class StrategyOptimizer:
         self.sizer = sizer or PositionSizer()
         self.n_trials = n_trials
         self.seed = seed
+        self.use_feature_cache = use_feature_cache
+        # 硬约束阈值（真实数据寻优用宽松实测口径；None = 默认 回撤15%/胜率55%/盈亏比1.5/交易30）
+        self.constraint_kwargs = constraint_kwargs or {}
+
+        # 合成目标软惩罚（硬约束线内即生效，用于给 TPE 平滑引导）：
+        #   score = Sharpe - dd_pen*max(0,回撤-dd_soft) - to_pen*max(0,年化换手-to_soft)
+        pk = penalty_kwargs or {}
+        self.penalty_kwargs = {
+            "dd_soft": float(pk.get("dd_soft", 0.25)),
+            "dd_pen": float(pk.get("dd_pen", 1.0)),
+            "to_soft": float(pk.get("to_soft", 6.0)),
+            "to_pen": float(pk.get("to_pen", 0.03)),
+        }
 
         # trial.number → (params, metrics)，避免 objective/constraints_func
         # 在同一 trial 内被 Optuna 多次调用时重复回测
@@ -91,7 +111,12 @@ class StrategyOptimizer:
         """在任意数据切片上以给定参数跑完整流水线，返回 (metrics, engine)。"""
         micro = MicroStructure(chip_window=int(params["chip_window"]))
         fe = FeatureEngine(micro=micro, symbol_to_industry=self.symbol_to_industry)
-        features = fe.compute(ds)
+        # 真实数据寻优（use_feature_cache=True）：特征按 (区间,标的) 落盘缓存，
+        # 同一切片首 trial 计算一次、后续命中，避免每 trial 重算特征（关键性能优化）
+        if self.use_feature_cache:
+            features = fe.compute_cached(ds)
+        else:
+            features = fe.compute(ds)
 
         syn = SignalSynthesizer(
             weights=tuple(float(w) for w in params["weights"]),
@@ -114,6 +139,9 @@ class StrategyOptimizer:
             th_xs_exit=float(params.get("th_xs_exit", -0.3)),
             th_xs_reduce_high=float(params.get("th_xs_reduce_high", 0.2)),
             th_xs_crash=float(params.get("th_xs_crash", -0.6)),
+            w_xs_ms=float(params.get("w_xs_ms", 0.5)),
+            w_xs_purity=float(params.get("w_xs_purity", 0.3)),
+            w_xs_drawdown=float(params.get("w_xs_drawdown", 0.2)),
             # ---- 次日低开反包 ----
             th_reversal_gap=float(params.get("th_reversal_gap", -0.015)),
             th_reversal_ofss=float(params.get("th_reversal_ofss", 0.2)),
@@ -171,48 +199,171 @@ class StrategyOptimizer:
     # ------------------------------------------------------------------
 
     def objective(self, trial: optuna.Trial) -> float:
-        """优化目标：样本内年化夏普比率（最大化）。"""
+        """优化目标（最大化）：训练段年化 Sharpe − 软惩罚。
+
+        软惩罚在硬约束线内即生效（用于给 TPE 更光滑的引导，不替代约束）：
+            dd_pen × max(0, 最大回撤 − dd_soft)
+            to_pen × max(0, 年化换手 − to_soft)
+        """
         _, metrics = self._params_and_metrics(trial)
         sharpe = float(metrics.get("sharpe", float("nan")))
-        return sharpe if np.isfinite(sharpe) else _NAN_OBJECTIVE
+        if not np.isfinite(sharpe):
+            return _NAN_OBJECTIVE
+        pk = self.penalty_kwargs
+        score = sharpe
+        dd = float(metrics.get("max_drawdown", float("nan")))
+        if np.isfinite(dd):
+            score -= pk["dd_pen"] * max(0.0, dd - pk["dd_soft"])
+        to = float(metrics.get("turnover_annual", float("nan")))
+        if np.isfinite(to):
+            score -= pk["to_pen"] * max(0.0, to - pk["to_soft"])
+        return float(score)
 
     def constraints_func(self, trial: optuna.Trial) -> List[float]:
         """硬约束违反量（4 个，>= 0；0 = 满足，NaN → 最大违反）。"""
         _, metrics = self._params_and_metrics(trial)
-        violations = constraint_violations(metrics)
+        violations = constraint_violations(metrics, **self.constraint_kwargs)
         return [float(v) if np.isfinite(v) else _NAN_VIOLATION for v in violations]
 
     # ------------------------------------------------------------------
     # 寻优入口与结果
     # ------------------------------------------------------------------
 
-    def optimize(self, n_trials: Optional[int] = None) -> optuna.Study:
+    def optimize(self, n_trials: Optional[int] = None,
+                 study_name: str = "optuna_study",
+                 storage_path: Optional[str] = None) -> optuna.Study:
         """运行贝叶斯寻优，返回 Optuna Study。
 
-        TPE sampler 以 constraints_func 为硬约束：采样优先落在可行域。
+        storage_path 非空时使用持久化存储（JournalStorage 单文件）：
+        支持中途停止 / 断点续跑——已跑 trial 全部保留，重复调用从断点
+        继续新增 trial（n_trials 为"本次新增数"）。显式传 n_trials=0
+        表示「仅恢复已有结果、不再新增」，配合续跑把流程收尾
+        （best 选择 / 样本外评估）。恢复时显式重绑 TPESampler
+        （load_if_exists 会忽略传入 sampler），保证后续 trial 仍走
+        含硬约束的 TPE 采样。
         """
         sampler = TPESampler(seed=self.seed, constraints_func=self.constraints_func)
-        study = optuna.create_study(direction="maximize", sampler=sampler)
-        study.optimize(self.objective, n_trials=n_trials or self.n_trials)
+        if storage_path is None:
+            storage, load_if = None, False
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(storage_path)),
+                        exist_ok=True)
+            storage = optuna.storages.JournalStorage(
+                optuna.storages.journal.JournalFileBackend(
+                    storage_path,
+                    # Windows 无符号链接特权：改用"创建锁文件"式锁
+                    lock_obj=optuna.storages.journal.JournalFileOpenLock(
+                        storage_path)))
+            load_if = True
+        study = optuna.create_study(
+            study_name=study_name, storage=storage,
+            direction="maximize", sampler=sampler, load_if_exists=load_if)
+        if load_if:
+            study.sampler = sampler  # 续跑场景重绑含硬约束的采样器
+        study.optimize(self.objective,
+                       n_trials=None if n_trials is None
+                       else max(0, int(n_trials)))
         return study
+
+    def _trial_violations(self, trial: optuna.Trial) -> List[float]:
+        """该 trial 的硬约束违反量（需先在 _cache 中有评估结果）。"""
+        _, metrics = self._cache[trial.number]
+        return constraint_violations(metrics, **self.constraint_kwargs)
 
     def best(self, study: optuna.Study) -> Tuple[Dict[str, object], Dict[str, float]]:
         """返回 (最优参数, 其样本内指标)。
 
-        约束寻优下若无任何满足硬约束的 trial，Optuna 的 best_trial 会抛
-        ValueError：此时回退为按目标值（Sharpe）最优的 trial 兜底返回。
+        本进程已评估（_cache 中）的 trial 内：
+        - 优先返回「满足全部硬约束（self.constraint_kwargs 口径）且目标值
+          最优」的 trial；
+        - 无可行 trial 时，回退为按目标值（Sharpe）最优的已评估 trial 兜底。
+
+        断点续跑场景（本次进程未新增任何 trial、全部从 Journal 加载，
+        _cache 为空）：按目标值降序逐一对候选 trial 重建参数并回测重算，
+        返回首个满足硬约束者（最多 _MAX_RE_EVAL 个）；仍无可行解则回退为
+        目标值最优。
         """
-        try:
-            best_trial = study.best_trial
-        except ValueError:
-            candidates = [t for t in study.trials if t.value is not None]
-            if not candidates:
-                raise ValueError("study 无任何有效 trial") from None
-            best_trial = max(candidates, key=lambda t: float(t.value))
-            logger.warning("无满足硬约束的 trial，回退为按目标值最优（trial %d）",
-                           best_trial.number)
+        cached = [t for t in study.trials
+                  if t.value is not None and t.number in self._cache]
+        if cached:
+            feasible = [t for t in cached
+                        if all(float(v) <= 1e-9
+                               for v in self._trial_violations(t))]
+            pool = feasible or cached
+            best_trial = max(pool, key=lambda t: float(t.value))
+            if not feasible:
+                logger.warning(
+                    "无满足硬约束的 trial，回退为按目标值最优（trial %d）",
+                    best_trial.number)
+            else:
+                logger.info("满足硬约束的最优 trial: %d（Sharpe=%.4f）",
+                            best_trial.number, float(best_trial.value))
+            return self._cache[best_trial.number]
+
+        ranked = [t for t in study.trials if t.value is not None]
+        if not ranked:
+            raise ValueError("study 无任何有效 trial") from None
+        ranked.sort(key=lambda t: float(t.value), reverse=True)
+        logger.info("断点续跑：%d 个 Journal trial 无进程内缓存，"
+                    "按目标值降序重算候选指标（上限 %d 个）",
+                    len(ranked), _MAX_RE_EVAL)
+        for trial in ranked[:_MAX_RE_EVAL]:
+            params = SearchSpace.params_from_trial(trial)
+            metrics = self._evaluate(params)  # 训练段单点重算，补足未落盘指标
+            self._cache[trial.number] = (params, metrics)
+            if all(float(v) <= 1e-9 for v in
+                   constraint_violations(metrics, **self.constraint_kwargs)):
+                logger.info("续跑恢复：trial %d 满足硬约束（Sharpe=%.4f）",
+                            trial.number, float(trial.value))
+                return params, metrics
+        best_trial = ranked[0]
         params, metrics = self._cache[best_trial.number]
+        logger.warning("续跑恢复：前 %d 个候选均不满足硬约束，"
+                       "回退为按目标值最优（trial %d）",
+                       min(_MAX_RE_EVAL, len(ranked)), best_trial.number)
         return params, metrics
+
+    def top_candidates(self, study: optuna.Study, k: int = 5,
+                       max_re_eval: int = _MAX_RE_EVAL
+                       ) -> List[Tuple[Dict[str, object], Dict[str, float]]]:
+        """约束可行候选（按目标值降序，至多 k 个）。
+
+        供「训练段 top-k → 验证段复评」使用（严格三集：验证段参与选参、
+        测试段仅终评）。进程内已有缓存（本进程刚跑完）直接取；
+        Journal 断点续跑缺缓存的 trial 按目标值降序重算指标（上限
+        max_re_eval 个）。无可行候选时降级为按目标值最优的 k 个。
+
+        :return: [(params, 训练段metrics), ...]，目标值降序
+        """
+        def _metrics_of(t: optuna.Trial) -> Dict[str, float]:
+            if t.number in self._cache:
+                return self._cache[t.number][1]
+            params = SearchSpace.params_from_trial(t)
+            m = self._evaluate(params)
+            self._cache[t.number] = (params, m)
+            return m
+
+        # 1) 补足 Journal 无缓存候选的指标（按目标值降序优先，限个）
+        missing = [t for t in study.trials
+                   if t.value is not None and t.number not in self._cache]
+        missing.sort(key=lambda t: float(t.value), reverse=True)
+        for t in missing[:max_re_eval]:
+            _metrics_of(t)
+
+        ranked = [t for t in study.trials
+                  if t.value is not None and t.number in self._cache]
+        ranked.sort(key=lambda t: float(t.value), reverse=True)
+        feasible = [t for t in ranked
+                    if all(float(v) <= 1e-9 for v in
+                           constraint_violations(
+                               self._cache[t.number][1],
+                               **self.constraint_kwargs))]
+        pool = feasible or ranked
+        if not feasible:
+            logger.warning("top_candidates：无满足硬约束的 trial，"
+                           "降级按目标值取前 %d", k)
+        return [(self._cache[t.number][0], dict(self._cache[t.number][1]))
+                for t in pool[:k]]
 
     # ------------------------------------------------------------------
     # 收敛图
@@ -235,7 +386,7 @@ class StrategyOptimizer:
         fig, ax = plt.subplots(figsize=(9, 5))
         ax.axhline(_NAN_OBJECTIVE, color="gray", linestyle="--", linewidth=0.8,
                    label="NaN objective floor")
-        ax.scatter(x, y, s=18, alpha=0.6, label="trial Sharpe")
+        ax.scatter(x, y, s=18, alpha=0.6, label="trial score")
         # 可行域内最优值轨迹（cummax；含 NaN 的 trial 视为不达标跳过）
         best = -np.inf
         xs, ys = [], []
@@ -246,8 +397,8 @@ class StrategyOptimizer:
             ys.append(best if np.isfinite(best) else float("nan"))
         ax.plot(xs, ys, color="crimson", linewidth=1.6, label="best-so-far (feasible)")
         ax.set_xlabel("trial")
-        ax.set_ylabel("annualized Sharpe (in-sample)")
-        ax.set_title("Optimizer history (annualized Sharpe, in-sample)")
+        ax.set_ylabel("synthetic objective (Sharpe - penalties)")
+        ax.set_title("Optimizer history (synthetic objective, in-sample)")
         ax.legend()
         fig.tight_layout()
 

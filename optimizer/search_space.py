@@ -51,6 +51,10 @@ class SearchSpace:
         th_xs_exit: Tuple[float, float] = (-0.6, 0.0),
         th_xs_reduce_high: Tuple[float, float] = (0.1, 0.4),
         th_xs_crash: Tuple[float, float] = (-0.8, -0.65),
+        # XS 权重（w_xs_drawdown 由归一化推导：和恒为 1；
+        # 采样范围收窄保证 max(ms+purity)=0.9 → drawdown ≥ 0.1）
+        w_xs_ms: Tuple[float, float] = (0.3, 0.55),
+        w_xs_purity: Tuple[float, float] = (0.2, 0.35),
         # ---- 次日低开反包 ----
         th_reversal_gap: Tuple[float, float] = (-0.05, -0.005),
         th_reversal_ofss: Tuple[float, float] = (0.0, 0.4),
@@ -83,6 +87,7 @@ class SearchSpace:
         self.th_xs_exit = th_xs_exit
         self.th_xs_reduce_high = th_xs_reduce_high
         self.th_xs_crash = th_xs_crash
+        self.w_xs_ms, self.w_xs_purity = w_xs_ms, w_xs_purity
         # 反包
         self.th_reversal_gap = th_reversal_gap
         self.th_reversal_ofss = th_reversal_ofss
@@ -112,17 +117,14 @@ class SearchSpace:
 
         :return: 可直接解包给 SignalSynthesizer / MicroStructure / 回测引擎的字典
         """
-        w_ofss = trial.suggest_float("w_ofss", *self.w_ofss)
-        w_cps = trial.suggest_float("w_cps", *self.w_cps)
-        w_inst = trial.suggest_float("w_inst", *self.w_inst)
-        w_north = 1.0 - w_ofss - w_cps - w_inst  # 归一化：和恒为 1
-
-        params: Dict[str, object] = {
-            # 策略层（SignalSynthesizer）
-            "weights": (w_ofss, w_cps, w_inst, w_north),
-            # 窗口：WIN_INST → inst_window；WIN_CHIP_OLD → chip_window（因子层）
-            "inst_window": trial.suggest_int("win_inst", *self.win_inst),
-            "chip_window": trial.suggest_int("win_chip_old", *self.win_chip_old),
+        flat: Dict[str, float] = {
+            # 组合权重（W_NORTH 归一化推导见 _assemble）
+            "w_ofss": trial.suggest_float("w_ofss", *self.w_ofss),
+            "w_cps": trial.suggest_float("w_cps", *self.w_cps),
+            "w_inst": trial.suggest_float("w_inst", *self.w_inst),
+            # 窗口
+            "win_inst": trial.suggest_int("win_inst", *self.win_inst),
+            "win_chip_old": trial.suggest_int("win_chip_old", *self.win_chip_old),
             # 连续评分：ES
             "w_es_ms": trial.suggest_float("w_es_ms", *self.w_es_ms),
             "w_es_purity": trial.suggest_float("w_es_purity", *self.w_es_purity),
@@ -133,8 +135,9 @@ class SearchSpace:
             "th_xs_exit": trial.suggest_float("th_xs_exit", *self.th_xs_exit),
             "th_xs_reduce_high": trial.suggest_float(
                 "th_xs_reduce_high", *self.th_xs_reduce_high),
-            "th_xs_crash": trial.suggest_float(
-                "th_xs_crash", *self.th_xs_crash),
+            "th_xs_crash": trial.suggest_float("th_xs_crash", *self.th_xs_crash),
+            "w_xs_ms": trial.suggest_float("w_xs_ms", *self.w_xs_ms),
+            "w_xs_purity": trial.suggest_float("w_xs_purity", *self.w_xs_purity),
             # 次日低开反包
             "th_reversal_gap": trial.suggest_float(
                 "th_reversal_gap", *self.th_reversal_gap),
@@ -157,24 +160,86 @@ class SearchSpace:
                 "cancel_ratio_th", *self.cancel_ratio_th),
             "fund_stability_penalty": trial.suggest_float(
                 "fund_stability_penalty", *self.fund_stability_penalty),
-            # 状态 / 一票否决共用
+            # 状态 / 一票否决
             "th_retail_chase": trial.suggest_float(
                 "th_retail_chase", *self.th_retail_chase),
-            # 目标权重 Target_Weight（floor/cap 组装为裁剪区间，SignalSynthesizer 解包）
+            # 目标权重 Target_Weight（floor/cap 组装为裁剪区间）
             "base_weight": trial.suggest_float("base_weight", *self.base_weight),
             "reduce_step_ratio": trial.suggest_float(
                 "reduce_step_ratio", *self.reduce_step_ratio),
-            "tw_gmod_clip": (
-                trial.suggest_float("tw_gmod_floor", *self.tw_gmod_floor),
-                trial.suggest_float("tw_gmod_cap", *self.tw_gmod_cap)),
-            "tw_cmod_clip": (
-                trial.suggest_float("tw_cmod_floor", *self.tw_cmod_floor),
-                trial.suggest_float("tw_cmod_cap", *self.tw_cmod_cap)),
+            "tw_gmod_floor": trial.suggest_float("tw_gmod_floor", *self.tw_gmod_floor),
+            "tw_gmod_cap": trial.suggest_float("tw_gmod_cap", *self.tw_gmod_cap),
+            "tw_cmod_floor": trial.suggest_float("tw_cmod_floor", *self.tw_cmod_floor),
+            "tw_cmod_cap": trial.suggest_float("tw_cmod_cap", *self.tw_cmod_cap),
             # 撮合引擎
             "deadzone_th": trial.suggest_float("deadzone_th", *self.deadzone_th),
         }
-        trial.set_user_attr("w_north", w_north)
+        params = self._assemble(flat)
+        trial.set_user_attr("w_north", params["weights"][-1])
         return params
+
+    @staticmethod
+    def _assemble(flat: Dict[str, float]) -> Dict[str, object]:
+        """扁平采样值 → 代码层参数字典（归一化推导单一出口）。
+
+        W_NORTH = 1 - (W_OFSS+W_CPS+W_INST)；越界靠约束机制判不可行。
+        W_XS_DRAWDOWN = 1 - (W_XS_MS+W_XS_PURITY)：范围收窄保证
+        max(ms+purity)=0.9 → drawdown ≥ 0.1，恒为正。
+        """
+        w_ofss, w_cps, w_inst = flat["w_ofss"], flat["w_cps"], flat["w_inst"]
+        w_north = 1.0 - w_ofss - w_cps - w_inst
+        w_xs_ms, w_xs_purity = flat["w_xs_ms"], flat["w_xs_purity"]
+        return {
+            # 策略层（SignalSynthesizer）
+            "weights": (w_ofss, w_cps, w_inst, w_north),
+            # 窗口：WIN_INST → inst_window；WIN_CHIP_OLD → chip_window（因子层）
+            "inst_window": int(flat["win_inst"]),
+            "chip_window": int(flat["win_chip_old"]),
+            # 连续评分：ES
+            "w_es_ms": flat["w_es_ms"],
+            "w_es_purity": flat["w_es_purity"],
+            "w_es_mrs": flat["w_es_mrs"],
+            "es_sigmoid_k": flat["es_sigmoid_k"],
+            "th_es_entry": flat["th_es_entry"],
+            # 连续评分：XS
+            "th_xs_exit": flat["th_xs_exit"],
+            "th_xs_reduce_high": flat["th_xs_reduce_high"],
+            "th_xs_crash": flat["th_xs_crash"],
+            "w_xs_ms": w_xs_ms,
+            "w_xs_purity": w_xs_purity,
+            "w_xs_drawdown": 1.0 - w_xs_ms - w_xs_purity,
+            # 次日低开反包
+            "th_reversal_gap": flat["th_reversal_gap"],
+            "th_reversal_ofss": flat["th_reversal_ofss"],
+            "reversal_add_mult": flat["reversal_add_mult"],
+            "reversal_window_span": int(flat["reversal_window_span"]),
+            # 连续评分：PS
+            "base_decay_rate": flat["base_decay_rate"],
+            "win_decay_grace": int(flat["win_decay_grace"]),
+            "pnl_decay_profit_mult": flat["pnl_decay_profit_mult"],
+            "pnl_decay_loss_mult": flat["pnl_decay_loss_mult"],
+            "cancel_ratio_th": flat["cancel_ratio_th"],
+            "fund_stability_penalty": flat["fund_stability_penalty"],
+            # 状态 / 一票否决
+            "th_retail_chase": flat["th_retail_chase"],
+            # 目标权重 Target_Weight（floor/cap 组装为裁剪区间）
+            "base_weight": flat["base_weight"],
+            "reduce_step_ratio": flat["reduce_step_ratio"],
+            "tw_gmod_clip": (flat["tw_gmod_floor"], flat["tw_gmod_cap"]),
+            "tw_cmod_clip": (flat["tw_cmod_floor"], flat["tw_cmod_cap"]),
+            # 撮合引擎
+            "deadzone_th": flat["deadzone_th"],
+        }
+
+    @staticmethod
+    def params_from_trial(trial: optuna.Trial) -> Dict[str, object]:
+        """从 Optuna 已存 trial 重建代码层参数字典。
+
+        JournalStorage 断点续跑时，先前进程评估的 trial 无本进程缓存
+        （_cache），但参数已持久化于 trial.params；续跑恢复 / 断点分析
+        用本方法重建，与 suggest() 同源（归一化推导走同一 _assemble 出口）。
+        """
+        return SearchSpace._assemble(dict(trial.params))
 
     # ------------------------------------------------------------------
     # 可行性

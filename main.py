@@ -94,13 +94,42 @@ def _window_end_str(params: Dict[str, object]) -> str:
 # 真实数据（data1+data2）回测区间与参数：
 # （旧"放宽环境层闸门"（th_mrs_min/th_industry_min）已随二值化闸门废除而移除，
 #   与寻优链路参数集合保持一致，保证寻优结果可在实盘复现。）
-REAL_START = "2023-01-03"
+REAL_START = "2024-01-02"
 REAL_END = "2024-12-31"
+# 最优参数（当前 = 候选 #2 comparison）：seed=42 journal trial 11（验证段 Sharpe=+1.27 候选）
+# 对照注记—生产默认 trial 14（训练段 top-1）：2024 单年 603019 Sharpe +1.03 / +295 万；
+# 本组为 A/B 检验用，2024 单年 603019 结果见运行日志。窗口沿用寻优固定值 (1,1)。
 REAL_PARAMS: Dict[str, object] = {
-    **SMOKE_PARAMS,
+    # 组合权重（W_OFSS+W_CPS+W_INST+W_NORTH == 1，W_NORTH 归一化推导）
+    "weights": (0.2069, 0.3547, 0.3981, 0.0403),
+    # 窗口（寻优固定 (1,1)，与特征缓存签名一致）
+    "inst_window": 1, "chip_window": 1,
+    # ---- 连续评分：ES ----
+    "w_es_ms": 0.2261, "w_es_purity": 0.3573, "w_es_mrs": 0.2324,
+    "es_sigmoid_k": 3.2786, "th_es_entry": 0.2148,
+    # ---- 连续评分：XS ----
+    "th_xs_exit": -0.4482, "th_xs_reduce_high": 0.2893, "th_xs_crash": -0.6547,
+    "w_xs_ms": 0.4213, "w_xs_purity": 0.2341,
+    "w_xs_drawdown": 1.0 - 0.4213 - 0.2341,  # 归一化推导 = 0.3446
+    # ---- 次日低开反包 ----
+    "th_reversal_gap": -0.0472, "th_reversal_ofss": 0.1758,
+    "reversal_add_mult": 0.7632, "reversal_window_span": 0,
+    # ---- 连续评分：PS ----
+    "base_decay_rate": 0.9097, "win_decay_grace": 31,
+    "pnl_decay_profit_mult": 0.4506, "pnl_decay_loss_mult": 1.5633,
+    "cancel_ratio_th": 0.3682, "fund_stability_penalty": 0.5913,
+    # ---- 状态 / 一票否决 ----
+    "th_retail_chase": 0.7961,
+    # ---- 目标权重 Target_Weight（floor/cap 裁剪区间）----
+    "base_weight": 0.1913, "reduce_step_ratio": 0.601,
+    "tw_gmod_clip": (0.1947, 1.7618),
+    "tw_cmod_clip": (0.6898, 1.2783),
+    # ---- 撮合引擎（调仓死区）----
+    "deadzone_th": 0.0831,
 }
 # 真实数据回测股票子集（空列表 = 全部 20 只；指定代码可大幅缩短运行时间）
-REAL_SYMBOLS: List[str] = ["600171", "600460"]
+# 单票检验：603019（计算机设备 / 中科曙光）
+REAL_SYMBOLS: List[str] = ["603019"]
 
 
 # ----------------------------------------------------------------------
@@ -334,6 +363,9 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
         th_xs_exit=float(params.get("th_xs_exit", -0.3)),
         th_xs_reduce_high=float(params.get("th_xs_reduce_high", 0.2)),
         th_xs_crash=float(params.get("th_xs_crash", -0.6)),
+        w_xs_ms=float(params.get("w_xs_ms", 0.5)),
+        w_xs_purity=float(params.get("w_xs_purity", 0.3)),
+        w_xs_drawdown=float(params.get("w_xs_drawdown", 0.2)),
         th_reversal_gap=float(params.get("th_reversal_gap", -0.015)),
         th_reversal_ofss=float(params.get("th_reversal_ofss", 0.2)),
         reversal_add_mult=float(params.get("reversal_add_mult", 0.5)),
@@ -384,6 +416,7 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
         ExecutionCost(),
         PositionSizer(),
         ds, signals,
+        deadzone_th=float(params.get("deadzone_th", 0.05)),
     )
     trade_log, equity_curve = engine.run()
     filled = trade_log[trade_log["shares"] > 0]

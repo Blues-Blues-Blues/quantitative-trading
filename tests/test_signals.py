@@ -121,12 +121,19 @@ _MAPPING = {"600000": "银行"}
 
 
 def mk_features(axis, symbols=("600000",), base=None, overrides=None):
+    u = dict(base or {})
     merged = dict(_BULL_BASE)
-    merged.update(base or {})
+    merged.update(u)
     rows = []
     for t in axis:
         for s in symbols:
-            rows.append({"ts": t, "symbol": s, **merged})
+            row = dict(merged)
+            # 资金流恒为常量（非 rolling_std 扰动）：常量大额流 → 无状态 tanh
+            # _norm_flow 直接输出 ±1 强信号；overrides/base 统一走 merged。
+            row["inst_flow"] = merged["inst_flow"]
+            row["retail_flow"] = merged["retail_flow"]
+            row.update({"ts": t, "symbol": s})
+            rows.append(row)
     df = pd.DataFrame(rows)
     if overrides:
         for ts, upd in overrides.items():
@@ -180,30 +187,141 @@ class TestSignalSynthesizer:
     def test_agent_ms_formula(self):
         axis = cn_minutes(["2024-01-02"])
         syn = SignalSynthesizer(weights=(0.35, 0.25, 0.25, 0.15))
-        f = mk_features(axis)
-        agent = syn._agent_ms(f).iloc[0]
-        # 0.35*0.5 + 0.25*0.3 + 0.25*1 + 0.15*0.2
-        assert agent == pytest.approx(0.53)
+        f = mk_features(axis)  # inst_flow 常量 1e8，无滚动扰动
+        res = syn._agent_ms(f)
+        # 机构流无状态 tanh：inst_flow=1e8 → scale=1e7 → tanh(10)≈1（不衰减、无盲区）。
+        inst = np.tanh(f["inst_flow"].astype(float) / 1e7)
+        expect = (0.35 * f["ofss"] + 0.25 * f["cps"] + 0.25 * inst
+                  + 0.15 * f["north_sync"])
+        np.testing.assert_allclose(res.to_numpy(), expect.to_numpy(), rtol=1e-9)
+        # 常量大额资金流 → inst≈+1 强信号（无 rolling_std 置 0 / 开盘钝化）
+        assert res.iloc[0] == pytest.approx(0.35*0.5 + 0.25*0.3 + 0.25*1.0 + 0.15*0.2)
+        # 值域边界 [-1, 1]
+        assert (res.dropna() >= -1.0).all()
+        assert (res.dropna() <= 1.0).all()
 
     def test_final_ms_formula(self):
         syn = SignalSynthesizer()
         out = syn.final_ms(pd.Series([0.53]), pd.Series([0.05]), pd.Series([0.1]))
         assert out.iloc[0] == pytest.approx((0.53 + 0.05) * 1.1)
 
+    def test_final_ms_short_side_amplified(self):
+        """多空不对称：全球恶化(global_mod<0)时，负向 agent_ms 被放大而非压制。"""
+        syn = SignalSynthesizer()
+        out = syn.final_ms(pd.Series([-0.5, 0.5]),
+                           pd.Series([0.0, 0.0]),
+                           pd.Series([-0.3, -0.3]))
+        # 空头：base=-0.5<0 → scale=1-(-0.3)=1.3 → -0.65
+        np.testing.assert_allclose(out.iloc[0], -0.65, rtol=1e-9)
+        # 多头：base=0.5>=0 → scale=1+(-0.3)=0.7 → 0.35
+        np.testing.assert_allclose(out.iloc[1], 0.35, rtol=1e-9)
+        # 负向信号幅度被放大（|-0.65| > |0.35|）
+        assert abs(out.iloc[0]) > abs(out.iloc[1])
+
+    def test_final_ms_bounds(self):
+        """量纲有界：多空与 global 极端组合下，输出严格在 [-1, 1]。"""
+        syn = SignalSynthesizer()
+        out = syn.final_ms(pd.Series([1.0, -1.0, 0.5, -0.6]),
+                           pd.Series([0.3, -0.3, 0.2, 0.1]),
+                           pd.Series([0.8, -0.8, 0.8, -0.8]))
+        assert (out.dropna() >= -1.0).all()
+        assert (out.dropna() <= 1.0).all()
+        assert out.iloc[0] == pytest.approx(1.0)   # 多头饱和上限
+        assert out.iloc[1] == pytest.approx(-1.0)  # 空头饱和下限
+
+    def test_final_ms_nan_preserved(self):
+        """agent_ms 缺失 → 输出保持 NaN（fillna(0) 中间计算不污染）。"""
+        syn = SignalSynthesizer()
+        out = syn.final_ms(pd.Series([np.nan, 0.4]),
+                           pd.Series([0.05, 0.05]),
+                           pd.Series([0.1, 0.1]))
+        assert np.isnan(out.iloc[0])
+        # 第二行：base=0.45>=0 → scale=1.1 → 0.495
+        np.testing.assert_allclose(out.iloc[1], 0.45 * 1.1, rtol=1e-9)
+
     def test_capital_purity_formula(self):
         axis = cn_minutes(["2024-01-02"])
-        f = mk_features(axis)  # inst>0, north=0.2, retail<0, youzi<0
+        f = mk_features(axis)  # 常量流：inst=1e8, north=0.2, retail=-1e5, youzi=-5e5
         purity = SignalSynthesizer().capital_purity(f).iloc[0]
-        assert purity == pytest.approx(0.35 + 0.25 * 0.2 + 0.2 + 0.2)
+        # 无状态 tanh 平滑（scale=1e7，常量大流不衰减）+ 固定权重重归一化
+        wi, wn, wr, wy = 0.35, 0.25, 0.20, 0.20
+        norm_inst = np.tanh(1e8 / 1e7)
+        norm_retail = np.tanh(-1e5 / 1e7)
+        norm_youzi = np.tanh(-5e5 / 1e7)
+        num = wi * norm_inst + wn * 0.2 - wr * norm_retail - wy * norm_youzi
+        expect = num / (wi + wn + wr + wy)
+        assert purity == pytest.approx(expect, rel=1e-9)
+        # 常量大额机构净流入 → 强正纯净度（不再因常量 rolling_std==0 误判为中性 0）
+        assert purity > 0.3
+
+    def test_capital_purity_small_flow_neutral(self):
+        """资金流极小值不引发突变：常量极小正流 → tanh 近 0 → 纯净度中性。"""
+        syn = SignalSynthesizer()
+        n = 10
+        f = pd.DataFrame({
+            "symbol": ["A"] * n, "inst_flow": [1e-6] * n,
+            "retail_flow": [0.0] * n, "youzi_flow": [0.0] * n,
+            "north_sync": [0.0] * n,
+        })
+        purity = syn.capital_purity(f)
+        assert np.allclose(purity, 0.0)
+
+    def test_capital_purity_missing_renormalize(self):
+        """缺失重归一化（与 Agent_MS 一致）：部分缺失按剩余权重归一化；
+        全缺失 → w_sum==0 → 输出 NaN。"""
+        axis = cn_minutes(["2024-01-02"])
+        f = mk_features(axis)  # 常量流：inst=1e8, north=0.2, retail=-1e5, youzi=-5e5
+        # 全缺失 → w_sum==0 → NaN
+        full_nan = f.assign(inst_flow=np.nan, retail_flow=np.nan,
+                            youzi_flow=np.nan, north_sync=np.nan)
+        assert SignalSynthesizer().capital_purity(full_nan).isna().all()
+        # 仅 youzi 缺失 → 剔除权重 0.20，剩余 (inst,north,retail) 归一化
+        part = f.assign(youzi_flow=np.nan)
+        p = SignalSynthesizer().capital_purity(part)
+        assert not p.isna().any()
+        wi, wn, wr = 0.35, 0.25, 0.20
+        num = wi * np.tanh(1e8 / 1e7) + wn * 0.2 - wr * np.tanh(-1e5 / 1e7)
+        np.testing.assert_allclose(p.iloc[0], num / (wi + wn + wr), rtol=1e-9)
+
+    def test_capital_purity_bounds(self):
+        """输出上下界：强多/空流下饱和到 ±1，且恒在 [-1, 1]。"""
+        syn = SignalSynthesizer()
+        n = 8
+        # 多头：机构/北向强流入 + 零售/游资强流出 → 纯净度饱和 +1
+        bull = pd.DataFrame({
+            "symbol": ["A"] * n, "inst_flow": [1e8] * n,
+            "retail_flow": [-1e8] * n, "youzi_flow": [-1e8] * n,
+            "north_sync": [1.0] * n,
+        })
+        pb = syn.capital_purity(bull)
+        assert (pb >= -1.0).all() and (pb <= 1.0).all()
+        assert pb.iloc[0] == pytest.approx(1.0)  # 0.35+0.25+0.20+0.20
+        # 空头：机构/北向强流出 + 零售/游资强涌入 → 纯净度饱和 -1
+        bear = pd.DataFrame({
+            "symbol": ["A"] * n, "inst_flow": [-1e8] * n,
+            "retail_flow": [1e8] * n, "youzi_flow": [1e8] * n,
+            "north_sync": [-1.0] * n,
+        })
+        pe = syn.capital_purity(bear)
+        assert pe.iloc[0] == pytest.approx(-1.0)
+        assert (pe >= -1.0).all() and (pe <= 1.0).all()
 
     def test_agent_ms_nan_renormalize(self):
         axis = cn_minutes(["2024-01-02"])
         syn = SignalSynthesizer(weights=(0.35, 0.25, 0.25, 0.15))
         f = mk_features(axis, overrides={"2024-01-02 09:30": {"ofss": np.nan}})
-        agent = syn._agent_ms(f).iloc[0]
-        # ofss 缺失 → 剩余权重 (0.25,0.25,0.15) 和 0.65 重归一化
-        expect = (0.25 * 0.3 + 0.25 * 1 + 0.15 * 0.2) / 0.65
-        assert agent == pytest.approx(expect)
+        res = syn._agent_ms(f)
+        idx = pd.Timestamp("2024-01-02 09:30")
+        # ofss 缺失 → 剔除其权重 0.35，剩余权重 (cps, inst, north)=(0.25,0.25,0.15)，
+        # 和 0.65 重归一化；常量大额 inst_flow → inst = tanh(1e8/1e7) ≈ 1。
+        expect = (0.25 * f.loc[idx, "cps"] + 0.25 * np.tanh(1e8 / 1e7)
+                  + 0.15 * f.loc[idx, "north_sync"]) / 0.65
+        np.testing.assert_allclose(res.loc[idx], expect, rtol=1e-9)
+        # 仅一分量缺失 → 输出非 NaN（重归一化成功）
+        assert not np.isnan(res.loc[idx])
+        # 值域边界 [-1, 1]
+        assert (res.dropna() >= -1.0).all()
+        assert (res.dropna() <= 1.0).all()
 
     def test_all_nan_agent_ms_is_nan(self):
         axis = cn_minutes(["2024-01-02"])
@@ -257,13 +375,19 @@ def _pos(**mut):
 class TestEntryScore:
 
     def test_bull_es_above_entry_threshold(self):
-        """牛市基准：ES ≈ sigmoid(3 * 0.3776) ≈ 0.756 > th_es_entry=0.4。"""
+        """牛市基准：ES 显著高于 th_es_entry=0.4。
+        final_ms 已在 [-1,1] 直接使用（不再二次 clip）；mrs 经 ±mrs_clip
+        有界缩放后加权，再 sigmoid 归一。"""
         syn, row = _row()
-        # final_ms=0.638 → 0.319；purity=0.8；mrs=0.1 → 0.0333
-        expect_raw = 0.4 * 0.319 + 0.3 * 0.8 + 0.3 * (0.1 / 3.0)
-        expect = 1.0 / (1.0 + np.exp(-3.0 * expect_raw))
+        final_ms = float(row["final_ms"])  # 原值直接参与
+        mrs_c = float(np.clip(row["mrs"], -syn.mrs_clip,
+                              syn.mrs_clip)) / syn.mrs_clip
+        purity = float(row["capital_purity"])
+        expect_raw = (syn.w_es_ms * final_ms + syn.w_es_purity * purity
+                      + syn.w_es_mrs * mrs_c)
+        expect = 1.0 / (1.0 + np.exp(-syn.es_sigmoid_k * expect_raw))
         assert syn.calculate_entry_score(row) == pytest.approx(expect)
-        assert 0.0 <= syn.calculate_entry_score(row) <= 1.0
+        assert 0.0 < syn.calculate_entry_score(row) < 1.0
 
     def test_weak_es_below_entry_threshold(self):
         syn = bull_syn()
@@ -273,24 +397,31 @@ class TestEntryScore:
         assert syn.calculate_entry_score(row) < 0.1
 
     def test_es_bounded_even_with_extreme_inputs(self):
-        """有界化：Final_MS 极端 ±10 也只按 ±final_ms_clip 参与，ES 不饱和出界。"""
-        syn, row = _row(final_ms=10.0, capital_purity=1.0, mrs=10.0)
+        """有界化：值域未定的 mrs（±10）仍被 clip 到 ±mrs_clip，ES 恒在 (0,1)。
+        final_ms 按契约已在 [-1,1]，直接使用其上界 1.0。"""
+        syn, row = _row(final_ms=1.0, capital_purity=1.0, mrs=10.0)
         es = syn.calculate_entry_score(row)
-        assert 0.0 <= es <= 1.0
-        assert es == pytest.approx(
-            1.0 / (1.0 + np.exp(-3.0 * (0.4 * 1.0 + 0.3 * 1.0 + 0.3 * 1.0))))
+        assert 0.0 < es < 1.0
+        # mrs_c = clip(10, ±3)/3 = 1；state 为牛 (S_PUSH) → 无游资衰减
+        es_raw = (syn.w_es_ms * 1.0 + syn.w_es_purity * 1.0 + syn.w_es_mrs * 1.0)
+        assert es == pytest.approx(1.0 / (1.0 + np.exp(-syn.es_sigmoid_k * es_raw)))
 
-    def test_es_youzi_only_decay(self):
+    def test_es_youzi_only_masked_to_zero(self):
+        """游资独舞 → 硬掩码否决：ES 直接输出 0.0（非衰减乘积）。"""
         syn, row = _row(state=S_YOUZI_ONLY)
-        base = syn.calculate_entry_score(row)
-        assert base == pytest.approx(0.5 * syn.calculate_entry_score(
-            row.drop("state").to_dict() | {"state": S_PUSH}))
+        assert syn.calculate_entry_score(row) == pytest.approx(0.0)
+        # 非游资同特征行 → 正常 sigmoid > 0
+        push = syn.calculate_entry_score(row.drop("state").to_dict()
+                                         | {"state": S_PUSH})
+        assert push > 0.0
+        assert not (syn.calculate_entry_score(row) == pytest.approx(push))
 
     def test_es_missing_component_neutral(self):
         """分量缺失视为中性 0：不影响其余分量，ES 不崩溃。"""
         syn, row = _row(final_ms=np.nan, mrs=np.nan)
         es = syn.calculate_entry_score(row)
-        expect = 1.0 / (1.0 + np.exp(-3.0 * (0.3 * 0.8)))
+        expect = 1.0 / (1.0 + np.exp(-3.0 * (syn.w_es_purity
+                                             * float(row["capital_purity"]))))
         assert es == pytest.approx(expect)
 
     def test_es_invariant_to_unused_columns(self):
@@ -298,6 +429,42 @@ class TestEntryScore:
         syn, row = _row(rs=np.nan, industry_ms=np.nan)
         assert syn.calculate_entry_score(row) == pytest.approx(
             syn.calculate_entry_score(bull_eval_row(syn)))
+
+    def test_compute_es_vectorized_long(self):
+        """批量 _compute_es：全程 pd.Series index 自动对齐、缺失填 0、mrs 有界
+        缩放、游资硬掩码为 0，返回值与输入索引对齐（不乱序、不丢失）、严格在
+        [0, 1)。"""
+        syn = bull_syn()
+        idx = cn_minutes(_D3)
+        n = len(idx)
+        fms = pd.Series(([0.5, -0.3, np.nan] * (n // 3 + 1))[:n], index=idx)
+        purity = pd.Series(([0.2, -0.4, 0.9] * (n // 3 + 1))[:n], index=idx)
+        mrs = pd.Series(([5.0, -2.0, 1.2] * (n // 3 + 1))[:n], index=idx)
+        youzi = pd.Series(([False, True, False] * (n // 3 + 1))[:n], index=idx)
+        es = syn._compute_es(fms, purity, mrs, youzi)
+        # 索引在计算前后未丢失、未乱序
+        assert es.index.equals(idx)
+        assert es.index.tolist() == idx.tolist()
+        # 游资行才允许 0，其余行严格 (0, 1)
+        assert (es[youzi] == 0.0).all()
+        assert ((es[~youzi] > 0.0) & (es[~youzi] < 1.0)).all()
+        # 逐行对照：fms 缺失→0；mrs clip ±mrs_clip；youzi=True → 硬掩码 0
+        # 第 1 行：非游资，fms=0.5、purity=0.2、mrs=5.0→clip=3/3=1
+        mrs_c1 = float(np.clip(5.0, -syn.mrs_clip, syn.mrs_clip)) / syn.mrs_clip
+        raw1 = syn.w_es_ms * 0.5 + syn.w_es_purity * 0.2 + syn.w_es_mrs * mrs_c1
+        assert es.iloc[0] == pytest.approx(
+            1.0 / (1.0 + np.exp(-syn.es_sigmoid_k * raw1)))
+        # 第 2 行：游资独舞 → 硬掩码 0（不再衰减后 sigmoid）
+        assert es.iloc[1] == pytest.approx(0.0)
+        # 第 3 行：非游资，fms 缺失→0、purity=0.9、mrs=1.2
+        mrs_c3 = float(np.clip(1.2, -syn.mrs_clip, syn.mrs_clip)) / syn.mrs_clip
+        raw3 = syn.w_es_ms * 0.0 + syn.w_es_purity * 0.9 + syn.w_es_mrs * mrs_c3
+        assert es.iloc[2] == pytest.approx(
+            1.0 / (1.0 + np.exp(-syn.es_sigmoid_k * raw3)))
+        # 索引对齐测试：打乱 purity 顺序，结果仍按输入 idx 对齐（非位置剥离）
+        shuffled = purity.copy().sample(frac=1.0, random_state=0)
+        es_align = syn._compute_es(fms, shuffled, mrs, youzi)
+        assert es_align.index.equals(idx)
 
 
 class TestPositionScore:
@@ -352,33 +519,68 @@ class TestPositionScore:
         pos = _pos(bars_held=40)  # effective=10
         assert syn.time_decay(row, pos) == pytest.approx(0.95)
 
-    def test_fund_stability_cancel_ratio(self):
+    def test_time_decay_avg_cost_zero_fallback(self):
+        """avg_cost = 0（或 <=1e-6）→ pnl 无法计算 → 安全回退 base_decay_rate。"""
         syn = SignalSynthesizer()
         row = bull_eval_row(syn).copy()
-        row["cancel_ratio"] = 0.5
-        assert syn.fund_stability(row) == pytest.approx(0.7)
-        row["cancel_ratio"] = 0.1
-        assert syn.fund_stability(row) == pytest.approx(1.0)
+        row["close"] = 10.0
+        pos = _pos(bars_held=40, avg_cost=0.0)  # effective=10
+        assert syn.time_decay(row, pos) == pytest.approx(0.95)
+        pos.avg_cost = 1e-9  # 极小均值同样视为非法
+        assert syn.time_decay(row, pos) == pytest.approx(0.95)
 
-    def test_fund_stability_nan_neutral(self):
-        """cancel_ratio 缺失（无逐笔数据）→ 中性 1.0，不惩罚。"""
-        syn = SignalSynthesizer()
-        row = bull_eval_row(syn).copy()
-        row["cancel_ratio"] = np.nan
-        assert syn.fund_stability(row) == pytest.approx(1.0)
+    def test_time_decay_negative_base_defense(self):
+        """纵深防御：setattr 强行放大 loss_mult 产生负底数，不抛复数/domain error。
 
-    def test_fund_stability_book_thin(self):
-        """盘口变薄（|OBI| 与 |big_flow| 同时趋零）→ 惩罚。"""
+        绕过构造校验后 raw_factor = 1-(1-0.95)*100 = -4 → factor 钳到 0.01 下限，
+        输出恒为合法 [0.1, 1.0] 内的 float。
+        """
         syn = SignalSynthesizer()
+        syn.pnl_decay_loss_mult = 100.0  # → raw_factor = 1 - 0.05*100 = -4
         row = bull_eval_row(syn).copy()
-        row["cancel_ratio"] = 0.0
-        row["obi"] = 0.01
-        row["big_flow"] = 0.01
-        assert syn.book_thin(row) is True
-        assert syn.fund_stability(row) == pytest.approx(0.7)
-        row["obi"] = 0.5  # 盘口失衡恢复 → 不再变薄
-        assert syn.book_thin(row) is False
-        assert syn.fund_stability(row) == pytest.approx(1.0)
+        row["close"] = 5.0  # 深亏 → 走 loss_mult 分支
+        pos = _pos(bars_held=40, avg_cost=10.0)
+        td = syn.time_decay(row, pos)  # 不应抛 ComplexWarning / math domain error
+        assert isinstance(td, float)
+        assert 0.1 <= td <= 1.0
+        # factor = max(0.01, -4) = 0.01 → effective=10/interval=10 → 0.01^1，clip≥0.1
+        assert td == pytest.approx(max(0.1, 0.01))
+
+    def test_fund_stability_vectorized_differential(self):
+        """纯向量化 _compute_fund_stability：多行、NaN、阈值触发/不触发分片正确。
+
+        行0: cancel=NaN(→不撤单)、obi/big 大(不薄) → 1.0
+        行1: cancel=0.5>th(→撤单惩罚) → 0.7
+        行2: cancel=0.1 不撤单、obi/big=0.01<th(双薄) → 0.7
+        行3: cancel=0.1 不撤单、obi 大(不薄) → 1.0
+        """
+        syn = bull_syn()
+        idx = cn_minutes(_D3)
+        n = len(idx)
+        cancel = pd.Series(([np.nan, 0.5, 0.1, 0.1] * (n // 4 + 1))[:n], index=idx)
+        obi = pd.Series(([0.9, 0.3, 0.01, 0.5] * (n // 4 + 1))[:n], index=idx)
+        flow = pd.Series(([0.9, 0.05, 0.01, 0.5] * (n // 4 + 1))[:n], index=idx)
+        fs = syn._compute_fund_stability(cancel, obi, flow)
+        assert fs.index.equals(idx)                      # index 对齐
+        assert fs.mode().iloc[0] in (1.0, syn.fund_stability_penalty)
+        assert set(fs.unique()) <= {1.0, syn.fund_stability_penalty}
+        assert (fs == 1.0).sum() >= 2                    # 至少行0/行3 中性
+        # 逐行精确断言（周期性模式，取第 0~3 行校验）
+        assert fs.iloc[0::4].eq(1.0).all()
+        assert fs.iloc[1::4].eq(syn.fund_stability_penalty).all()
+        assert fs.iloc[2::4].eq(syn.fund_stability_penalty).all()
+        assert fs.iloc[3::4].eq(1.0).all()
+
+    def test_fund_stability_missing_columns_downgrade(self):
+        """缺列（全 NaN 输入）→ 安全降级为全 1.0，不抛 KeyError/异常。"""
+        syn = bull_syn()
+        idx = cn_minutes(_D3)
+        n = len(idx)
+        cancel = pd.Series(np.nan, index=idx)
+        obi = pd.Series(np.nan, index=idx)
+        flow = pd.Series(np.nan, index=idx)
+        fs = syn._compute_fund_stability(cancel, obi, flow)
+        assert list(fs.unique()) == [1.0]
 
     def test_ps_in_bounds(self):
         syn, row = _row()
@@ -388,15 +590,63 @@ class TestPositionScore:
         assert 0.0 <= ps <= 1.0
         assert ps == pytest.approx(syn.calculate_entry_score(row) * 1.0 * 1.0)
 
+    def test_ps_no_clip_equivalence(self):
+        """外层 clip 已移除：结果与裸连乘 es*td*fs 完全一致，且天然有界。"""
+        syn, row = _row()
+        pos = _pos(bars_held=40, avg_cost=10.0)
+        row["close"] = 9.5  # 浮亏 → 真实衰减 factor=0.90
+        raw = (syn.calculate_entry_score(row) * syn.time_decay(row, pos)
+               * float(row.get("fund_stability", 1.0)))
+        ps = syn.calculate_position_score(row, pos)
+        assert ps == pytest.approx(raw)
+        assert 0.0 <= ps <= 1.0
+
+    def test_ps_es_nan_zeros(self):
+        """es 缺失 → 强制 0 兜底：PS = 0.0（标量与 Series 双路）。"""
+        syn = bull_syn()
+        assert syn._compute_ps(float("nan"), 1.0, 1.0).iloc[0] == pytest.approx(0.0)
+        es_s = pd.Series([np.nan, 0.5], index=["a", "b"])
+        ps = syn._compute_ps(es_s, 1.0, 1.0)
+        assert ps["a"] == pytest.approx(0.0)
+        assert ps["b"] == pytest.approx(0.5)
+
+    def test_ps_time_decay_nan_neutral(self):
+        """time_decay 缺失 → 回退 1.0（不打折）：PS = es * fund_stability。"""
+        syn = bull_syn()
+        es_s = pd.Series([0.5])
+        fs_s = pd.Series([0.7])
+        ps = syn._compute_ps(es_s, float("nan"), fs_s)
+        assert ps.iloc[0] == pytest.approx(0.5 * 1.0 * 0.7)
+        # 两个乘数同时缺失 → 均不打折 = es
+        ps2 = syn._compute_ps(0.5, float("nan"), float("nan"))
+        assert ps2.iloc[0] == pytest.approx(0.5)
+
+    def test_compute_ps_vectorized_long(self):
+        """批量 _compute_ps：pd.Series index 对齐、es→0 / 乘数→1 兜底、去 clip 天然有界。"""
+        syn = bull_syn()
+        idx = cn_minutes(_D3)
+        n = len(idx)
+        es = pd.Series(([0.5, np.nan, 0.2] * (n // 3 + 1))[:n], index=idx)
+        td = pd.Series(([0.9, 1.0, np.nan] * (n // 3 + 1))[:n], index=idx)
+        fs = pd.Series(([0.7, 1.0, 0.7] * (n // 3 + 1))[:n], index=idx)
+        ps = syn._compute_ps(es, td, fs)
+        assert ps.index.equals(idx)                                # 索引未丢失/乱序
+        assert ps.iloc[0] == pytest.approx(0.5 * 0.9 * 0.7)
+        assert ps.iloc[1] == pytest.approx(0.0)                    # es 缺失 → 0
+        assert ps.iloc[2] == pytest.approx(0.2 * 1.0 * 0.7)        # td 缺失 → 1.0
+        assert ((ps >= 0.0) & (ps <= 1.0)).all()                   # 去 clip 后仍不越界
+
 
 class TestExitScore:
 
     def test_xs_formula(self):
         syn = SignalSynthesizer()
-        row = bull_eval_row(syn).copy()   # final_ms=0.638→0.319, purity=0.8
+        row = bull_eval_row(syn).copy()   # final_ms 已严格在 [-1,1]，直接使用原值
         pos = _pos(high_price_watermark=10.0)
         row["close"] = 9.5                # drawdown = 0.05
-        expect = 0.5 * 0.319 + 0.3 * 0.8 - 0.2 * 0.05
+        final_ms = float(row["final_ms"])
+        expect = (syn.w_xs_ms * final_ms + syn.w_xs_purity
+                  * float(row["capital_purity"]) - syn.w_xs_drawdown * 0.05)
         assert syn.calculate_exit_score(row, pos) == pytest.approx(expect)
 
     def test_xs_drawdown_from_high_watermark(self):
@@ -424,6 +674,33 @@ class TestExitScore:
         """一票否决输入缺失（无 big_flow/指数）→ 不触发（保守不误杀）。"""
         syn, row = _row(big_flow=np.nan, index_close=np.nan, index_vwap=np.nan)
         assert syn.veto(row) is False
+
+    def test_xs_zero_watermark_division_defense(self):
+        """纯函数零除防御：hwm=0 → dd=0，安全返回基于 ms/purity 的有效分数。"""
+        syn = SignalSynthesizer()
+        ws = (syn.w_xs_ms, syn.w_xs_purity, syn.w_xs_drawdown)
+        xs = syn._compute_xs(0.8, 0.5, 0.0, 9.5, False, ws)  # hwm=0 → dd=0
+        assert isinstance(xs, float)
+        assert xs == pytest.approx(syn.w_xs_ms * 0.8 + syn.w_xs_purity * 0.5)
+        assert -1.0 <= xs <= 1.0
+
+    def test_xs_nan_neutralized(self):
+        """纯函数空值中性：final_ms=NaN 与 final_ms=0.0 完全等价。"""
+        syn = SignalSynthesizer()
+        ws = (syn.w_xs_ms, syn.w_xs_purity, syn.w_xs_drawdown)
+        a = syn._compute_xs(np.nan, 0.5, 10.0, 9.5, False, ws)
+        b = syn._compute_xs(0.0, 0.5, 10.0, 9.5, False, ws)
+        assert a == pytest.approx(b)
+        # None 同样中立化
+        c = syn._compute_xs(None, 0.5, 10.0, 9.5, False, ws)
+        assert c == pytest.approx(b)
+
+    def test_xs_absolute_veto_ignores_score(self):
+        """纯函数绝对否决：极度利好因子 + veto_flag=True → 严格 -1.0。"""
+        syn = SignalSynthesizer()
+        ws = (syn.w_xs_ms, syn.w_xs_purity, syn.w_xs_drawdown)
+        xs = syn._compute_xs(1.0, 1.0, 10.0, 5.0, True, ws)  # 高ms/高purity/深回撤
+        assert xs == -1.0
 
 
 class TestHardFilters:
@@ -538,11 +815,12 @@ class TestStateMachine:
         assert list(frame.columns)[:4] == ["timestamp", "symbol", "action", "state"]
 
     def test_youzi_only_blocks_entry(self):
-        # 全程游资主导 + 散户盲从 → 状态恒为 S_youzi_only（ES 衰减），绝不开仓
+        # 全程游资主导 + 散户盲从 → 状态恒为 S_youzi_only（ES 硬掩码=0.0），绝不开仓
         base = {"youzi_flow": 1e5, "inst_flow": -1e5, "retail_flow": 1e8}
         sm, ds, features = self._run(base=base)
         sigs = sm.run(ds, features)
         assert all(s.state == S_YOUZI_ONLY for s in sigs)
+        assert all(s.metrics["es"] == pytest.approx(0.0) for s in sigs)
         assert all(s.action != ACT_BUY for s in sigs)
 
     def test_sell_on_youzi_runaway_veto(self):
@@ -563,14 +841,15 @@ class TestStateMachine:
             assert sm.positions["600000"].entry_time > sell.timestamp
 
     def test_decay_reduce_on_final_ms_dip(self):
-        """XS 落入 (0, th_xs_reduce)：chain_mod=-1 → final_ms 转弱 → DECAY_REDUCE。"""
+        """XS 落入 (th_xs_exit, th_xs_reduce) 减仓带：chain_mod=-1 → final_ms 转弱
+        → DECAY_REDUCE。final_ms 直接满幅参与（不再 clip 减半），XS 可为负但仍在带内。"""
         sm, ds, features = self._run(overrides={
             "2024-01-04 10:30": {"chain_mod": -1.0}})
         sigs = sm.run(ds, features)
         sig = next(s for s in sigs
                    if s.timestamp == pd.Timestamp("2024-01-04 10:30"))
         assert sig.action == ACT_DECAY_REDUCE
-        assert 0.0 < sig.metrics["xs"] < 0.2
+        assert sm.syn.th_xs_exit < sig.metrics["xs"] < sm.syn.th_xs_reduce_high
         assert sig.metrics["reduce_fraction"] == 0.5
         assert "600000" in sm.positions  # 减仓不清仓
 
@@ -725,7 +1004,8 @@ class TestTargetWeights:
             syn.tw_gmod_clip[0] * syn.tw_cmod_clip[0])
 
     def test_buy_signal_writes_target_weight(self):
-        sm, ds, features = TestStateMachine()._run()
+        # min_add_interval 取极大值以禁用后续 ADD，隔离验证"BUY 建仓时 simulated_weight == target_weight"
+        sm, ds, features = TestStateMachine()._run(sm_kw={"min_add_interval": 1000})
         sigs = sm.run(ds, features)
         first = min((s for s in sigs if s.action == ACT_BUY),
                     key=lambda s: s.timestamp)

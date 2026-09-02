@@ -4,6 +4,8 @@
 
 当前开发状态：**真实数据接入（`data/real_loader.py`，万得 L2 parquet + 日频 CSV）、数据管道与多源时间对齐、核心因子与主体情绪特征工程、连续评分信号与状态机（ES/PS/XS + A股硬过滤）、Target_Weight 差额调仓撮合引擎、绩效评估与收益归因、Optuna 贝叶斯寻优、项目主入口（`main.py --data smoke|real`）均已实现**；冒烟模式内置 mock 数据秒级跑通全链路，真实数据模式全链路验证通过（20 只股票 × 4 个月 / 2 只 × 2 年）。
 
+评分模块已完成**纯函数化 / 向量化架构重构**：`ES`（`_compute_es`）、`PS`（`_compute_ps`）、`Fund_Stability`（`_compute_fund_stability`）、`XS`（`_compute_xs`）均为无状态纯算子，长表整列向量化、index 对齐、缺失值中性化兜底、负底数/零除几何防护；`_build_eval_table` 预计算 `fund_stability` 整列供状态机消费，游资独舞走硬掩码否决（ES=0）/一票否决（XS=-1）而非数学衰减。
+
 ## 功能特性
 
 - **真实数据接入**：`data/real_loader.py` 将 `data/data1`（万得 Level-2 行情/逐笔成交/逐笔委托 parquet）与 `data/data2`（宏观/北向/两融/行业/龙虎榜 CSV）清洗、解析、对齐为标准 `DataSlice`，缺表自动降级，全部因子严格防未来函数
@@ -14,7 +16,7 @@
 - **多因子打分**：趋势质量 TQ（0~3）+ 量能确认 VC（0~2），配合动态阈值（滚动分位数）
 - **时间对齐管道**：`TimeAligner` 多源异构数据时钟对齐（宏观/外盘 T-1 全量对齐、龙虎榜 T+1 隔离），内置 `verify_no_lookahead` 防未来函数校验
 - **因子体系**：资金主体分层（小/中/大/超大单净流）、微观结构因子（OFSS 盘口/CPS 筹码/PSS 价格结构）、宏观共振因子（MRS/GRS/IRS 与 Global_Mod/Chain_Mod），统一由 `FeatureEngine` 调度
-- **连续评分信号**：ES（入场分，sigmoid 合成资金主体/纯净度/量价共振）+ PS（持仓分 = ES×Time_Decay×Fund_Stability）+ XS（出局分 clip 加权），数值统一有界化；独立 A 股硬过滤层（ST 禁买、涨跌停禁买卖、时间窗 10:00~14:50、成交额门槛）前置否决 + 一票否决（游资溃逃 / 大盘跳水），全部评分参数可寻优
+- **连续评分信号**：全向量化纯函数算子——**ES**（入场分 = `sigmoid` 合成资金主体/纯净度/量价共振，游资独舞硬掩码=0）、**PS**（持仓分 = `ES×Time_Decay×Fund_Stability` 变比分片、缺失兜底）、**XS**（出局分 = 权重线性加权 + 高水位回撤、一票否决硬 -1 的纯函数）；**Fund_Stability** 在评估表预计算整列、缺列/NaN 安全降级 1.0；独立 A 股硬过滤层（ST 禁买、涨跌停禁买卖、时间窗 10:00~14:50、成交额门槛）前置否决，全部评分参数可寻优
 - **目标权重 Target_Weight**：连续评分 → 分钟级目标持仓比例（base × ES/PS × 宏观/行业乘子），驱动撮合引擎差额调仓
 - **回测撮合引擎**：事件驱动型分钟级撮合——Target_Weight 差额调仓 + 调仓死区（防过度换手）+ T+1 顺延挂起（当日买入锁定、跌停跳过）、动态滑点（订单参与率冲击模型）、佣金/印花税/过户费、单股与总杠杆上限风控，输出完整成交日志与净值曲线
 - **超参数优化**：Optuna 贝叶斯寻优（`StrategyOptimizer`），Dirichlet 式权重归一化（和为 1）、TPE 原生多重硬约束（回撤 < 15%、胜率 > 55%、盈亏比 > 1.5、有效交易 ≥ 30 笔）、样本内年化 Sharpe 最大化、优化历程收敛图；搜索空间只含决策链实际读取的参数（旧二值化闸门死参数已清理），寻优结果可直接注入 `main.py` 实盘复现
@@ -206,9 +208,10 @@ ds.validate()
 
 `strategy/signals.py` 提供 `SignalSynthesizer`（连续评分合成）与 `TradingStateMachine`（逐 Bar 状态机）：
 
-- **ES 入场分**：sigmoid 合成资金主体（机构净流带权重偏置）、资金纯净度、量价共振（MRS）等维度，区间 [0,1]；构造参数全部可寻优（w_es_ms / w_es_purity / w_es_mrs / es_sigmoid_k / th_es_entry）
-- **PS 持仓分**：`ES × Time_Decay × Fund_Stability`；Time_Decay = 前 30 分钟（win_decay_grace）恒 1.0，此后按浮盈亏非对称衰减：浮盈 factor=0.975（减半）、浮亏 factor=0.90（加倍），`clip(factor^(eff_bars/10), 0.1, 1.0)`
-- **XS 出局分**：汇入均线偏离、动量衰减、回撤（高水位）、超时等维度，clip 加权到 [-1,1]，驱动 清仓 / 减仓 / 持有 三分支
+- **ES 入场分**（纯向量化 `_compute_es`，长表整列计算）：`es = sigmoid(k · (w_ms·final_ms + w_purity·capital_purity + w_mrs·mrs_c))`；`final_ms`/`capital_purity` 已定 `[-1,1]` 直接使用（缺失→0，不二次 clip），大盘项 `mrs_c = clip(mrs, ±mrs_clip)/mrs_clip`；**游资独舞硬掩码**：`s_youzi_only=True` 时 `es = 0`；参数可寻优（`w_es_*` / `es_sigmoid_k` / `th_es_entry`），纯函数内 index 对齐、缺失中性化
+- **PS 持仓分**（纯向量化 `_compute_ps`）：`PS = ES × Time_Decay × Fund_Stability`，三乘数天然有界故移除外层 `clip`；`es` 缺失→0、`time_decay`/`fund_stability` 缺失→1.0 不做折减；`Time_Decay` 前 `win_decay_grace` 恒 1.0，此后按浮盈亏非对称衰减（浮盈 factor=0.975、浮亏=0.90，`max(0.01, factor)` 防负底数，`clip(factor^(eff_bars/10), 0.1, 1.0)`）
+- **Fund_Stability**（纯向量化预计算整列）：`_compute_fund_stability(cancel_ratio, obi, big_flow)` 在 `_build_eval_table` 注入 `fund_stability` 列——撤单率超阈或盘口变薄（`|OBI|` 与 `|big_flow|` 同时趋零）→ `penalty`，缺列/NaN（`fillna` 后不触发）安全降级 1.0；状态机仅消费该列，不重复计算
+- **XS 出局分**（纯函数 `_compute_xs`）：权重线性加权 + 高水位回撤 `max(0, (hwm-close)/hwm)`（`hwm≤1e-6 → 0` 防除零）clip 到 [-1,1]；`veto_flag=True` 一票否决无视权重硬返回 -1.0
 - **A 股硬过滤层**（否决前置）：ST 禁买、涨停禁买/跌停禁卖、交易时间窗 10:00~14:50（10:00 整之前禁买，防开盘冲高骗局）、成交额门槛；未持仓时任一不过即不开仓（`hard_filters` 与状态机 BUY 口径一致）
 - **一票否决**：游资溃逃（资金流为负且散户追高超阈值）或大盘跳水（沪深300 跌破 VWAP×(1-1.5%)）→ XS=-1，强制出局
 - **状态机动作**：BUY / ADD / SELL / DECAY_REDUCE / HOLD，输出含 `target_weight` 在内的全量评分快照（metrics）
@@ -247,13 +250,13 @@ trade_log, equity_curve = eng.run()   # 完整成交日志 + 逐 Bar 净值曲�
 python -m pytest tests/ -v
 ```
 
-当前 175 项单元测试全部通过（合成 mock 数据，不联网；运行约 40 秒）：
+当前 **190** 项单元测试全部通过（合成 mock 数据，不联网；运行约 40 秒）：
 
 | 测试文件 | 覆盖范围 |
 | --- | --- |
 | `tests/test_data_aligner.py` | 多源时间对齐、T-1/T+1 隔离、防未来函数校验、DataSlice 组装 |
 | `tests/test_factors.py` / `tests/test_features.py` | 微观结构/环境/主体分层因子与 FeatureEngine 端到端 |
-| `tests/test_state_machine.py` / `tests/test_signals.py` | 连续评分公式（ES/PS/XS）精确值、硬过滤层、状态机 BUY/ADD/DECAY/SELL/HOLD 全流程 |
+| `tests/test_state_machine.py` / `tests/test_signals.py` | 连续评分纯函数公式（ES/PS/Fund_Stability/XS）精确值 + 向量化/NaN/零除/否决等健壮性用例、硬过滤层、状态机全流程 |
 | `tests/test_backtest_engine.py` | 下一 Bar 成交、T+1 挂起卖出、涨跌停拦截、成本滑点、仓位/杠杆风控、成交日志与净值曲线 |
 | `tests/test_optimizer.py` | 绩效指标纯函数、搜索空间归一化、StrategyOptimizer 端到端寻优、Walk-Forward OOS 报告 |
 | `tests/test_analytics.py` | 实时流 JSONL、绩效指标精确值、因子归因盈亏守恒、IC/Rank IC/IR 双模式、复盘清单导出、Dashboard |
@@ -270,14 +273,14 @@ python -m pytest tests/ -v
 | 指标计算 `indicators/trend.py` `shock.py` `basic.py` | ✅ 已完成 |
 | 因子体系 `indicators/`（agent_profiling / microstructure / environment / feature_engine） | ✅ 已完成 |
 | 仓位管理（PositionSizer + Target_Weight 差额调仓） | ✅ 已完成 |
-| 信号合成与状态机 `strategy/signals.py`（ES/PS/XS 连续评分 + A股硬过滤 + 一票否决） | ✅ 已完成 |
+| 信号合成与状态机 `strategy/signals.py`（ES/PS/XS + A股硬过滤 + 一票否决） | ✅ 已完成（评分算子已纯函数化/向量化重构） |
 | 回测撮合引擎 `engine/`（backtest / execution / portfolio / risk_control） | ✅ 已完成（差额调仓 + 死区 + T+1 顺延） |
 | 绩效指标 `analytics/metrics.py` + `performance.py`（PerformanceAnalyzer） | ✅ 已完成（含 Calmar/Sortino/持仓周期/复盘清单/Dashboard） |
 | 收益归因 `analytics/attribution.py`（因子暴露分解 + IC/Rank IC/IR） | ✅ 已完成 |
 | 实时流 `analytics/real_time_stream.py`（StreamLogger JSONL） | ✅ 已完成 |
 | 机器学习优化 `optimizer/`（search_space / bayesian_opt / walk_forward） | ✅ 已完成 |
 | 项目主入口 `main.py`（--data smoke / real） | ✅ 已完成 |
-| 单元测试 `tests/` | ✅ 175 项通过（信号 73 + 引擎 30 + 优化器 21 + 归因/IC/流 21 + 对齐 15 + 特征 15） |
+| 单元测试 `tests/` | ✅ 190 项通过（信号 88 + 引擎 30 + 优化器 21 + 归因/IC/流 21 + 对齐 15 + 特征 15） |
 | 旧策略壳 `strategy/`（base / position / sentiment / state_machine） | 🗑️ 已废弃（空壳死代码，由 signals.py 与 risk_control 取代，待清理） |
 | Brinson 基准归因 | 🚧 规划中（当前为因子暴露分解，需基准收益） |
 

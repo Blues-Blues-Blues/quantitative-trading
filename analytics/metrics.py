@@ -226,6 +226,7 @@ def trade_stats(trade_log: pd.DataFrame) -> Dict[str, float]:
 def evaluate(equity_curve: pd.DataFrame, trade_log: pd.DataFrame) -> Dict[str, float]:
     """完整绩效评估：返回全部优化/约束所需的指标。"""
     st = trade_stats(trade_log)
+    turnover, turnover_annual = _turnover_metrics(trade_log, equity_curve)
     return {
         "sharpe": daily_sharpe(equity_curve),
         "max_drawdown": max_drawdown(equity_curve),
@@ -233,18 +234,46 @@ def evaluate(equity_curve: pd.DataFrame, trade_log: pd.DataFrame) -> Dict[str, f
         "win_rate": float(st["win_rate"]),
         "profit_loss_ratio": float(st["profit_loss_ratio"]),
         "total_pnl": float(st["total_pnl"]),
+        # 双边换手：成交额(买+卖) / 期间平均权益（倍数）；年化按 244 日折算。
+        # 高频换手是 A 股实测最大亏损源之一，作为寻优软惩罚与硬约束的输入
+        "turnover": turnover,
+        "turnover_annual": turnover_annual,
     }
+
+
+def _turnover_metrics(trade_log: pd.DataFrame,
+                      equity_curve: pd.DataFrame) -> Tuple[float, float]:
+    """双边换手率（倍/区间）与年化换手率。
+
+    turnover = Σ成交额(买入+卖出) / mean(总权益)；turnover_annual = turnover × 244 / 交易日数。
+    无成交时返回 (0.0, 0.0)；权益均值非法时返回 NaN。
+    """
+    if trade_log is None or len(trade_log) == 0:
+        return 0.0, 0.0
+    filled = trade_log[trade_log["shares"] > 0]
+    if filled.empty or "amount" not in filled.columns:
+        return 0.0, 0.0
+    notional = float(filled["amount"].astype(float).sum())
+    s = _equity_series(equity_curve)
+    avg_eq = float(s.mean())
+    if not np.isfinite(avg_eq) or avg_eq <= 1e-9:
+        return float("nan"), float("nan")
+    days = len(s.resample("D").last().dropna())
+    turnover = notional / avg_eq
+    annual = turnover * TRADING_DAYS / days if days else float("nan")
+    return float(turnover), float(annual)
 
 
 def constraint_violations(metrics: Dict[str, float],
                           max_drawdown: float = 0.15,
                           win_rate: float = 0.55,
                           pl_ratio: float = 1.5,
-                          min_trades: int = 30) -> List[float]:
+                          min_trades: int = 30,
+                          max_turnover_annual: float = 1e9) -> List[float]:
     """硬约束违反量（>= 0，0 = 满足；NaN 视为最大违反 1e9）。
 
     返回顺序与 Optuna constraints_func 约定一致：
-        [回撤, 胜率, 盈亏比, 交易笔数]
+        [回撤, 胜率, 盈亏比, 交易笔数, 年化换手]
     """
     def _v(value: float, limit: float, direction: str) -> float:
         v = float(value)
@@ -259,4 +288,6 @@ def constraint_violations(metrics: Dict[str, float],
         _v(metrics.get("win_rate", float("nan")), win_rate, "gt"),
         _v(metrics.get("profit_loss_ratio", float("nan")), pl_ratio, "gt"),
         _v(metrics.get("n_trades", float("nan")), float(min_trades), "gt"),
+        _v(metrics.get("turnover_annual", float("nan")),
+           float(max_turnover_annual), "lt"),
     ]

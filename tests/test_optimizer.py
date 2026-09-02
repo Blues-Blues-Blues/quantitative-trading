@@ -227,9 +227,14 @@ class TestMetrics:
         )
         m = evaluate(curve, log)
         assert set(m) == {"sharpe", "max_drawdown", "n_trades", "win_rate",
-                          "profit_loss_ratio", "total_pnl"}
+                          "profit_loss_ratio", "total_pnl",
+                          "turnover", "turnover_annual"}
+        # 双边换手：成交额(1000+1200) / 平均权益(115) ≈ 19.13；权益曲线仅覆盖 1 个交易日
+        assert m["turnover"] == pytest.approx(2200 / 115.0, rel=1e-6)
+        assert m["turnover_annual"] == pytest.approx(m["turnover"] * 244,
+                                                     rel=1e-6)
         v = constraint_violations(m)
-        assert len(v) == 4
+        assert len(v) == 5
         assert all(x >= 0 for x in v)
         # 只有 1 笔交易 → 交易笔数违反（30 - 1 = 29）
         assert v[3] == pytest.approx(29.0)
@@ -239,7 +244,7 @@ class TestMetrics:
                                    "win_rate": float("nan"),
                                    "profit_loss_ratio": float("nan"),
                                    "n_trades": float("nan")})
-        assert v == [1e9, 1e9, 1e9, 1e9]
+        assert v == [1e9, 1e9, 1e9, 1e9, 1e9]
 
 
 # ----------------------------------------------------------------------
@@ -277,6 +282,14 @@ class TestSearchSpace:
             # 旧二值化闸门参数已从搜索空间移除（P0-1/P1-3 清理）
             for dead_k in ("win_hold_max", "th_global_min", "th_adr_min"):
                 assert dead_k not in p
+
+    def test_params_from_trial_roundtrip(self):
+        """journal 续跑重建：params_from_trial(trial) 与 suggest() 输出完全一致。"""
+        ss = SearchSpace()
+        for _ in range(5):
+            trial = optuna.create_study().ask()
+            p = ss.suggest(trial)
+            assert SearchSpace.params_from_trial(trial) == p
 
     def test_is_feasible_rejects_out_of_range(self):
         ss = SearchSpace()
@@ -321,7 +334,8 @@ class TestStrategyOptimizer:
         opt = _make_optimizer()
         study = opt.optimize(n_trials=4)
         v = opt.constraints_func(study.trials[0])
-        assert len(v) == 4 and all(x >= 0 for x in v)
+        # 5 项约束：回撤/胜率/盈亏比/交易笔数/年化换手；默认换手上限 1e9 → 恒满足
+        assert len(v) == 5 and all(x >= 0 for x in v)
 
     def test_plot_history(self, tmp_path):
         opt = _make_optimizer()

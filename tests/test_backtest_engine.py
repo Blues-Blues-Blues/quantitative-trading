@@ -107,12 +107,19 @@ _BULL_BASE = dict(
 
 
 def mk_features(axis, symbols=("600000",), base=None, overrides=None):
+    u = dict(base or {})
     merged = dict(_BULL_BASE)
-    merged.update(base or {})
+    merged.update(u)
     rows = []
     for t in axis:
         for s in symbols:
-            rows.append({"ts": t, "symbol": s, **merged})
+            row = dict(merged)
+            # 资金流恒为常量（非 rolling_std 扰动）：无状态 tanh 平滑下，
+            # 常量大额流直接输出 ±1 强信号；base 显式覆盖统一走 merged。
+            row["inst_flow"] = merged["inst_flow"]
+            row["retail_flow"] = merged["retail_flow"]
+            row.update({"ts": t, "symbol": s})
+            rows.append(row)
     df = pd.DataFrame(rows)
     if overrides:
         for ts, upd in overrides.items():
@@ -191,7 +198,7 @@ class TestTPlusOne:
         # D0 10:00 BUY（成交 10:30 当日）；D0 10:30 SELL 信号 → 当日锁仓挂起，
         # 次日（D1）开盘强制卖出；D1 起链式因子持续为负 → 不再重新入场。
         # 注：新架构下需纯度转负（retail/youzi 转正 + inst 转负）才能使 XS<=0。
-        weak = {"chain_mod": -1.0, "inst_flow": -1e5,
+        weak = {"chain_mod": -1.0, "inst_flow": -1e8, "north_sync": -0.2,
                 "retail_flow": 1e8, "youzi_flow": 1e5}
         ov = {}
         # D0 10:30 起至最后一日全天弱化：SELL 后不再重新入场
@@ -256,7 +263,7 @@ class TestLimit:
 
     def test_limit_down_blocks_sell(self):
         # D1 10:00 SELL 信号（D0 买入已解冻）→ 撮合于 10:30，该 Bar 盘中触及跌停 → 拒绝卖出
-        weak = {"chain_mod": -1.0, "inst_flow": -1e5,
+        weak = {"chain_mod": -1.0, "inst_flow": -1e8, "north_sync": -0.2,
                 "retail_flow": 1e8, "youzi_flow": 1e5}
         ds, signals = full_env(dates=_D4,
                                overrides={"2024-01-03 10:00": weak})
@@ -440,7 +447,7 @@ class TestOutputs:
         # D0 10:00 BUY（成交 10:30）；D1 14:30 SELL 信号（次日已解冻）→ 15:00 卖出清仓；
         # D2/D3 全天弱化 → 不再重新入场。
         # 新架构下需纯度转负（retail/youzi 转正 + inst 转负）才能使 XS<=0。
-        weak = {"chain_mod": -1.0, "inst_flow": -1e5,
+        weak = {"chain_mod": -1.0, "inst_flow": -1e8, "north_sync": -0.2,
                 "retail_flow": 1e8, "youzi_flow": 1e5}
         ov = {"2024-01-03 14:30": weak}
         for d in ("2024-01-04", "2024-01-05"):

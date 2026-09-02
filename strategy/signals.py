@@ -13,11 +13,11 @@
     Industry_MS   行业近 N 交易日资金流累计变化率（日频）
 
 连续评分（废弃二值化开平仓闸门的信号判定，全部系数可寻优）：
-    入场分 ES = sigmoid(w_es_ms*Final_MS_c + w_es_purity*Capital_Purity
+    入场分 ES = sigmoid(w_es_ms*Final_MS + w_es_purity*Capital_Purity
                         + w_es_mrs*MRS_c) ∈ [0, 1]
-        Final_MS_c = clip(Final_MS, ±final_ms_clip) / final_ms_clip   （有界化）
+        Final_MS / Capital_Purity 已严格在 [-1, 1]，直接使用，缺失 → 0
         MRS_c      = clip(MRS, ±mrs_clip) / mrs_clip                 （有界化）
-        S_youzi_only 状态衰减：ES *= es_youzi_decay（默认 0.5）
+        S_youzi_only 硬掩码否决：ES = 0.0（游资独舞直接清零）
     持仓分 PS = ES * Time_Decay * Fund_Stability ∈ [0, 1]
         Time_Decay：前 win_decay_grace 分钟为保护期 = 1.0（防刚入场被误判减仓）；
             此后按浮盈亏非对称衰减（effective_bars = bars_held - win_decay_grace）：
@@ -27,7 +27,7 @@
             Time_Decay = clip(factor ** (effective_bars / time_decay_interval),
                               0.1, 1.0)
         Fund_Stability = 撤单率 > cancel_ratio_th 或盘口变薄 → 惩罚系数，否则 1.0
-    出局分 XS = w_xs_ms*Final_MS_c + w_xs_purity*Capital_Purity
+    出局分 XS = w_xs_ms*Final_MS + w_xs_purity*Capital_Purity
                 - w_xs_drawdown*Drawdown_From_High ∈ [-1, 1]
         一票否决（强制 XS = -1.0）：big_flow<0 且 Retail_Chase>th_retail_chase
         （游资溃逃）；或沪深300 日内跌破 VWAP*(1-circuit_index_drop)（大盘跳水）
@@ -98,6 +98,9 @@ ACT_SELL = "SELL"
 ACT_HOLD = "HOLD"
 ACT_DECAY_REDUCE = "DECAY_REDUCE"   # 阶梯减仓（XS 回落区间）
 
+# 资金流无状态平滑基准（tanh 归一化，无滚动窗口 / 时序累积依赖）
+_DEFAULT_FLOW_SCALE = 1e7  # 默认 1000 万基准量
+
 # ---- 合成所需的最小特征列 ----
 REQUIRED_FEATURES: List[str] = [
     "ofss", "cps", "inst_flow", "north_sync", "retail_flow", "youzi_flow",
@@ -110,6 +113,32 @@ def _drop_grouper_level(s):
     if isinstance(s.index, pd.MultiIndex):
         return s.reset_index(level=0, drop=True)
     return s
+
+
+def _norm_flow(flow_series: pd.Series,
+               amount_series: Optional[pd.Series] = None) -> np.ndarray:
+    """无状态资金流平滑：norm_flow = tanh(flow / scale)，量纲有界到 (-1, 1)。
+
+    彻底移除 rolling_std 标准化（不再有常量大流→0 误判、开盘前 N 根由
+    min_periods 导致的钝化盲区、突发反转时 std 剧增引发的信号滞后——
+    全部是时序累积 / 滚动窗口状态不良特性，此处全部无状态化）。
+
+    scale 基准：
+      - 提供 amount_series：scale = clip(amount * 0.05, 1e6, 1e8)，逐 bar 按
+        成交额自适应规模（amount 缺失的 bar 回退到默认 1e7）；
+      - 未提供 amount_series：scale = 1e7（默认 1000 万基准量）。
+
+    flow 缺失 → 输出 NaN（交由上层缺失权重重归一化处理，不强行置 0）。
+    无任何滚动窗口、无时序累积依赖、无开盘前 N 根盲区。
+    """
+    flow = flow_series.astype(float)
+    if amount_series is None:
+        scale = np.full(len(flow), _DEFAULT_FLOW_SCALE, dtype=float)
+    else:
+        amt = amount_series.astype(float).to_numpy()
+        computed = np.clip(amt * 0.05, 1e6, 1e8)
+        scale = np.where(np.isnan(computed), _DEFAULT_FLOW_SCALE, computed)
+    return np.tanh(flow.to_numpy() / scale)
 
 
 @dataclass
@@ -187,10 +216,8 @@ class SignalSynthesizer:
         w_es_ms: float = 0.4,          # Final_MS 权重
         w_es_purity: float = 0.3,      # Capital_Purity 权重
         w_es_mrs: float = 0.3,         # MRS 权重
-        final_ms_clip: float = 2.0,    # Final_MS 有界化半宽（clip ±2 后 /2）
         mrs_clip: float = 3.0,         # MRS 有界化半宽（clip ±3 后 /3）
         es_sigmoid_k: float = 3.0,     # sigmoid 陡度
-        es_youzi_decay: float = 0.5,   # S_youzi_only 状态衰减系数
         th_es_entry: float = 0.4,      # 开仓 ES 门槛
         # ---- 持仓分 PS ----
         base_decay_rate: float = 0.95,     # 基准衰减率（每 time_decay_interval 分钟）
@@ -274,9 +301,8 @@ class SignalSynthesizer:
                 f"(1-base_decay_rate)*mult 必须 < 1（防 factor<=0 → NaN），"
                 f"当前 base={base_decay_rate}, profit={pnl_decay_profit_mult}, "
                 f"loss={pnl_decay_loss_mult}")
-        if final_ms_clip <= 0 or mrs_clip <= 0:
-            raise ValueError(f"final_ms_clip/mrs_clip 必须为正（有界化分母防除零），"
-                             f"当前: {final_ms_clip} / {mrs_clip}")
+        if mrs_clip <= 0:
+            raise ValueError(f"mrs_clip 必须为正（有界化分母防除零），当前: {mrs_clip}")
         if time_decay_interval <= 0:
             raise ValueError(f"time_decay_interval 必须为正（指数分母防除零），"
                              f"当前: {time_decay_interval}")
@@ -332,10 +358,8 @@ class SignalSynthesizer:
         self.w_es_ms = w_es_ms
         self.w_es_purity = w_es_purity
         self.w_es_mrs = w_es_mrs
-        self.final_ms_clip = final_ms_clip
         self.mrs_clip = mrs_clip
         self.es_sigmoid_k = es_sigmoid_k
-        self.es_youzi_decay = es_youzi_decay
         self.th_es_entry = th_es_entry
 
         # PS
@@ -392,18 +416,27 @@ class SignalSynthesizer:
     # ------------------------------------------------------------------
 
     def _agent_ms(self, features: pd.DataFrame) -> pd.Series:
-        """主体情绪分：加权合成，缺失分量按剩余权重重归一化，全缺失 → NaN。"""
+        """主体情绪分：加权合成，缺失分量按剩余权重重归一化，全缺失 → NaN。
+
+        Inst_Flow 经无状态 _norm_flow 平滑（tanh 有界，量纲自适应成交额或固定
+        1e7 基准，无 rolling_std / 打开盘前 N 根盲区）：
+            norm_inst = tanh(inst_flow / scale)
+        inst_flow 缺失 → norm 为 NaN（作为缺失分量参与权重重归一化，不强行置 0）。
+        """
+        amount = features["amount"] if "amount" in features.columns else None
+        inst = _norm_flow(features["inst_flow"], amount)
+
         parts = pd.DataFrame({
             "ofss": features["ofss"].astype(float),
             "cps": features["cps"].astype(float),
-            "inst": np.sign(features["inst_flow"]),
+            "inst": inst,
             "north": features["north_sync"].astype(float),
         })
         w = np.array([self.w_ofss, self.w_cps, self.w_inst, self.w_north])
-        mask = parts.notna()
+        mask = parts.notna().to_numpy()
         wsum = (mask * w).sum(axis=1)
-        score = (parts.fillna(0.0).to_numpy() * w).sum(axis=1)
-        # 全 NaN 时 wsum==0 → 保持 NaN
+        score = np.where(mask, parts.fillna(0.0).to_numpy() * w, 0.0).sum(axis=1)
+        # 全缺失时 wsum==0 → 保持 NaN
         return pd.Series(np.where(wsum > 0, score / np.where(wsum > 0, wsum, np.nan),
                                   np.nan), index=features.index)
 
@@ -560,20 +593,65 @@ class SignalSynthesizer:
 
     def final_ms(self, agent_ms: pd.Series, chain_mod: pd.Series,
                  global_mod: pd.Series) -> pd.Series:
-        """最终市场情绪分 = (Agent_MS + Chain_Mod) * (1 + Global_Mod)。
+        """最终市场情绪分（多空对称修正，量纲有界）。
 
-        Chain_Mod / Global_Mod 缺失视为中性 0（不惩罚也不奖励）。
+        base_ms  = clip(agent_ms + chain_mod, -1, 1)；宏观作乘性门控：
+            base_ms >= 0（多头偏向）→ scale = 1 + global_mod
+            base_ms <  0（空头偏向）→ scale = 1 - global_mod
+                 （全球越恶化 global_mod 越负，空头信号被放大而非压制）
+        final_ms = clip(base_ms * scale, -1, 1)。
+        Chain_Mod / Global_Mod 缺失视为中性 0；agent_ms 缺失 → 输出保持 NaN。
         """
-        chain = chain_mod.fillna(0.0).astype(float)
-        gmod = global_mod.fillna(0.0).astype(float)
-        return (agent_ms.astype(float) + chain) * (1.0 + gmod)
+        agent = agent_ms.astype(float)
+        chain = chain_mod.fillna(0.0).astype(float).to_numpy()
+        gmod = global_mod.fillna(0.0).astype(float).to_numpy()
+
+        base = np.clip(agent.fillna(0.0).to_numpy() + chain, -1.0, 1.0)
+        scale = np.where(base >= 0.0, 1.0 + gmod, 1.0 - gmod)
+        out = np.clip(base * scale, -1.0, 1.0)
+        # agent 缺失 → 恢复 NaN（不能让 fillna(0) 的中间计算污染输出）
+        out = np.where(agent.isna().to_numpy(), np.nan, out)
+        return pd.Series(out, index=agent_ms.index)
 
     def capital_purity(self, features: pd.DataFrame) -> pd.Series:
-        """资金纯净度：机构/北向流入加分，散户/游资流入减分。"""
-        return (0.35 * np.sign(features["inst_flow"])
-                + 0.25 * features["north_sync"].fillna(0.0)
-                - 0.2 * np.sign(features["retail_flow"])
-                - 0.2 * np.sign(features["youzi_flow"]))
+        """资金纯净度：聪明钱增益 - 噪声成分惩罚（连续化，动态缺失重归一化）。
+
+        资金流全部经无状态 _norm_flow 平滑（tanh 有界，量纲自适应成交额或固定
+        1e7 基准，无 rolling_std / 打开盘前 N 根盲区 / 反转信号滞后）。
+
+        固定权重：w_inst=0.35, w_north=0.25, w_retail=0.20, w_youzi=0.20。
+        分子 = w_inst*norm_inst + w_north*north
+               - w_retail*norm_retail - w_youzi*norm_youzi
+        分母 = 仅对非 NaN 分量的权重求和 w_sum（与 Agent_MS 完全一致的动态
+        权重重归一化）：全缺失 → w_sum==0 → 输出 NaN；
+        否则 purity = clip(numerator / w_sum, -1, 1)。
+        north_sync 缺失 → 视为该分量缺失（不再 fillna(0) 参与）。
+        """
+        amount = features["amount"] if "amount" in features.columns else None
+        norm_inst = _norm_flow(features["inst_flow"], amount)
+        norm_retail = _norm_flow(features["retail_flow"], amount)
+        norm_youzi = _norm_flow(features["youzi_flow"], amount)
+        north = features["north_sync"].astype(float).to_numpy()
+
+        w_inst, w_north, w_retail, w_youzi = 0.35, 0.25, 0.20, 0.20
+
+        m_inst = features["inst_flow"].notna().to_numpy()
+        m_north = features["north_sync"].notna().to_numpy()
+        m_retail = features["retail_flow"].notna().to_numpy()
+        m_youzi = features["youzi_flow"].notna().to_numpy()
+
+        contrib = (
+            np.where(m_inst, w_inst * norm_inst, 0.0)
+            + np.where(m_north, w_north * north, 0.0)
+            - np.where(m_retail, w_retail * norm_retail, 0.0)
+            - np.where(m_youzi, w_youzi * norm_youzi, 0.0)
+        )
+        w_sum = (m_inst.astype(float) * w_inst + m_north.astype(float) * w_north
+                 + m_retail.astype(float) * w_retail
+                 + m_youzi.astype(float) * w_youzi)
+        out = np.where(w_sum > 0, contrib / np.where(w_sum > 0, w_sum, np.nan),
+                       np.nan)
+        return pd.Series(np.clip(out, -1.0, 1.0), index=features.index)
 
     # ------------------------------------------------------------------
     # 状态判定（无状态纯函数）
@@ -596,107 +674,189 @@ class SignalSynthesizer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _bounded(value, half_width: float) -> float:
-        """有界化分量：clip(±half_width) / half_width → [-1, 1]；缺失 → 中性 0。"""
-        if value is None or pd.isna(value):
-            return 0.0
-        return float(np.clip(float(value), -half_width, half_width) / half_width)
+    def _as_series(x, dtype, fill, index=None) -> pd.Series:
+        """统一为 pd.Series（缺失 → fill 值），依托 index 自动对齐参与运算。
+
+        兼容标量 / 长度为 1 的 Series；标量 NaN 也按 fill 兜底。提供 `index` 时，
+        标量按该索引广播（避免与等长 Series 混乘时因 outer-join 产生 NaN）。
+        """
+        if isinstance(x, pd.Series):
+            return x.astype(dtype).fillna(fill)
+        if index is not None:
+            return pd.Series(np.broadcast_to(x, len(index)), index=index,
+                             dtype=dtype).fillna(fill)
+        if pd.isna(x):
+            return pd.Series([fill], dtype=dtype)
+        return pd.Series([x], dtype=dtype)
+
+    def _compute_es(self, final_ms, capital_purity, mrs,
+                    s_youzi_only) -> pd.Series:
+        """入场分 ES ∈ (0, 1)：批量向量化，长表整列计算。
+
+        全流程以 pd.Series 参与加减乘除，依托各自 index 自动对齐（不做 numpy
+        位置剥离）：
+            final_ms       已严格在 [-1, 1]，直接使用，缺失 → 0
+            capital_purity 已严格在 [-1, 1]，直接使用，缺失 → 0
+            mrs            值域未定，做无量纲有界缩放，缺失 → 0
+            s_youzi_only   布尔型，标记游资独舞
+
+        es_raw  = w_es_ms*final_ms + w_es_purity*capital_purity
+                  + w_es_mrs*mrs_c
+        mrs_c   = clip(mrs, ±mrs_clip) / mrs_clip
+        es_score = sigmoid(es_sigmoid_k * es_raw)，有限输入严格位于 (0, 1)
+        游资独舞 s_youzi_only → 硬掩码否决：es_final = es_score.mask(youzi, 0.0)
+        直接输出 0.0（不做数学衰减）。
+        """
+        fms = self._as_series(final_ms, float, 0.0)
+        purity = self._as_series(capital_purity, float, 0.0)
+        mrs_s = self._as_series(mrs, float, 0.0)
+        youzi = self._as_series(s_youzi_only, bool, False)
+
+        mrs_c = mrs_s.clip(-self.mrs_clip, self.mrs_clip) / self.mrs_clip
+
+        es_raw = (self.w_es_ms * fms + self.w_es_purity * purity
+                  + self.w_es_mrs * mrs_c)
+        es_score = 1.0 / (1.0 + np.exp(-self.es_sigmoid_k * es_raw))
+        es_final = es_score.mask(youzi, 0.0)
+        return es_final.rename("es")
 
     def calculate_entry_score(self, row: pd.Series) -> float:
-        """入场分 ES ∈ [0, 1]。
+        """入场分 ES ∈ (0, 1)：单行包装，公式与 _compute_es 完全一致。
 
-        ES_raw = w_es_ms*Final_MS_c + w_es_purity*Capital_Purity + w_es_mrs*MRS_c
+        ES_raw = w_es_ms*final_ms + w_es_purity*capital_purity + w_es_mrs*mrs_c
         ES     = sigmoid(es_sigmoid_k * ES_raw)
-        缺失分量视为中性 0；S_youzi_only 状态衰减 ×es_youzi_decay。
+        游资独舞（state==S_YOUZI_ONLY）→ ES 硬掩码为 0.0。
         """
-        ms = self._bounded(row.get("final_ms", np.nan), self.final_ms_clip)
-        purity = self._bounded(row.get("capital_purity", np.nan), 1.0)
-        mrs = self._bounded(row.get("mrs", np.nan), self.mrs_clip)
-        es_raw = self.w_es_ms * ms + self.w_es_purity * purity + self.w_es_mrs * mrs
-        es = 1.0 / (1.0 + np.exp(-self.es_sigmoid_k * es_raw))
-        if row.get("state", S_NOISE) == S_YOUZI_ONLY:
-            es *= self.es_youzi_decay
-        return float(np.clip(es, 0.0, 1.0))
+        youzi = bool(row.get("state", S_NOISE) == S_YOUZI_ONLY)
+        es = self._compute_es(
+            pd.Series([row.get("final_ms", np.nan)]),
+            pd.Series([row.get("capital_purity", np.nan)]),
+            pd.Series([row.get("mrs", np.nan)]),
+            pd.Series([youzi]),
+        )
+        return float(es.iloc[0])
 
     # ------------------------------------------------------------------
     # 连续评分：持仓分 PS
     # ------------------------------------------------------------------
 
+    def _compute_ps(self, es, time_decay, fund_stability) -> pd.Series:
+        """持仓分 PS ∈ [0, 1]：批量向量化，长表整列计算。
+
+        全流程以 pd.Series 参与连乘，依托 index 自动对齐（不做 numpy 位置剥离）；
+        兼容标量 / 长度为 1 的 Series：
+            es             ∈ [0, 1)，缺失 → 0
+            time_decay     ∈ [0.1, 1.0]，缺失 → 1.0（不打折）
+            fund_stability ∈ {penalty, 1.0}，缺失 → 1.0（不打折）
+
+        ps_score = es * time_decay * fund_stability，各分量天然有界 → 连乘恒在
+        [0, 1]，不再 clip。
+        """
+        idx = next((s.index for s in (es, time_decay, fund_stability)
+                    if isinstance(s, pd.Series)), None)
+        es_s = self._as_series(es, float, 0.0, idx)
+        td_s = self._as_series(time_decay, float, 1.0, idx)
+        fs_s = self._as_series(fund_stability, float, 1.0, idx)
+        return (es_s * td_s * fs_s).rename("ps")
+
     def calculate_position_score(self, row: pd.Series, pos: Position) -> float:
-        """持仓分 PS ∈ [0, 1] = ES * Time_Decay * Fund_Stability。"""
-        es = self.calculate_entry_score(row)
-        td = self.time_decay(row, pos)
-        fs = self.fund_stability(row)
-        return float(np.clip(es * td * fs, 0.0, 1.0))
+        """持仓分 PS ∈ [0, 1] = ES * Time_Decay * Fund_Stability（标量包装）。"""
+        ps = self._compute_ps(self.calculate_entry_score(row),
+                              self.time_decay(row, pos),
+                              row.get("fund_stability", 1.0))
+        return float(ps.iloc[0])
 
     def time_decay(self, row: pd.Series, pos: Position) -> float:
-        """时间衰减（衰减保护期 + 浮盈亏非对称衰减）。
+        """时间衰减（衰减保护期 + 浮盈亏非对称衰减）。纯数学安全 / 无冗余分支。
 
-        - 前 win_decay_grace 分钟（bars_held <= win_decay_grace）：Time_Decay = 1.0，
-          给予建仓后的发酵窗口，避免刚入场横盘就被误判减仓。
-        - 此后 effective_bars = bars_held - win_decay_grace，按 pnl_ratio 选衰减系数：
-            浮盈(pnl_ratio > 0)：factor = 1-(1-base_decay_rate)*pnl_decay_profit_mult
-            浮亏/持平(pnl_ratio <= 0)：factor = 1-(1-base_decay_rate)*pnl_decay_loss_mult
-          Time_Decay = clip(factor ** (effective_bars / time_decay_interval), 0.1, 1.0)
-        - pnl_ratio 无法计算（close 缺失 / avg_cost<=0）：fallback 基准衰减率（中性）。
+        - effective = max(0.0, bars_held - win_decay_grace)；effective=0 时次幂为
+          1.0，直接省去旧代码"保护期内 return 1.0"的冗余分支。
+        - pnl_ratio = (close - avg_cost) / avg_cost；防除零与空值：avg_cost<=1e-6
+          或含 NaN → 缺失 → raw_factor = base_decay_rate（中性）。
+        - 浮盈(pnl>0) / 浮亏(pnl<=0) 分别套用 profit / loss mult 得 raw_factor。
+        - factor = max(0.01, raw_factor)（纵深防御，严禁负/零底数 → 防复数/NaN）。
+        - td = factor ** (effective / time_decay_interval)，clip 到 [0.1, 1.0]。
         """
-        if pos.bars_held <= self.win_decay_grace:
-            return 1.0
-        held = pos.bars_held - self.win_decay_grace
-        close = row.get("close", np.nan)
-        if pd.notna(close) and pos.avg_cost > 0:
-            pnl = (float(close) - pos.avg_cost) / pos.avg_cost
-            if pnl > 0:
-                factor = 1.0 - (1.0 - self.base_decay_rate) * self.pnl_decay_profit_mult
-            else:
-                factor = 1.0 - (1.0 - self.base_decay_rate) * self.pnl_decay_loss_mult
+        close = float(row["close"])
+        avg_cost = float(pos.avg_cost)
+        effective = max(0.0, float(pos.bars_held) - self.win_decay_grace)
+
+        if avg_cost <= 1e-6 or np.isnan(close) or np.isnan(avg_cost):
+            raw_factor = self.base_decay_rate
         else:
-            factor = self.base_decay_rate
-        td = factor ** (held / self.time_decay_interval)
-        return float(np.clip(td, 0.1, 1.0))
+            pnl = (close - avg_cost) / avg_cost
+            if pnl > 0:
+                raw_factor = 1.0 - (1.0 - self.base_decay_rate) * self.pnl_decay_profit_mult
+            else:
+                raw_factor = 1.0 - (1.0 - self.base_decay_rate) * self.pnl_decay_loss_mult
 
-    def fund_stability(self, row: pd.Series) -> float:
-        """资金稳定性：撤单率 > 阈值 或 盘口变薄 → 惩罚系数；否则 1.0。
+        factor = max(0.01, raw_factor)
+        td_val = factor ** (effective / self.time_decay_interval)
+        return float(np.clip(td_val, 0.1, 1.0))
 
-        cancel_ratio 缺失（无逐笔数据）视为中性，不触发撤单率惩罚。
+    def _compute_fund_stability(self, cancel_ratio_series, obi_series,
+                                big_flow_series) -> pd.Series:
+        """资金稳定性系数（纯向量化，长表整列预计算，状态机仅消费结果列）。
+
+        is_cancel    = cancel.fillna(0.0)  > cancel_ratio_th   （NaN 视为不撤单）
+        is_thin_obi  = |obi.fillna(1.0)|   < obi_thin_th       （NaN 视为不薄）
+        is_thin_flow = |big_flow.fillna(1.0)| < big_thin_th
+        mask = is_cancel | (is_thin_obi & is_thin_flow)
+        命中 mask → fund_stability_penalty，否则 1.0。输出与输入 index 对齐。
         """
-        cr = row.get("cancel_ratio", np.nan)
-        cr_unstable = bool(pd.notna(cr) and float(cr) > self.cancel_ratio_th)
-        if cr_unstable or self.book_thin(row):
-            return self.fund_stability_penalty
-        return 1.0
-
-    def book_thin(self, row: pd.Series) -> bool:
-        """盘口变薄近似：|OBI| 与 |big_flow| 同时趋零 → 买卖盘失衡消失且大单消失。
-
-        任一指标缺失 → False（缺失降级为"不变薄"）。
-        """
-        obi = row.get("obi", np.nan)
-        big = row.get("big_flow", np.nan)
-        if pd.isna(obi) or pd.isna(big):
-            return False
-        return abs(float(obi)) < self.obi_thin_th \
-            and abs(float(big)) < self.big_thin_th
+        cancel = cancel_ratio_series.fillna(0.0)
+        is_cancel = cancel > self.cancel_ratio_th
+        is_thin_obi = np.abs(obi_series.fillna(1.0)) < self.obi_thin_th
+        is_thin_flow = np.abs(big_flow_series.fillna(1.0)) < self.big_thin_th
+        is_thin = is_thin_obi & is_thin_flow
+        mask = is_cancel | is_thin
+        fs = pd.Series(1.0, index=mask.index)
+        fs.loc[mask] = self.fund_stability_penalty
+        return fs
 
     # ------------------------------------------------------------------
     # 连续评分：出局分 XS
     # ------------------------------------------------------------------
 
     def calculate_exit_score(self, row: pd.Series, pos: Position) -> float:
-        """出局分 XS ∈ [-1, 1]。
+        """出局分 XS ∈ [-1, 1]（业务适配器：提取标量 + 调纯函数）。
 
-        XS = w_xs_ms*Final_MS_c + w_xs_purity*Capital_Purity
+        XS = w_xs_ms*Final_MS + w_xs_purity*Capital_Purity
              - w_xs_drawdown*Drawdown_From_High
-        一票否决（游资溃逃 / 大盘跳水）→ 强制 XS = -1.0。
+        Final_MS / Capital_Purity 已在 [-1, 1]，直接使用原值（缺失 → 0），
+        不再二次 clip 缩放。一票否决（游资溃逃 / 大盘跳水）→ 强制 XS = -1.0。
+        所有数学计算委托给纯函数 _compute_xs。
         """
-        ms = self._bounded(row.get("final_ms", np.nan), self.final_ms_clip)
-        purity = self._bounded(row.get("capital_purity", np.nan), 1.0)
-        dd = self.drawdown_from_high(row, pos)
-        xs = self.w_xs_ms * ms + self.w_xs_purity * purity - self.w_xs_drawdown * dd
-        xs = float(np.clip(xs, -1.0, 1.0))
-        if self.veto(row):
-            xs = -1.0
-        return xs
+        ms = float(row.get("final_ms", 0.0))
+        purity = float(row.get("capital_purity", 0.0))
+        close = float(row.get("close", 0.0))
+        hwm = float(pos.high_price_watermark)
+        is_veto = bool(self.veto(row))
+        ws = (self.w_xs_ms, self.w_xs_purity, self.w_xs_drawdown)
+        return self._compute_xs(ms, purity, hwm, close, is_veto, ws)
+
+    @staticmethod
+    def _compute_xs(final_ms, capital_purity, high_price_watermark,
+                    close, veto_flag, weights) -> float:
+        """出局分 XS ∈ [-1, 1]（纯数学算子，无业务/状态依赖）。
+
+        NaN/None → 0（空值中性，中立不提供出局信号）。
+        回撤 dd = max(0, (hwm - close) / hwm)；hwm<=1e-6 → 0（防除零）。
+        veto_flag=True → 一票否决，无视权重直接返回 -1.0。
+        xs_raw = w_ms*final_ms + w_purity*capital_purity - w_dd*dd，clip 到 [-1, 1]。
+        """
+        w_ms, w_purity, w_dd = weights
+        ms = float(final_ms) if not (final_ms is None or pd.isna(final_ms)) else 0.0
+        purity = float(capital_purity) if not (capital_purity is None
+                                               or pd.isna(capital_purity)) else 0.0
+        if veto_flag:
+            return -1.0
+        if high_price_watermark <= 1e-6:
+            dd = 0.0
+        else:
+            dd = max(0.0, (high_price_watermark - close) / high_price_watermark)
+        xs_raw = w_ms * ms + w_purity * purity - w_dd * dd
+        return float(np.clip(xs_raw, -1.0, 1.0))
 
     def drawdown_from_high(self, row: pd.Series, pos: Position) -> float:
         """持仓回撤（相对持仓期最高价）：max(0, (HWM - close) / HWM)。"""
@@ -1051,6 +1211,11 @@ class TradingStateMachine:
 
         # 状态列（逐行无状态判定）
         ev["state"] = ev.apply(self.syn.state_of, axis=1)
+        # 资金稳定性系数：纯向量化预计算整列，状态机仅消费本列（缺列 → 全 NaN → 1.0）
+        s_cancel = ev.get("cancel_ratio", pd.Series(np.nan, index=ev.index))
+        s_obi = ev.get("obi", pd.Series(np.nan, index=ev.index))
+        s_flow = ev.get("big_flow", pd.Series(np.nan, index=ev.index))
+        ev["fund_stability"] = self.syn._compute_fund_stability(s_cancel, s_obi, s_flow)
         assert ev["ts"].is_monotonic_increasing, "评估表必须按时间升序"
         return ev
 
@@ -1070,7 +1235,7 @@ class TradingStateMachine:
             scores["xs_crash"] = bool(
                 scores["xs"] <= self.syn.th_xs_crash or self.syn.veto(row))
             scores["time_decay"] = self.syn.time_decay(row, pos)
-            scores["fund_stability"] = self.syn.fund_stability(row)
+            scores["fund_stability"] = row.get("fund_stability", 1.0)
             scores["drawdown"] = self.syn.drawdown_from_high(row, pos)
             scores["reduce_fraction"] = self.syn.reduce_fraction
             scores["reduce_step_ratio"] = self.syn.reduce_step_ratio  # 供撮合 fallback 统一比例
