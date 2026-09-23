@@ -4,8 +4,8 @@
     MRS = w1*沪深300分钟收益 + w2*市场量能偏离 + w3*ADR偏离 + w4*北向净流偏离
     GRS = w1*美股隔夜收益 + w2*商品指数偏离 + w3*美债利率波动
     IRS = w1*行业资金流 + w2*海外龙头隔夜涨跌 + w3*产业链指数涨跌
-    Global_Mod = clip(GRS, -0.8, 0.8)
-    Chain_Mod  = clip(IRS, -0.3, 0.3)
+    Global_Mod = clip(GRS/3, -1, 1) * max_gmod   # 3σ 压缩到标准空间再乘极限乘数
+    Chain_Mod  = clip(IRS/3, -1, 1) * max_cmod
 
 防未来函数约定：
 - GRS 基于 macro（已由 TimeAligner 做 T-1 全量对齐），当日外部数据不参与当日
@@ -15,7 +15,7 @@
 """
 
 import logging
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -37,8 +37,8 @@ class Environment:
     :param mrs_weights:  MRS 分量权重 (收益, 量能, ADR, 北向)
     :param grs_weights:  GRS 分量权重 (美股, 商品, 美债)
     :param irs_weights:  IRS 分量权重 (行业资金流, 海外龙头, 产业链)
-    :param grs_clip:     Global_Mod 的 clip 范围
-    :param irs_clip:     Chain_Mod 的 clip 范围
+    :param max_gmod:     Global_Mod 极限乘数（3σ 压缩后饱和值），默认 0.8
+    :param max_cmod:     Chain_Mod 极限乘数（3σ 压缩后饱和值），默认 0.3
     """
 
     def __init__(
@@ -48,16 +48,17 @@ class Environment:
         mrs_weights: Sequence[float] = (0.35, 0.20, 0.25, 0.20),
         grs_weights: Sequence[float] = (0.40, 0.30, 0.30),
         irs_weights: Sequence[float] = (1.00, 0.00, 0.00),
-        grs_clip: Tuple[float, float] = (-0.8, 0.8),
-        irs_clip: Tuple[float, float] = (-0.3, 0.3),
+        max_gmod: float = 0.8,
+        max_cmod: float = 0.3,
     ) -> None:
+        """保存宏观与市场环境因子的窗口和权重配置，供分钟级环境合成复用。"""
         self.score_window = score_window
         self.min_periods = min_periods
         self.mrs_weights = tuple(mrs_weights)
         self.grs_weights = tuple(grs_weights)
         self.irs_weights = tuple(irs_weights)
-        self.grs_clip = grs_clip
-        self.irs_clip = irs_clip
+        self.max_gmod = float(max_gmod)
+        self.max_cmod = float(max_cmod)
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -144,18 +145,26 @@ class Environment:
 
         m = macro.sort_index()
         us_ret = m["us_spx"].pct_change().fillna(0.0)
-        commodity = m[_COMMODITY_COLS].mean(axis=1)
+        # 商品篮子：对「收益率」求均值（skipna=True 免疫局部休市），而非绝对价格
+        commodity = m[_COMMODITY_COLS].pct_change().mean(axis=1)
         comps = {
             "us": self._zscore(us_ret),
             "com": self._zscore(commodity),
-            "rate": self._zscore(m["us10y"]),
+            # 美债利率上行 = Risk-Off（利空）：本列显式取反，权重保持全正
+            "rate": -1.0 * self._zscore(m["us10y"]),
         }
         s = self._weighted(comps, self.grs_weights, ["us", "com", "rate"])
         return pd.DataFrame({"grs": s}, index=m.index)
 
     def global_mod(self, grs: pd.DataFrame) -> pd.Series:
-        """Global_Mod = clip(GRS, -0.8, 0.8)。"""
-        return grs["grs"].clip(*self.grs_clip)
+        """Global_Mod = clip(GRS/3, -1, 1) * max_gmod。
+
+        上游 GRS 为原生 Z-score，先除 3 压缩至标准空间再赋予极限乘数，
+        保留 1-3σ 的线性风险梯度、大于 3σ 饱和于 max_gmod。
+        缺失 → 0.0（中性），保证向下游 Final_MS / Target_Weight 传递干净数值。
+        """
+        out = np.clip(grs["grs"] / 3.0, -1.0, 1.0) * self.max_gmod
+        return out.fillna(0.0)
 
     # ------------------------------------------------------------------
     # IRS：产业共振（分钟级，行业资金流 + 可选海外龙头/产业链）
@@ -182,14 +191,22 @@ class Environment:
         rows = []
         for name, g in ind.groupby("industry"):
             g = g.sort_index()
-            comps = {"flow": self._zscore(g["money_flow"].astype(float))}
-            names = ["flow"]
-            # 海外龙头隔夜涨跌（需 mapping 提供 macro 列名）
+            # 分量按规范顺序：行业资金流 / 海外龙头隔夜涨跌 / 产业链指数涨跌，
+            # 依次对应 irs_weights 三元组。缺失分量不构造、严禁 fillna(0.0)，
+            # 由 _weighted 对剩余分量权重做重归一化（权重让渡）。
+            comps = {
+                "flow": self._zscore(g["money_flow"].astype(float)),
+                # 产业链指数涨跌：复用行业表自身指数收益率（各行业恒有，自包含）
+                "chain": self._zscore(g["close"].pct_change().fillna(0.0)),
+            }
+            names = ["flow", "leader", "chain"]
+            # 海外龙头隔夜涨跌（需 mapping 提供 macro 列名）。macro 已由
+            # TimeAligner 做 T-1 对齐，A 股当日仅读取美股昨夜数据（防穿越）。
             if mapping and name in mapping:
                 col = mapping[name].get("overseas_leader")
                 if macro is not None and col in macro.columns and macro[col].notna().any():
-                    comps["leader"] = self._zscore(macro[col].pct_change().fillna(0.0))
-                    names.append("leader")
+                    comps["leader"] = self._zscore(
+                        macro[col].sort_index().pct_change().fillna(0.0))
                 else:
                     logger.warning("行业 %s 的海外龙头数据缺失，分量跳过", name)
             s = self._weighted(comps, self.irs_weights, names)
@@ -198,5 +215,10 @@ class Environment:
         return out
 
     def chain_mod(self, irs: pd.DataFrame) -> pd.Series:
-        """Chain_Mod = clip(IRS, -0.3, 0.3)。"""
-        return irs["irs"].clip(*self.irs_clip)
+        """Chain_Mod = clip(IRS/3, -1, 1) * max_cmod。
+
+        上游 IRS 为原生 Z-score，先除 3 压缩至标准空间再赋极限乘数。
+        缺失 → 0.0（中性），保证向下游 Final_MS / Target_Weight 传递干净数值。
+        """
+        out = np.clip(irs["irs"] / 3.0, -1.0, 1.0) * self.max_cmod
+        return out.fillna(0.0)

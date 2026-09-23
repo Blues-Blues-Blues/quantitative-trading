@@ -3,7 +3,7 @@
 覆盖：
 - 下一 Bar 开盘价成交（执行延迟，防未来）
 - T+1：当日买入不可卖、SELL 挂起次日开盘强制卖出
-- 涨跌停拦截（盘中触及不可买/卖）
+- 涨跌停拦截（开盘达到涨跌停价时不可买/卖）
 - 先到先得资金分配（现金不足拒绝）与杠杆/单股上限风控
 - 动态仓位公式 Position_Size 与成本/滑点模型
 - 100 股整数倍取整、成交日志与净值曲线完整性
@@ -187,6 +187,41 @@ class TestNextBarFill:
         with pytest.raises(ValueError):
             BacktestEngine(Account(1e8), ExecutionCost(), PositionSizer(), ds, rev)
 
+    def test_open_fill_ignores_later_high_low_and_amount(self):
+        ds, _ = full_env()
+        signal = Signal("600000", pd.Timestamp("2024-01-02 10:00"),
+                        ACT_BUY, "S_push", {"target_weight": 0.2})
+        _, (before, _) = run_backtest(ds, [signal])
+        changed = ds.kline.copy()
+        ts = pd.Timestamp("2024-01-02 10:30")
+        changed.loc[ts, "high"] = changed.loc[ts, "up_limit"]
+        changed.loc[ts, "low"] = changed.loc[ts, "down_limit"]
+        changed.loc[ts, "amount"] = 1.0
+        ds.kline = changed
+        _, (after, _) = run_backtest(ds, [signal])
+        pd.testing.assert_frame_equal(before, after)
+
+    def test_engine_rejects_second_run(self):
+        ds, signals = full_env()
+        engine, _ = run_backtest(ds, signals)
+        with pytest.raises(RuntimeError, match="只能执行一次"):
+            engine.run()
+
+    def test_rejected_buy_leaves_strategy_flat_until_fill(self):
+        ds, _ = full_env()
+        ts = pd.Timestamp("2024-01-02 10:30")
+        ds.kline.loc[ts, "open"] = ds.kline.loc[ts, "up_limit"]
+        features = mk_features(ds.time_axis())
+        sm = TradingStateMachine(SignalSynthesizer(
+            symbol_to_industry=_MAPPING))
+        engine = BacktestEngine(Account(1e8), ExecutionCost(), PositionSizer(),
+                                ds, state_machine=sm, features=features)
+        log, curve = engine.run()
+        assert log.loc[log.ts.eq(ts), "reason"].iloc[0] == "limit_up"
+        assert curve.loc[curve.ts.eq(ts), "n_positions"].iloc[0] == 0
+        assert next(s for s in engine.generated_signals if s.timestamp == ts).action == ACT_BUY
+        assert engine.account.positions["600000"].entry_time == pd.Timestamp("2024-01-02 11:00")
+
 
 # ----------------------------------------------------------------------
 # T+1 机制
@@ -241,16 +276,16 @@ class TestTPlusOne:
 
 
 # ----------------------------------------------------------------------
-# 涨跌停拦截（盘中触及）
+# 涨跌停拦截（开盘达到限价）
 # ----------------------------------------------------------------------
 
 class TestLimit:
 
     def test_limit_up_blocks_buy(self):
         ds, signals = full_env()
-        # 使 BUY 撮合 Bar（D0 10:30）盘中触及涨停 → 拒绝买入
+        # BUY 撮合 Bar 在开盘即涨停时拒单。
         ts = pd.Timestamp("2024-01-02 10:30")
-        ds.kline.loc[ds.kline.index == ts, "high"] = \
+        ds.kline.loc[ds.kline.index == ts, "open"] = \
             ds.kline.loc[ds.kline.index == ts, "up_limit"]
         eng, (log, _) = run_backtest(ds, signals)
 
@@ -262,13 +297,13 @@ class TestLimit:
         assert "600000" in eng.account.positions
 
     def test_limit_down_blocks_sell(self):
-        # D1 10:00 SELL 信号（D0 买入已解冻）→ 撮合于 10:30，该 Bar 盘中触及跌停 → 拒绝卖出
+        # D1 10:00 SELL 信号在 10:30 开盘即跌停时拒单。
         weak = {"chain_mod": -1.0, "inst_flow": -1e8, "north_sync": -0.2,
                 "retail_flow": 1e8, "youzi_flow": 1e5}
         ds, signals = full_env(dates=_D4,
                                overrides={"2024-01-03 10:00": weak})
         ts = pd.Timestamp("2024-01-03 10:30")
-        ds.kline.loc[ds.kline.index == ts, "low"] = \
+        ds.kline.loc[ds.kline.index == ts, "open"] = \
             ds.kline.loc[ds.kline.index == ts, "down_limit"]
         eng, (log, _) = run_backtest(ds, signals)
 
@@ -547,7 +582,7 @@ class TestTargetRebalanceT1:
         sell = Signal("600000", pd.Timestamp("2024-01-03 10:00"), ACT_SELL,
                       "S_push", {})
         ts_dl = pd.Timestamp("2024-01-03 10:30")
-        ds.kline.loc[ds.kline.index == ts_dl, "low"] = \
+        ds.kline.loc[ds.kline.index == ts_dl, "open"] = \
             ds.kline.loc[ds.kline.index == ts_dl, "down_limit"]
         eng, (log, _) = run_backtest(ds, [buy, sell])
         assert not log[(log["side"] == ACT_SELL) &

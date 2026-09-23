@@ -125,7 +125,17 @@ class TimeAligner:
                 raise ValueError(
                     f"已对齐外部表缺少值列: {missing}（应包含 {value_cols}）"
                 )
-            return external[value_cols].sort_index()
+            out = external[value_cols].sort_index()
+            source = external.attrs.get("source_trade_date")
+            if source is not None:
+                source = pd.Series(source, index=external.index).reindex(out.index)
+                valid = source.notna()
+                bad = source.loc[valid].dt.normalize().to_numpy() >= \
+                    out.index[valid].normalize().to_numpy()
+                if bad.any():
+                    raise LookaheadError(f"外部数据来源日不早于使用日: {source.loc[valid].iloc[int(np.argmax(bad))]}")
+                out.attrs["source_trade_date"] = source.tolist()
+            return out
 
         ext = external.copy()
         ext[date_col] = pd.to_datetime(ext[date_col])
@@ -159,10 +169,18 @@ class TimeAligner:
         )
 
         # 映射回分钟轴并做缺失容错（ffill）
-        mapping = merged.set_index("_cn_date")[value_cols]
+        mapping = merged.set_index("_cn_date")[[*value_cols, date_col]]
         tmp = pd.DataFrame({"_cn_date": index.normalize()}, index=index)
-        aligned = tmp.join(mapping, on="_cn_date")[value_cols]
-        aligned = aligned.ffill()
+        joined = tmp.join(mapping, on="_cn_date")
+        aligned = joined[value_cols].ffill()
+        source = pd.to_datetime(joined[date_col]).ffill()
+        valid = source.notna()
+        bad = source.loc[valid].dt.normalize().to_numpy() >= \
+            index[valid].normalize().to_numpy()
+        if bad.any():
+            i = int(np.argmax(bad))
+            raise LookaheadError(f"外部数据来源日不早于使用日: {source.loc[valid].iloc[i]}")
+        aligned.attrs["source_trade_date"] = source.tolist()
 
         missing = int(aligned.isna().sum().sum())
         if missing:
@@ -195,11 +213,11 @@ class TimeAligner:
             pd.DatetimeIndex(cn_axis).normalize()
         ).unique().sort_values()
 
-        pos = cn_dates.searchsorted(out[TRADE_DATE].to_numpy(), side="left")
+        pos = cn_dates.searchsorted(out[TRADE_DATE].to_numpy(), side="right")
         # numpy 2.x 下 np.array([Timestamp, NaT], dtype="datetime64") 会报
         # "'float' object cannot be interpreted as an integer"，改用 pd.to_datetime
         avail = pd.to_datetime(
-            [cn_dates[i + 1] if i + 1 < len(cn_dates) else pd.NaT for i in pos]
+            [cn_dates[i] if i < len(cn_dates) else pd.NaT for i in pos]
         )
         out["avail_date"] = avail
 

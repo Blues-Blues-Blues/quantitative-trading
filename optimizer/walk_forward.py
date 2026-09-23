@@ -39,6 +39,7 @@ class FoldResult:
     best_params: Dict[str, object] = field(default_factory=dict)
     train_metrics: Dict[str, float] = field(default_factory=dict)
     oos_metrics: Dict[str, float] = field(default_factory=dict)
+    feasible: bool = True
 
 
 class WalkForward:
@@ -52,6 +53,7 @@ class WalkForward:
         expanding: bool = True,
         seed: int = 42,
     ) -> None:
+        """保存滚动训练与验证窗口配置；窗口生成方法负责保证各折时间顺序且训练段先于验证段。"""
         if n_folds < 1:
             raise ValueError(f"n_folds 必须 >= 1，当前: {n_folds}")
         if train_folds < 1:
@@ -135,7 +137,7 @@ class WalkForward:
                 **(optimizer_kwargs or {}),
             )
             study = opt.optimize()
-            params, train_metrics = opt.best(study)
+            params, train_metrics = opt.best(study, allow_exploratory=True)
             if plot_path is not None:
                 opt.plot_history(study, path=plot_path.format(k=k))
 
@@ -149,6 +151,7 @@ class WalkForward:
                 oos_start=os_, oos_end=oe,
                 best_params=params, train_metrics=train_metrics,
                 oos_metrics=oos_metrics,
+                feasible=bool(train_metrics.get("feasible", True)),
             ))
         return results
 
@@ -170,6 +173,7 @@ class WalkForward:
                 "oos_win_rate": r.oos_metrics.get("win_rate", float("nan")),
                 "oos_pl_ratio": r.oos_metrics.get("profit_loss_ratio", float("nan")),
                 "oos_n_trades": r.oos_metrics.get("n_trades", float("nan")),
+                "train_feasible": r.feasible,
                 "w_ofss": r.best_params.get("weights", (None,))[0],
                 "w_cps": r.best_params.get("weights", (None, None))[1],
                 "th_ms_bull": r.best_params.get("th_ms_bull"),

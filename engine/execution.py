@@ -5,13 +5,14 @@
 - 印花税：仅卖出收取，stamp_duty_rate（默认千分之 0.5）
 - 过户费：双边收取，transfer_fee_rate（默认万分之一，即 0.00001）
 
-动态滑点模型（基于当前 Bar 的成交量与 VWAP 偏差）：
-    参与率 participation = 订单金额 / Bar 成交额（amount），clip 到 [0, 1]
+动态滑点模型（用上一根已完成 Bar 的成交额近似当前流动性）：
+    参与率 participation = 订单金额 / 上一根已完成 Bar 成交额，clip 到 [0, 1]
     滑点 bps = fixed_slippage_bps + slippage_coef_bps × participation，封顶 slippage_cap_bps
     买入成交价 = open × (1 + 滑点)；卖出成交价 = open × (1 - 滑点)
 
-说明：Bar 内 VWAP 与成交量的关系近似以「订单占 Bar 成交额比例」度量冲击成本，
-参与率越高，滑点越大 —— 与实盘中大单吃穿盘口的行为一致。
+说明：撮合发生在当前 Bar 开盘，不能使用当前 Bar 尚未完成的成交额；因此由回测引擎
+传入上一根已完成 Bar 的成交额作为参与率分母。该比例只是冲击成本近似，不是盘口级成交模拟。
+参与率越高，滑点越大；计算出的成交价仍由引擎按涨跌停价边界截断。
 """
 
 from typing import Tuple
@@ -30,6 +31,7 @@ class ExecutionCost:
         slippage_coef_bps: float = 50.0,      # 参与率敏感系数（基点 / 100% 参与率）
         slippage_cap_bps: float = 60.0,       # 滑点封顶（基点）
     ) -> None:
+        """保存费用率与滑点参数并校验其取值范围；滑点参与率由撮合方提供的上一根已完成 Bar 成交额计算。"""
         if not 0.0 < commission_rate < 0.01:
             raise ValueError(f"commission_rate 必须在 (0, 0.01)，当前: {commission_rate}")
         if min_commission < 0:

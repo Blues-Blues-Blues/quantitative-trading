@@ -163,6 +163,17 @@ class TestDragonTiger:
 
         assert out["avail_date"].iloc[0] == pd.Timestamp("2024-01-03")
 
+    def test_historical_and_nontrading_events_use_first_later_session(self):
+        axis = cn_minutes(["2024-01-02", "2024-01-04"])
+        events = mock_dragon_tiger(["2023-12-29", "2024-01-02",
+                                    "2024-01-03", "2024-01-04"])
+        out = TimeAligner().align_dragon_tiger(events, axis)
+        by_day = out.set_index("trade_date")["avail_date"]
+        assert by_day[pd.Timestamp("2023-12-29")] == pd.Timestamp("2024-01-02")
+        assert by_day[pd.Timestamp("2024-01-02")] == pd.Timestamp("2024-01-04")
+        assert by_day[pd.Timestamp("2024-01-03")] == pd.Timestamp("2024-01-04")
+        assert pd.isna(by_day[pd.Timestamp("2024-01-04")])
+
     def test_using_before_avail_raises(self):
         """T 日实时特征若误用当日榜单 → 触发未来函数校验。"""
         axis = cn_minutes(["2024-01-02", "2024-01-03"])

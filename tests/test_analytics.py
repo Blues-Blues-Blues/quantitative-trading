@@ -40,17 +40,13 @@ _MAPPING = {"600000": "银行"}
 def pipeline():
     """跑通端到端回测：返回 (equity_curve, trade_log)。
 
-    opt.backtest() 内部已执行过一次 run()，返回的 engine 账户带残留持仓，
-    不能再次 run()。用全新 Account 重建引擎，保证 fixture 拿到干净的曲线与日志。
+    opt.backtest() 返回同一次运行的曲线与日志。
     """
     ds = bull_slice()
     opt = StrategyOptimizer(data=ds, symbol_to_industry=_MAPPING,
                             account_kwargs={"initial_cash": 1e8})
     _, engine = opt.backtest(ds, TRADE_PARAMS)
-    fresh = BacktestEngine(Account(initial_cash=1e8), ExecutionCost(),
-                           PositionSizer(), ds, engine.signals)
-    log, curve = fresh.run()
-    return curve, log
+    return engine.equity_curve, engine.trade_log
 
 
 # ----------------------------------------------------------------------

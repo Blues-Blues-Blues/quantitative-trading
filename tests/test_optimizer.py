@@ -53,11 +53,20 @@ _MAPPING = {"600000": "银行"}
 
 # 可直接成交的显式参数（权重和为 1，全部落在 SearchSpace 范围，chip_window=1
 # 保证第 3 个交易日起 CPS 有值 → 牛段开仓 → 熊段强制卖出）
+# P0.1 修复：决策链已由「二值化闸门」重构为「ES/PS/XS 连续评分」，必须携带
+# 新评分链参数；th_xs_exit=0.15 > 熊市最低 XS（≈0.119）保证熊市触发 SELL，
+# 且 0.15 < th_xs_reduce_high=0.2 保证牛段高 XS 仍走正常持仓/DECAY。
 TRADE_PARAMS = {
     "weights": (0.35, 0.25, 0.25, 0.15),
+    "inst_window": 1, "chip_window": 1,
+    # ---- 连续评分链（使熊市能触发清仓）----
+    "w_es_ms": 0.4, "w_es_purity": 0.3, "w_es_mrs": 0.3,
+    "es_sigmoid_k": 3.0, "th_es_entry": 0.4,
+    "th_xs_exit": 0.15, "th_xs_reduce_high": 0.2, "th_xs_crash": -0.6,
+    "w_xs_ms": 0.5, "w_xs_purity": 0.3, "w_xs_drawdown": 0.2,
+    # ---- 旧参数保留（决策链已忽略，仅为构造向后兼容）----
     "th_ms_bull": 0.3, "th_ms_exit": -0.1, "th_lock": 0.4, "th_purity": 0.1,
-    "th_global_min": -0.8, "th_adr_min": 0.3,
-    "win_hold_max": 120, "inst_window": 1, "chip_window": 1,
+    "th_global_min": -0.8, "th_adr_min": 0.3, "win_hold_max": 120,
 }
 
 
@@ -308,11 +317,30 @@ class TestSearchSpace:
 
 class TestStrategyOptimizer:
 
+    def test_weight_violation_rejected_even_with_good_metrics(self):
+        opt = _make_optimizer()
+        study = optuna.create_study(direction="maximize")
+        trial = study.ask()
+        study.tell(trial, 2.0)
+        bad = dict(TRADE_PARAMS)
+        bad["weights"] = (0.6, 0.5, 0.0, -0.1)
+        good_metrics = {"sharpe": 2.0, "max_drawdown": 0.0,
+                        "n_trades": 100.0, "win_rate": 1.0,
+                        "profit_loss_ratio": 3.0,
+                        "turnover_annual": 0.0}
+        opt._cache[trial.number] = (bad, good_metrics)
+        assert any(v > 0 for v in opt.constraints_func(study.trials[0]))
+        with pytest.raises(ValueError, match="无满足"):
+            opt.best(study)
+        with pytest.raises(ValueError, match="无满足"):
+            opt.top_candidates(study)
+
     def test_backtest_produces_trades(self):
         opt = _make_optimizer()
         metrics, engine = opt.backtest(bull_slice(), TRADE_PARAMS)
-        log, curve = engine.run()
+        log, curve = engine.trade_log, engine.equity_curve
         assert len(log) > 0
+        assert evaluate(curve, log)["total_pnl"] == pytest.approx(metrics["total_pnl"])
         assert metrics["n_trades"] >= 1
         assert set(metrics) >= {"sharpe", "max_drawdown", "win_rate",
                                 "profit_loss_ratio", "total_pnl"}
@@ -323,19 +351,19 @@ class TestStrategyOptimizer:
         opt = _make_optimizer()
         study = opt.optimize(n_trials=6)
         assert len(study.trials) == 6
-        params, metrics = opt.best(study)
+        params, metrics = opt.best(study, allow_exploratory=True)
         assert sum(params["weights"]) == pytest.approx(1.0, abs=1e-9)
         assert "sharpe" in metrics
         # best() 返回的必须是某 trial 的缓存结果（objective/constraints 同源）
         cached = {id(m): n for n, (_, m) in opt._cache.items()}
-        assert id(metrics) in cached
+        assert id(metrics) in cached or metrics.get("feasible") is False
 
     def test_constraints_violation_values(self):
         opt = _make_optimizer()
         study = opt.optimize(n_trials=4)
         v = opt.constraints_func(study.trials[0])
-        # 5 项约束：回撤/胜率/盈亏比/交易笔数/年化换手；默认换手上限 1e9 → 恒满足
-        assert len(v) == 5 and all(x >= 0 for x in v)
+        # 5 项绩效 + 权重和与四组上下界。
+        assert len(v) == 14 and all(x >= 0 for x in v)
 
     def test_plot_history(self, tmp_path):
         opt = _make_optimizer()

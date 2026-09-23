@@ -77,6 +77,7 @@ class SearchSpace:
         # ---- 撮合引擎 ----
         deadzone_th: Tuple[float, float] = (0.0, 0.15),
     ) -> None:
+        """定义连续参数、离散参数及权重单纯形约束；采样、持久化和约束检查共享同一参数定义。"""
         self.w_ofss, self.w_cps = w_ofss, w_cps
         self.w_inst, self.w_north = w_inst, w_north
         self.win_inst, self.win_chip_old = win_inst, win_chip_old
@@ -252,10 +253,14 @@ class SearchSpace:
     def is_feasible(self, params: Dict[str, object],
                     atol: float = 1e-9) -> bool:
         """权重是否同时满足「和为 1」与「各自范围」。"""
+        return all(v <= atol for v in self.weight_violations(params))
+
+    def weight_violations(self, params: Dict[str, object]) -> List[float]:
+        """Return nonnegative sum and lower/upper bound violations."""
         w = tuple(float(x) for x in params["weights"])
-        if not abs(sum(w) - 1.0) <= atol:
-            return False
+        if len(w) != 4:
+            raise ValueError("weights 必须包含四个权重")
+        violations = [abs(sum(w) - 1.0)]
         for value, (lo, hi) in zip(w, self.weight_ranges()):
-            if not (lo - atol <= value <= hi + atol):
-                return False
-        return True
+            violations.extend((max(0.0, lo - value), max(0.0, value - hi)))
+        return violations

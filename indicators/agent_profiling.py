@@ -53,8 +53,12 @@ class AgentProfiling:
         north_weights: Sequence[float] = (0.6, 0.4),
         mid_split: float = 0.5,
     ) -> None:
+        """保存资金主体分类阈值和权重；后续方法据此把成交流拆分为散户、机构与游资信号。"""
         if norm_by not in ("amount", "mcap"):
             raise ValueError("norm_by 仅支持 'amount' 或 'mcap'")
+        self.north_weights = tuple(north_weights)
+        if not np.isclose(sum(self.north_weights), 1.0):
+            raise ValueError(f"north_weights 必须和为 1.0，当前：{self.north_weights}")
         self.small_th = small_th
         self.medium_th = medium_th
         self.large_th = large_th
@@ -62,12 +66,35 @@ class AgentProfiling:
         self.norm_by = norm_by
         self.holding_days = holding_days
         self.margin_days = margin_days
-        self.north_weights = tuple(north_weights)
         self.mid_split = mid_split
 
     # ------------------------------------------------------------------
     # 分钟级资金流
     # ------------------------------------------------------------------
+
+    def _compute_actor_flows(self, small_net, mid_net, large_net, xl_net,
+                             norm_base=None):
+        """纯数学向量化：将四档净流合成 retail/inst/youzi，并强约束到 [-1, 1]。
+
+        :param small_net/mid_net/large_net/xl_net: 各档净流 Series（等长、索引对齐）
+        :param norm_base: 归一化基准 Series；为 None 时以 1e-6 兜底 → 绝对额被强
+            clip 成 ±1，退化为纯方向信号（Sign）。
+        :return: (retail_flow, inst_flow, youzi_flow) 三个与输入索引对齐的 Series，
+            均 clip 到 [-1, 1]，NaN 分量以 0 填充参与计算。
+        """
+        small = small_net.fillna(0.0)
+        mid = mid_net.fillna(0.0)
+        large = large_net.fillna(0.0)
+        xl = xl_net.fillna(0.0)
+        if norm_base is None:
+            safe = pd.Series(1e-6, index=small.index)
+        else:
+            safe = norm_base.fillna(0.0) + 1e-6
+        mid_term = self.mid_split * mid
+        retail = ((small + mid_term) / safe).clip(-1.0, 1.0)
+        inst = ((xl + mid_term) / safe).clip(-1.0, 1.0)
+        youzi = (large / safe).clip(-1.0, 1.0)
+        return retail, inst, youzi
 
     def net_flows(
         self,
@@ -110,25 +137,22 @@ class AgentProfiling:
                       fill_value=0.0).fillna(0.0)
         g = g.reset_index().rename(columns={"level_0": "ts"})
 
-        retail = g["small"] + self.mid_split * g["med"]
-        inst = g["mega"] + self.mid_split * g["med"]
-        youzi = g["large"]
-
-        out = pd.DataFrame({
-            "ts": g["ts"], SYMBOL: g[SYMBOL],
-            "retail_flow": retail, "inst_flow": inst, "youzi_flow": youzi,
-        })
-
+        out = g[["ts", SYMBOL]].copy()
         if norm_base is not None and not norm_base.empty:
             base = norm_base.rename(columns={"norm_base": "_base"})
             out = out.merge(base, on=["ts", SYMBOL], how="left")
-            denom = out["_base"].replace(0, np.nan)
-            out["retail_flow"] = out["retail_flow"] / denom
-            out["inst_flow"] = out["inst_flow"] / denom
-            out["youzi_flow"] = out["youzi_flow"] / denom
-            out = out.drop(columns="_base")
+            base_s = out["_base"]
+            out.drop(columns="_base", inplace=True)
         else:
-            logger.warning("未提供 norm_base，资金流因子不做归一化（数值为绝对额）")
+            logger.warning("未提供 norm_base，资金流绝对额被强 clip 为 ±1 方向信号")
+            base_s = None
+
+        # 将原始四档净流交给纯函数合成 retail/inst/youzi（force clip [-1,1]）
+        retail, inst, youzi = self._compute_actor_flows(
+            g["small"], g["med"], g["large"], g["mega"], base_s)
+        out["retail_flow"] = retail
+        out["inst_flow"] = inst
+        out["youzi_flow"] = youzi
         return out.set_index("ts")
 
     # ------------------------------------------------------------------

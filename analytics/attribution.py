@@ -218,6 +218,7 @@ def _dominant_factor(exps: Dict[str, float]) -> str:
 
 
 def _summarize_attribution(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """把因子归因结果汇总为可报告的统计量；对有效样本不足或全常数的输入保留显式缺失值，避免把无定义结果误报为零。"""
     total = float(trades_df["pnl"].sum()) if len(trades_df) else 0.0
     rows = []
     for factor in ATTRIBUTION_FACTORS + ["other"]:
@@ -269,6 +270,7 @@ def _forward_returns(df: pd.DataFrame, kline: pd.DataFrame,
 
 
 def _resolve_mode(mode: str, n_sym: int) -> str:
+    """解析归因模式并统一别名；集中处理可选值，避免不同调用方采用不同默认口径。"""
     if mode in ("cross", "ts"):
         return mode
     return "cross" if n_sym > 1 else "ts"
@@ -276,6 +278,7 @@ def _resolve_mode(mode: str, n_sym: int) -> str:
 
 def _ic_summary(ic_ts: pd.DataFrame,
                 rank_ts: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """计算各因子的 IC 汇总统计；只使用成对有效样本，并按模块约定返回样本数、均值和稳定性指标。"""
     rows = []
     for f in ic_ts.columns:
         ic = ic_ts[f].dropna()

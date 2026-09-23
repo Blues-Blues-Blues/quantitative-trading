@@ -26,6 +26,7 @@ class Position:
     cost_basis: float = 0.0        # 加权平均成本价
     last_price: float = 0.0        # 最近一次标记价格（收盘 mark）
     last_buy_date: Optional[pd.Timestamp] = None  # 最近一次买入的交易日（T+1 判定）
+    entry_time: Optional[pd.Timestamp] = None
 
     @property
     def market_value(self) -> float:
@@ -38,6 +39,7 @@ class Position:
         return self.shares - self.sellable_shares
 
     def __repr__(self) -> str:  # 便于日志/复盘
+        """生成便于日志排查的持仓摘要，包含总股数、可卖股数、成本和最新标记价格。"""
         return (f"Position({self.symbol}, shares={self.shares}, "
                 f"sellable={self.sellable_shares}, cost={self.cost_basis:.4f}, "
                 f"last={self.last_price:.4f})")
@@ -53,6 +55,7 @@ class Account:
 
     def __init__(self, initial_cash: float, max_leverage: float = 1.0,
                  max_single_position: float = 0.30) -> None:
+        """初始化现金、杠杆和单股仓位上限；仓位与 T+1 可卖数量由账户方法维护，避免撮合器直接改写内部状态。"""
         if initial_cash <= 0:
             raise ValueError(f"initial_cash 必须为正，当前: {initial_cash}")
         if max_leverage < 1.0:
@@ -130,6 +133,7 @@ class Account:
         if pos is None:
             pos = Position(symbol=symbol)
             self.positions[symbol] = pos
+            pos.entry_time = pd.Timestamp(ts)
 
         total = pos.shares + shares
         pos.cost_basis = (pos.cost_basis * pos.shares + price * shares) / total

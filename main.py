@@ -6,21 +6,24 @@
 并打印各环节耗时与状态检查信息。
 
 剧情设计（保证 ≥1 笔完整 BUY→SELL 闭环）：
-- D1~D4 强牛：每 Bar 超大单主动买 + 小单主动卖（Inst_Flow>0、CPS>0、OFSS>0 → S_push）
-- D5~D6 转熊：每 Bar 超大单主动卖（Inst_Flow<0 → 状态机退出 S_push → 触发 SELL）
-- 时序约束（T-1 对齐 + Next-Bar 执行，决定开/平仓时点）：
-    * 日频因子（CPS/北向/RS/行业情绪）第 2 个交易日起才可用
-    * GRS/Global_Mod 的滚动 z-score 需 20 根非 NaN 分钟 bar → D4 13:30 起有值
-    * 故 BUY 落在 D4 14:00（Next-Bar 成交），SELL 落在 D5 10:00（T+1 解冻后，合规）
+- D1~D4 强牛：每 Bar 超大单主动买 + 小单主动卖（Inst_Flow>0、CPS>0、OFSS>0 → S_push），
+  指数加速上涨（MRS>0）
+- D5~D6 转熊：每 Bar 超大单主动卖（Inst_Flow<0），且指数每 Bar 跳水 -2%，
+  close 跌破 VWAP*(1-circuit_index_drop) → 触发「大盘跳水」一票否决
+  （XS 强制 = -1.0 <= th_xs_exit）→ 状态机 SELL（清仓）。
+  （注：退出由连续评分 XS 决定，判据为 xs <= th_xs_exit 或一票否决；
+   「退出 S_push → SELL」的旧二值闸门语义已废除。）
+- 时序约束（Next-Bar 执行，决定开/平仓成交时点）：
+    * 开仓时间窗 10:00 起 → BUY 信号落在 D1 10:00（Next-Bar 10:30 成交）
+    * 熊段指数跳水触发「大盘跳水」一票否决 → SELL 信号落在 D5 09:30
+      （Next-Bar 10:00 成交；D1 建仓已过 T+1，卖出合规）
 
 用法：
     python main.py
 """
 
-import hashlib
 import logging
 import os
-import pickle
 import time
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
@@ -68,19 +71,7 @@ SMOKE_PARAMS: Dict[str, object] = {
     "win_hold_max": 120, "inst_window": 1, "chip_window": 1,
 }
 
-INITIAL_CASH = 1e8
-
-def _signals_cache_path(ds: DataSlice, params: Dict[str, object],
-                        label: str) -> str:
-    """信号落盘缓存路径：以 区间+标的+参数 为键（任一变化即失效）。"""
-    meta = getattr(ds, "meta", {}) or {}
-    key = hashlib.md5(
-        f"{label}|{meta.get('start')}|{meta.get('end')}"
-        f"|{','.join(sorted(meta.get('symbols', ['?'])))}"
-        f"|{sorted((str(k), repr(v)) for k, v in params.items())}"
-        .encode("utf-8")).hexdigest()[:16]
-    return os.path.join("data", "feature_cache", f"signals_{key}.pkl")
-
+INITIAL_CASH = 1e6
 
 def _window_end_str(params: Dict[str, object]) -> str:
     """reversal_window_end 透传：直接给定则原样；给定 reversal_window_span
@@ -172,17 +163,22 @@ def mk_kline(axis: pd.DatetimeIndex, bull_dates, symbols=SYMBOLS,
     return df
 
 
-def mk_snapshot(axis: pd.DatetimeIndex, symbols=SYMBOLS) -> pd.DataFrame:
-    """五档 L2 快照：买盘量 > 卖盘量 → OBI > 0。"""
+def mk_snapshot(axis: pd.DatetimeIndex, bull_dates,
+                symbols=SYMBOLS) -> pd.DataFrame:
+    """五档 L2 快照：牛段买盘量 > 卖盘量 → OBI > 0；
+    熊段卖压碾压买盘（卖盘量 ×5、买盘量 ×0.2）→ OBI < 0（OFSS 转负）。"""
+    bull = {pd.Timestamp(d).normalize() for d in bull_dates}
     rows = []
     for t in axis:
+        is_bull = t.normalize() in bull
+        bid_scale, ask_scale = (1.0, 1.0) if is_bull else (0.2, 5.0)
         for sym in symbols:
             row = {"symbol": sym}
             for i in range(1, 6):
                 row[f"bid{i}_p"] = 10.0 - 0.01 * i
-                row[f"bid{i}_v"] = 200.0 / i
+                row[f"bid{i}_v"] = 200.0 / i * bid_scale
                 row[f"ask{i}_p"] = 10.0 + 0.01 * i
-                row[f"ask{i}_v"] = 100.0 / i
+                row[f"ask{i}_v"] = 100.0 / i * ask_scale
             rows.append(row)
     df = pd.DataFrame(rows, index=axis.repeat(len(symbols)))
     df.index.name = "ts"
@@ -207,39 +203,68 @@ def mk_flow_ticks(axis: pd.DatetimeIndex, bull_dates, symbols=SYMBOLS) -> pd.Dat
     return df.set_index("ts")
 
 
-def mk_index_min(axis: pd.DatetimeIndex) -> pd.DataFrame:
-    """沪深300 指数：加速上涨（ma20 > ma60）→ MRS>0 且 个股跑赢 → RS>0。"""
+def mk_index_min(axis: pd.DatetimeIndex, bull_dates) -> pd.DataFrame:
+    """沪深300 指数：牛段加速上涨（ma20 > ma60）→ MRS>0 且 个股跑赢 → RS>0；
+    熊段跳水（每 Bar -2%），close 快速跌破 VWAP → 触发「大盘跳水」一票否决
+    （XS 强制 -1.0 <= th_xs_exit → SELL）。
+
+    vwap 取近 5 根 close 滚动均值（下跌时滞后于 close），故熊段
+    close < vwap*(1-circuit_index_drop) 成立；牛段上涨时 close > vwap，不误触。
+    """
+    bull = {pd.Timestamp(d).normalize() for d in bull_dates}
     n = len(axis)
     closes = 3000.0 + 0.05 * np.arange(n) + 0.002 * np.arange(n) ** 2
+    price_f, vol_f = 1.0, 1.0
+    adj_p = np.empty(n, dtype=float)
+    adj_v = np.empty(n, dtype=float)
+    for i, t in enumerate(axis):
+        if t.normalize() not in bull:
+            price_f *= 0.96  # 熊段每 Bar 跳水 -4%
+            vol_f *= 0.85    # 熊段缩量（量能 z-score 转负，MRS 同步走弱）
+        adj_p[i] = closes[i] * price_f
+        adj_v[i] = 1e7 * (1.0 + 0.02 * i) * vol_f
     rows = []
     for i, t in enumerate(axis):
-        c = closes[i]
+        c = adj_p[i]
         rows.append({"index_code": "000300.SH", "open": c, "high": c * 1.002,
                      "low": c * 0.998, "close": c,
-                     "volume": 1e7 * (1.0 + 0.02 * i), "vwap": c,
+                     "volume": adj_v[i], "vwap": c,
                      "ma20": c, "ma60": c * 0.99})
     df = pd.DataFrame(rows, index=axis)
     df.index.name = "ts"
+    df["vwap"] = df["close"].rolling(5, min_periods=1).mean()
     return df
 
 
-def mk_breadth(axis: pd.DatetimeIndex) -> pd.DataFrame:
-    """全市场广度：ADR=2.0 达标（> 1.0），北向净流为正。"""
+def mk_breadth(axis: pd.DatetimeIndex, bull_dates) -> pd.DataFrame:
+    """全市场广度：牛段 ADR=2.0 达标（> 1.0）、北向净流为正；
+    熊段 ADR 跌至 0.5、北向净流转负 → MRS 转负，抑制熊段开仓。"""
+    bull = {pd.Timestamp(d).normalize() for d in bull_dates}
     df = pd.DataFrame(index=axis)
-    df["advancers"] = 3000.0
-    df["decliners"] = 1500.0
-    df["adr"] = 2.0
-    df["north_net"] = 5e7
+    is_bull = pd.Series([t.normalize() in bull for t in axis], index=axis)
+    df["advancers"] = np.where(is_bull, 3000.0, 750.0)
+    df["decliners"] = np.where(is_bull, 1500.0, 1500.0)
+    df["adr"] = np.where(is_bull, 2.0, 0.5)
+    df["north_net"] = np.where(is_bull, 5e7, -5e8)
     return df
 
 
-def mk_industry(axis: pd.DatetimeIndex, name: str = "银行") -> pd.DataFrame:
-    """行业资金流：单调递增 → IRS / Chain_Mod > 0。"""
+def mk_industry(axis: pd.DatetimeIndex, bull_dates,
+                name: str = "银行") -> pd.DataFrame:
+    """行业资金流：牛段单调递增 → IRS / Chain_Mod > 0；
+    熊段自峰值快速回落至 0 → IRS z-score 转负 → Chain_Mod < 0。"""
+    bull = {pd.Timestamp(d).normalize() for d in bull_dates}
+    n = len(axis)
+    flow = np.linspace(0.0, 1.0, n)
+    bear_idx = [i for i, t in enumerate(axis) if t.normalize() not in bull]
+    if bear_idx:
+        s = bear_idx[0]
+        flow[s:] = np.linspace(flow[s], 0.0, n - s)
     df = pd.DataFrame(index=axis)
     df["industry"] = name
     df["open"] = df["high"] = df["low"] = df["close"] = 1000.0
     df["volume"] = 1e6
-    df["money_flow"] = np.linspace(0, 1, len(axis)) * 1e8
+    df["money_flow"] = flow * 1e8
     return df
 
 
@@ -287,15 +312,15 @@ def build_smoke_slice() -> DataSlice:
     axis = cn_minutes(DATES, freq="30min")
     ds = DataSlice(
         kline=mk_kline(axis, BULL_DATES),
-        l2_snapshot=mk_snapshot(axis),
+        l2_snapshot=mk_snapshot(axis, BULL_DATES),
         tick_trades=mk_flow_ticks(axis, BULL_DATES),
-        index_min=mk_index_min(axis),
-        breadth=mk_breadth(axis),
-        industry=mk_industry(axis),
+        index_min=mk_index_min(axis, BULL_DATES),
+        breadth=mk_breadth(axis, BULL_DATES),
+        industry=mk_industry(axis, BULL_DATES),
         macro=mk_macro(DATES),
         north_margin=mk_north_margin(DATES),
         dragon_tiger=mk_dragon_tiger(DATES),
-        meta={"symbols": list(SYMBOLS), "smoke": True},
+        meta={"symbols": list(SYMBOLS), "smoke": True, "source": "smoke_mock"},
     )
     # DataSlice.validate() 要求龙虎榜携带 avail_date，先按真实 T+1 规则标注
     ds.dragon_tiger = TimeAligner().align_dragon_tiger(ds.dragon_tiger, axis)
@@ -307,6 +332,7 @@ def build_smoke_slice() -> DataSlice:
 # ----------------------------------------------------------------------
 
 def _tick(t0: float, label: str) -> float:
+    """记录启动后经过的分钟数，并每小时输出一次运行进度；该回调不参与交易决策。"""
     dt = time.perf_counter() - t0
     logger.info("    └─ %s 耗时 %.3f s", label, dt)
     return time.perf_counter()
@@ -387,43 +413,31 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
         rank_gate=rank_gate,
     )
     sm = TradingStateMachine(synthesizer=syn)
-    cache_path = _signals_cache_path(ds, params, label)
-    signals = None
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "rb") as f:
-                signals = pickle.load(f)
-            logger.info("信号缓存命中：%s（%d 个信号）", cache_path, len(signals))
-        except Exception as exc:  # noqa: BLE001 缓存损坏则重算
-            logger.warning("信号缓存读取失败，将重新计算：%s", exc)
-            signals = None
-    if signals is None:
-        signals = sm.run(ds, features)
-        try:
-            with open(cache_path, "wb") as f:
-                pickle.dump(signals, f)
-            logger.info("信号缓存已写入：%s", cache_path)
-        except Exception as exc:  # noqa: BLE001 缓存写失败不影响回测
-            logger.warning("信号缓存写入失败（不影响回测）：%s", exc)
-    act_cnt = Counter(s.action for s in signals)
-    logger.info("状态机输出：%d 个信号 → %s", len(signals),
-                {k: act_cnt[k] for k in (ACT_BUY, ACT_ADD, ACT_SELL, "HOLD")})
-    t0 = _tick(t0, "信号合成 + 状态机（8/6 层闸门）")
+    t0 = _tick(t0, "信号评估表准备")
 
     # ---- 环节 4：回测撮合引擎 ----
     engine = BacktestEngine(
         Account(initial_cash=INITIAL_CASH),
         ExecutionCost(),
         PositionSizer(),
-        ds, signals,
+        ds,
         deadzone_th=float(params.get("deadzone_th", 0.05)),
+        state_machine=sm, features=features,
     )
     trade_log, equity_curve = engine.run()
+    signals = engine.generated_signals
+    act_cnt = Counter(s.action for s in signals)
+    logger.info("状态机输出：%d 个信号 → %s", len(signals),
+                {k: act_cnt[k] for k in (ACT_BUY, ACT_ADD, ACT_SELL, "HOLD")})
     filled = trade_log[trade_log["shares"] > 0]
     rejected = trade_log[trade_log["shares"] == 0]
+    reason_cnt = dict(rejected["reason"].value_counts()) if len(rejected) else {}
+    if "t1_lock" in reason_cnt:
+        # T+1 顺延是设计行为（每 Bar 记录一次），标注以区别于真正的失败拒绝
+        reason_cnt["t1_lock（T+1 顺延中，非失败）"] = reason_cnt.pop("t1_lock")
     logger.info("回测撮合：%d 根 Bar 净值点；成交 %d 笔 / 拒绝 %d 笔；"
                 "拒绝原因=%s", len(equity_curve), len(filled), len(rejected),
-                dict(rejected["reason"].value_counts()) if len(rejected) else "无")
+                reason_cnt or "无")
     t0 = _tick(t0, "回测撮合 BacktestEngine.run")
 
     # ---- 环节 5：绩效评估 ----
@@ -488,6 +502,13 @@ def run_real() -> None:
         logger.info("特征缓存预检命中：跳过 tick/l2_snapshot 加载（%s ~ %s）",
                     REAL_START, REAL_END)
     ds = loader.load_slice(symbols, REAL_START, REAL_END, skip_tick=cache_hit)
+    logger.info("真实数据覆盖：股票池=%d，独立指数=%s，独立广度=%s，"
+                "历史 ST=%.1f%%，流通市值=%.1f%%",
+                ds.meta.get("n_symbols", len(symbols)),
+                "有" if ds.index_min is not None else "缺失",
+                "有" if ds.breadth is not None else "缺失",
+                100 * ds.meta.get("st_coverage", 0.0),
+                100 * ds.meta.get("float_cap_coverage", 0.0))
     run_pipeline(ds, REAL_PARAMS, loader.symbol_to_industry, "真实数据",
                  rank_gate=_build_rank_gate(REAL_PARAMS))
 
@@ -561,8 +582,15 @@ def run_ic_flow(start: str, end: str,
 
 
 def _plot_smoke_charts(ds: DataSlice) -> List[str]:
-    """把分钟 K 线按日聚合后跑 compute_all，再调用 plot_trend 出图。"""
+    """把分钟 K 线按日聚合后跑 compute_all，再调用 plot_trend 出图。
+
+    文件名前缀与标题按数据模式区分：冒烟 Mock → ``smoke_`` 前缀；真实数据 → 无前缀，
+    避免真实回测出图被误标为冒烟产物、或与冒烟图互相覆盖。
+    """
     from analytics.plotter import plot_trend
+    smoke = bool(ds.meta.get("smoke"))
+    prefix = "smoke_" if smoke else ""
+    seg = "冒烟回测段" if smoke else "回测段"
     paths = []
     for sym in ds.symbols():
         k = ds.kline[ds.kline[SYMBOL] == sym].copy()
@@ -573,9 +601,9 @@ def _plot_smoke_charts(ds: DataSlice) -> List[str]:
         )
         daily = compute_all(daily)  # ma5/ma20/is_trend 等绘图必需列
         daily["code"] = sym
-        fname = os.path.join("analytics", "pictures", f"smoke_{sym}.png")
+        fname = os.path.join("analytics", "pictures", f"{prefix}{sym}.png")
         path = plot_trend(daily, fname=fname,
-                          title=f"{sym} 冒烟回测段（黄色区域=震荡区间）")
+                          title=f"{sym} {seg}（黄色区域=震荡区间）")
         paths.append(path)
     return paths
 
@@ -607,6 +635,7 @@ def _status_checks(ds: DataSlice, features: pd.DataFrame,
     t_trace: Dict[str, List[str]] = {}
 
     def _trace(sym: str, s: str) -> None:
+        """缓存最近的逐 Bar 持仓快照，供 T+1 可卖数量不变量失败时打印诊断上下文；只保留末尾 20 条以限制日志体积。"""
         lst = t_trace.setdefault(sym, [])
         lst.append(s)
         del lst[:-20]
@@ -657,13 +686,15 @@ def _status_checks(ds: DataSlice, features: pd.DataFrame,
 
 
 def _verify_no_lookahead(ds: DataSlice, features: pd.DataFrame) -> bool:
-    """日频因子 T-1 可见性二次校验。
-
-    口径：T-1 对齐（allow_exact_matches=False）下，A 股时点 T 只能使用
-    外部记录日期严格早于 T 的数据。若数据表含早于窗口起始的历史记录
-    （真实数据通常如此），首日出现日频值是合法的 T-1 值；只有当天
-    无法追溯到更早记录时出现值，才是未来函数。
-    """
+    """Validate per-row dragon-tiger provenance; daily asof sources are checked in align_external."""
+    if {"dt_net", "dt_avail"} <= set(features.columns):
+        mask = features["dt_net"].notna()
+        if mask.any():
+            source = pd.to_datetime(features.loc[mask, "dt_avail"])
+            if source.isna().any():
+                return False
+            if (features.index[mask] <= pd.DatetimeIndex(source)).any():
+                return False
     first_day = pd.Timestamp(features.index.normalize()[0])
     first_mask = features.index.normalize() == first_day
     daily_cols = ["north_sync", "margin_pressure", "cps", "dt_net"]

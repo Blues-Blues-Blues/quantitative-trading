@@ -85,6 +85,12 @@ logger = logging.getLogger("strategy.signals")
 
 _EPS = 1e-12
 
+# ---- 信号落盘缓存版本号 ----
+# 决策逻辑（合成 / 评分 / 状态机）变化时必须手动递增，否则 main.py 的信号
+# 缓存会按「区间+标的+参数」命中旧代码产出的 pickle，静默掩盖回归。
+# 与 indicators.feature_engine._CACHE_SCHEMA_VERSION 的做法保持一致。
+_SIGNAL_CACHE_VERSION = "3.1"
+
 # ---- 状态常量 ----
 S_PUSH = "S_push"
 S_YOUZI_ONLY = "S_youzi_only"
@@ -159,6 +165,7 @@ class Signal:
     metrics: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
+        """将信号转换为日志与序列化使用的普通字典；保留指标字典以便回溯决策依据。"""
         return {
             "symbol": self.symbol, "timestamp": self.timestamp,
             "action": self.action, "state": self.state, "metrics": self.metrics,
@@ -188,6 +195,7 @@ class Position:
     high_price_watermark: float = 0.0
     avg_cost: float = 0.0
     simulated_weight: float = 0.0
+    actual_shares: int = 0
 
 
 class SignalSynthesizer:
@@ -266,6 +274,7 @@ class SignalSynthesizer:
         # ---- 横截面排序闸门（可选，默认关闭）----
         rank_gate: Optional["CrossSectionalRankGate"] = None,
     ) -> None:
+        """保存因子权重、入场/出场阈值和时间衰减配置；合法性检查在构造时完成，避免状态机运行到一半才发现参数错误。"""
         if len(weights) != 4:
             raise ValueError(f"weights 必须为 4 个权重 (W_OFSS, W_CPS, W_INST, W_NORTH)，当前: {weights}")
         total = float(np.sum(weights))
@@ -460,12 +469,13 @@ class SignalSynthesizer:
             s = s.reindex(key)
             # 恢复 features 的 DatetimeIndex（含重复 ts）以便逐行赋值
             s = pd.Series(s.to_numpy(), index=features.index)
-        return s
+        # 纯净兜底：无交易/冷启动缺失视为无追涨 → 0.0，不向下游传 NaN
+        return s.fillna(0.0)
 
     def _relative_strength(self, ds: DataSlice, axis: pd.DatetimeIndex) -> pd.DataFrame:
         """个股相对强度 RS（日频，T-1 对齐）：个股近 N 日收益 - 指数近 N 日收益。
 
-        返回长表 [ts, symbol, rs]；缺数据 → rs 全 NaN（评分中性处理，不阻断）。
+        返回长表 [ts, symbol, rs]；上市初期/缺数据 → rs 中性 0.0（不阻断）。
         """
         if ds.kline is None or ds.kline.empty or ds.index_min is None or ds.index_min.empty:
             return pd.DataFrame(columns=["ts", SYMBOL, "rs"])
@@ -492,12 +502,19 @@ class SignalSynthesizer:
         dk["rs"] = _drop_grouper_level(
             dk.groupby(SYMBOL, group_keys=False)["drs"]
             .rolling(self.rs_window, min_periods=1).sum())
-        return self._align_daily_to_minute(dk[[TRADE_DATE, SYMBOL, "rs"]], axis, ["rs"])
+        # 绝对边界：超额收益 clip 到 [-1,1]，兼容系统契约、防极端妖股破坏权重体系。
+        # （T-1 asof 对齐等价于 rs_raw.shift(1)，此处不额外 shift，避免双重滞后）
+        dk["rs"] = dk["rs"].astype(float).clip(-1.0, 1.0)
+        out = self._align_daily_to_minute(dk[[TRADE_DATE, SYMBOL, "rs"]], axis, ["rs"])
+        # 中性兜底：上市初期/数据缺失 → 0.0（相对大盘表现记绝对中性），不传 NaN
+        out["rs"] = out["rs"].fillna(0.0)
+        return out
 
     def _industry_ms(self, ds: DataSlice, axis: pd.DatetimeIndex) -> pd.DataFrame:
         """行业层情绪 Industry_MS（日频，T-1 对齐）：行业资金流近 N 日累计变化率。
 
-        按行业计算后映射到个股（symbol_to_industry）；无映射 → NaN。
+        按行业计算 clip 到 [-1,1] 后映射到个股（symbol_to_industry）；
+        无映射 → 不在返回中（下游置 NaN）；首日/缺数据 → 中性 0.0。
         返回长表 [ts, symbol, industry_ms]。
         """
         if ds.industry is None or ds.industry.empty or not self.symbol_to_industry:
@@ -511,6 +528,9 @@ class SignalSynthesizer:
         di["ims"] = _drop_grouper_level(
             di.groupby("industry", group_keys=False)["flow_ret"]
             .rolling(self.industry_window, min_periods=1).sum())
+        # 空间压缩契约：clip 到 [-1,1]，防极端行业抱团破坏特征权重体系。
+        # （T-1 asof 对齐等价于 ims.shift(1)，此处不额外 shift，避免双重滞后）
+        di["ims"] = di["ims"].astype(float).clip(-1.0, 1.0)
 
         # 行业级对齐（无 symbol 列 → 按 industry 分组）
         rows = []
@@ -522,6 +542,8 @@ class SignalSynthesizer:
         if not rows:
             return pd.DataFrame(columns=["ts", SYMBOL, "industry_ms"])
         ind_long = pd.concat(rows).reset_index().rename(columns={"index": "ts"})
+        # 中性兜底：首日无前序数据/缺数据 → 0.0（行业背景视为绝对中性）
+        ind_long["ims"] = ind_long["ims"].fillna(0.0)
 
         # 映射到个股
         map_df = pd.DataFrame({
@@ -821,29 +843,37 @@ class SignalSynthesizer:
     def calculate_exit_score(self, row: pd.Series, pos: Position) -> float:
         """出局分 XS ∈ [-1, 1]（业务适配器：提取标量 + 调纯函数）。
 
-        XS = w_xs_ms*Final_MS + w_xs_purity*Capital_Purity
+        XS = w_xs_ms*adjusted_MS + w_xs_purity*Capital_Purity
              - w_xs_drawdown*Drawdown_From_High
         Final_MS / Capital_Purity 已在 [-1, 1]，直接使用原值（缺失 → 0），
         不再二次 clip 缩放。一票否决（游资溃逃 / 大盘跳水）→ 强制 XS = -1.0。
+        当前 K 线浮盈率 current_pnl 用于情绪极值反转门控（见 _compute_xs）。
         所有数学计算委托给纯函数 _compute_xs。
         """
         ms = float(row.get("final_ms", 0.0))
         purity = float(row.get("capital_purity", 0.0))
         close = float(row.get("close", 0.0))
         hwm = float(pos.high_price_watermark)
-        is_veto = bool(self.veto(row))
+        is_veto = bool(row.get("veto_flag", False))
+        avg_cost = float(pos.avg_cost)
+        current_pnl = 0.0 if avg_cost <= 1e-6 else (close - avg_cost) / avg_cost
         ws = (self.w_xs_ms, self.w_xs_purity, self.w_xs_drawdown)
-        return self._compute_xs(ms, purity, hwm, close, is_veto, ws)
+        return self._compute_xs(ms, purity, hwm, close, is_veto, ws, current_pnl)
 
     @staticmethod
     def _compute_xs(final_ms, capital_purity, high_price_watermark,
-                    close, veto_flag, weights) -> float:
+                    close, veto_flag, weights,
+                    pnl_ratio: float = 0.0) -> float:
         """出局分 XS ∈ [-1, 1]（纯数学算子，无业务/状态依赖）。
 
         NaN/None → 0（空值中性，中立不提供出局信号）。
         回撤 dd = max(0, (hwm - close) / hwm)；hwm<=1e-6 → 0（防除零）。
+        均值反转门控：情绪极度过热（final_ms>0.8）且已累积实质浮盈
+        （pnl_ratio>0.05）→ 将情绪分反转为惩罚项（adjusted_ms=-final_ms），
+        支持高处止盈离场。该翻转随浮盈率越过/跌破阈值在相邻 bar 间翻转，
+        属有意的均值反转特性。pnl_ratio 为 NaN 时比较为 False → 门不触发。
         veto_flag=True → 一票否决，无视权重直接返回 -1.0。
-        xs_raw = w_ms*final_ms + w_purity*capital_purity - w_dd*dd，clip 到 [-1, 1]。
+        xs_raw = w_ms*adjusted_ms + w_purity*purity - w_dd*dd，clip 到 [-1, 1]。
         """
         w_ms, w_purity, w_dd = weights
         ms = float(final_ms) if not (final_ms is None or pd.isna(final_ms)) else 0.0
@@ -851,11 +881,13 @@ class SignalSynthesizer:
                                                or pd.isna(capital_purity)) else 0.0
         if veto_flag:
             return -1.0
+        is_overheated = (ms > 0.8) and (pnl_ratio > 0.05)
+        adjusted_ms = -ms if is_overheated else ms
         if high_price_watermark <= 1e-6:
             dd = 0.0
         else:
             dd = max(0.0, (high_price_watermark - close) / high_price_watermark)
-        xs_raw = w_ms * ms + w_purity * purity - w_dd * dd
+        xs_raw = w_ms * adjusted_ms + w_purity * purity - w_dd * dd
         return float(np.clip(xs_raw, -1.0, 1.0))
 
     def drawdown_from_high(self, row: pd.Series, pos: Position) -> float:
@@ -866,22 +898,21 @@ class SignalSynthesizer:
             return 0.0
         return max(0.0, (hwm - float(close)) / hwm)
 
-    def veto(self, row: pd.Series) -> bool:
-        """一票否决（强制 XS = -1.0）：
+    def _compute_veto(self, big_flow, retail_chase, index_close,
+                      index_vwap) -> pd.Series:
+        """一票否决掩码（纯向量化，长表整列预计算）：
 
         ① 游资溃逃：big_flow < 0（大资金净流出）且 Retail_Chase > th_retail_chase
-        ② 大盘跳水：沪深300 日内跌破 VWAP * (1 - circuit_index_drop)
-        任一输入缺失 → 对应条件不触发（保守不误杀）。
+           （NaN fillna(0.0) → 恒不跨阈，等价旧"输入缺失不触发"）
+        ② 大盘跳水：index_close < index_vwap*(1 - circuit_index_drop)
+           （index_vwap NaN → threshold NaN → 恒 False；index_close NaN → fillna False）
+        返回与输入 index 对齐的布尔 Series；任一腿缺失输出 False。
         """
-        big = row.get("big_flow", np.nan)
-        chase = row.get("retail_chase", np.nan)
-        run_away = (pd.notna(big) and float(big) < 0.0
-                    and pd.notna(chase) and float(chase) > self.th_retail_chase)
-        idx_close = row.get("index_close", np.nan)
-        idx_vwap = row.get("index_vwap", np.nan)
-        idx_dive = (pd.notna(idx_close) and pd.notna(idx_vwap)
-                    and float(idx_close) < float(idx_vwap) * (1.0 - self.circuit_index_drop))
-        return bool(run_away or idx_dive)
+        cond1 = ((big_flow.fillna(0.0) < 0)
+                 & (retail_chase.fillna(0.0) > self.th_retail_chase))
+        threshold = index_vwap * (1.0 - self.circuit_index_drop)
+        cond2 = (index_close < threshold).fillna(False)
+        return (cond1 | cond2).astype(bool)
 
     # ------------------------------------------------------------------
     # A 股硬过滤层（一票否决前置条件，独立于连续评分）
@@ -890,7 +921,8 @@ class SignalSynthesizer:
     def hard_filters(self, row: pd.Series) -> Dict[str, bool]:
         """A 股硬约束明细（全部为真才允许开仓；NaN 比较恒为 False 保守关闭）。"""
         return {
-            "st": not bool(row.get("is_st", True)),
+            "st": bool(pd.notna(row.get("is_st", np.nan))
+                       and not bool(row.get("is_st"))),
             "limit": bool(self._gt(row, "up_limit", row.get("close", np.nan))
                           and self._gt(row, "close", row.get("down_limit", np.nan))),
             "liquidity": self._gt(row, "amount", self.th_amount),
@@ -926,29 +958,35 @@ class SignalSynthesizer:
             A 股硬过滤全过 且 ES >= th_es_entry
                 → base_weight * ES * clip(1+Global_Mod) * clip(1+Chain_Mod)
             否则 → 0.0
-        持仓（XS 四分判定链）：
+        持仓（XS 判定链）：
             XS >= th_xs_reduce_high      → base_weight * PS * 乘子（正常持仓按 PS 调仓）
             th_xs_exit < XS < th_xs_reduce_high
-                                         → simulated_weight * reduce_step_ratio
-                                            （容错阶梯减仓，不清仓）
+                                         → min(simulated_weight,
+                                               base_weight * reduce_step_ratio)
+                                            （容错阶梯减仓，锚定下限非递归衰减）
             th_xs_crash < XS <= th_xs_exit → 0.0（常规清仓）
             XS <= th_xs_crash 或一票否决   → 0.0（极速清仓 Crash / Panic Exit）
         统一 clip(0, max_single_position) 兜底。
         """
         if pos is None:
             es = self.calculate_entry_score(row)
-            if self.hard_all(row) and es >= self.th_es_entry:
+            if self.entry_all(row):
                 tw = self.base_weight * es * self._tw_scale(row)
             else:
                 tw = 0.0
         else:
             xs = self.calculate_exit_score(row, pos)
-            if xs <= self.th_xs_crash or self.veto(row):
-                tw = 0.0  # 极速清仓
+            # 硬路由强制拦截：一票否决 / 极速清仓线 / 常规清仓线 → 目标 0
+            if row.get("veto_flag", False) or xs <= self.th_xs_crash:
+                tw = 0.0  # 一票否决 / 极速清仓
             elif xs <= self.th_xs_exit:
                 tw = 0.0  # 常规清仓
             elif xs < self.th_xs_reduce_high:
-                tw = pos.simulated_weight * self.reduce_step_ratio
+                # 容错阶梯减仓（锚定下限，非递归衰减）：目标稳定在
+                # min(当前模拟权重, base_weight*reduce_step_ratio)，避免逐根 K
+                # 线对 simulated_weight 反复 ×ratio 导致目标指数级趋近 0。
+                tw = min(pos.simulated_weight,
+                         self.base_weight * self.reduce_step_ratio)
             else:
                 ps = self.calculate_position_score(row, pos)
                 tw = self.base_weight * ps * self._tw_scale(row)
@@ -992,7 +1030,7 @@ class SignalSynthesizer:
         """
         xs = self.calculate_exit_score(row, pos)
         exit_ = xs <= self.th_xs_exit
-        crash = bool(xs <= self.th_xs_crash or self.veto(row))
+        crash = bool(xs <= self.th_xs_crash or row.get("veto_flag", False))
         return {
             "state": exit_,
             "ms": exit_,
@@ -1104,8 +1142,8 @@ class TradingStateMachine:
             且 满足最小加仓间隔 → ADD
     - 其余 → HOLD（每根 Bar / 每标的均输出一个 Signal）
 
-    内部维护 paper positions（入场时间 / 入场 VWAP / 加权成本 / 持仓最高价 /
-    持仓分钟数），供持仓评分使用；连续回测可跨 run() 调用保留，也可 reset()。
+    回测使用 on_bar()，每根 Bar 收盘从 Account 的已成交持仓同步成本、
+    股数与实际权重。run() 保留为离线信号分析兼容接口，不用于回测撮合。
     """
 
     def __init__(
@@ -1115,6 +1153,7 @@ class TradingStateMachine:
         add_requires_entry_gates: bool = True,  # 加仓是否复用全部开仓闸门
         min_reduce_interval: int = 5,  # 两次阶梯减仓之间的最小 Bar 数
     ) -> None:
+        """初始化信号合成器及加仓、减仓节流间隔；该对象持有逐标的状态，因此新回测开始前应调用 reset。"""
         self.syn = synthesizer or SignalSynthesizer()
         if min_add_interval < 0:
             raise ValueError(f"min_add_interval 不能为负，当前: {min_add_interval}")
@@ -1130,6 +1169,50 @@ class TradingStateMachine:
         """清空内部持仓（新回测/新交易日前调用）。"""
         self.positions = {}
         self._step = 0  # 全局 Bar 计数（仅用于排序断言）
+        self._last_ts = None
+        self._account_driven = False
+
+    def on_bar(self, ts: pd.Timestamp, rows: pd.DataFrame,
+               account: object) -> List[Signal]:
+        """At bar close, decide using the filled account positions at this timestamp."""
+        from engine.portfolio import Account
+        if not isinstance(account, Account):
+            raise TypeError("on_bar requires an Account snapshot")
+        ts = pd.Timestamp(ts)
+        if self._last_ts is not None and ts <= self._last_ts:
+            raise ValueError("状态机 Bar 时间必须严格递增")
+        self._last_ts = ts
+        self._account_driven = True
+        result: List[Signal] = []
+        for _, row in rows.iterrows():
+            sym = row[SYMBOL]
+            actual = account.positions.get(sym)
+            paper = self.positions.get(sym)
+            if actual is None or actual.shares <= 0:
+                self.positions.pop(sym, None)
+                paper = None
+            else:
+                weight = actual.shares * actual.last_price / account.total_equity
+                if paper is None:
+                    paper = Position(
+                        symbol=sym, entry_time=actual.entry_time or ts,
+                        entry_vwap=actual.cost_basis,
+                        last_price=actual.last_price,
+                        high_price_watermark=actual.last_price,
+                        avg_cost=actual.cost_basis,
+                        simulated_weight=weight,
+                        actual_shares=actual.shares)
+                    self.positions[sym] = paper
+                else:
+                    if actual.shares > paper.actual_shares:
+                        paper.last_add_bar = paper.bars_held
+                    paper.actual_shares = actual.shares
+                    paper.avg_cost = actual.cost_basis
+                    paper.entry_vwap = actual.cost_basis
+                    paper.simulated_weight = weight
+            result.append(self._on_holding(row, paper) if paper is not None
+                          else self._on_flat(row))
+        return result
 
     # ------------------------------------------------------------------
     # 主入口
@@ -1216,6 +1299,12 @@ class TradingStateMachine:
         s_obi = ev.get("obi", pd.Series(np.nan, index=ev.index))
         s_flow = ev.get("big_flow", pd.Series(np.nan, index=ev.index))
         ev["fund_stability"] = self.syn._compute_fund_stability(s_cancel, s_obi, s_flow)
+        # 一票否决：纯向量化预计算整列（缺列 → 全 NaN → False，任一腿缺失不触发）
+        s_flow = ev.get("big_flow", pd.Series(np.nan, index=ev.index))
+        s_chase = ev.get("retail_chase", pd.Series(np.nan, index=ev.index))
+        s_idx_c = ev.get("index_close", pd.Series(np.nan, index=ev.index))
+        s_idx_v = ev.get("index_vwap", pd.Series(np.nan, index=ev.index))
+        ev["veto_flag"] = self.syn._compute_veto(s_flow, s_chase, s_idx_c, s_idx_v)
         assert ev["ts"].is_monotonic_increasing, "评估表必须按时间升序"
         return ev
 
@@ -1233,7 +1322,7 @@ class TradingStateMachine:
             scores["ps"] = self.syn.calculate_position_score(row, pos)
             scores["xs"] = self.syn.calculate_exit_score(row, pos)
             scores["xs_crash"] = bool(
-                scores["xs"] <= self.syn.th_xs_crash or self.syn.veto(row))
+                scores["xs"] <= self.syn.th_xs_crash or row.get("veto_flag", False))
             scores["time_decay"] = self.syn.time_decay(row, pos)
             scores["fund_stability"] = row.get("fund_stability", 1.0)
             scores["drawdown"] = self.syn.drawdown_from_high(row, pos)
@@ -1246,15 +1335,15 @@ class TradingStateMachine:
         sym = row[SYMBOL]
         gates = self.syn.entry_gates(row)
         scores = self._scores(row, None)  # 含 target_weight（开仓目标权重）
-        if self.syn.hard_all(row) and self.syn.calculate_entry_score(row) \
-                >= self.syn.th_es_entry:
+        if self.syn.entry_all(row):
             close = float(row["close"])
             vwap = float(row["vwap"])
-            self.positions[sym] = Position(
-                symbol=sym, entry_time=pd.Timestamp(row["ts"]),
-                entry_vwap=vwap, last_price=close, bars_held=0, last_add_bar=0,
-                last_reduce_bar=0, high_price_watermark=close, avg_cost=vwap,
-                simulated_weight=float(scores["target_weight"]))
+            if not self._account_driven:
+                self.positions[sym] = Position(
+                    symbol=sym, entry_time=pd.Timestamp(row["ts"]),
+                    entry_vwap=vwap, last_price=close, bars_held=0, last_add_bar=0,
+                    last_reduce_bar=0, high_price_watermark=close, avg_cost=vwap,
+                    simulated_weight=float(scores["target_weight"]))
             return Signal(sym, pd.Timestamp(row["ts"]), ACT_BUY,
                           row["state"],
                           self._metrics(row, entry_gates=gates, scores=scores))
@@ -1300,7 +1389,8 @@ class TradingStateMachine:
                              self.syn.max_single_position)
                 self._rebase_avg_cost(row, pos, sim_old, target)
                 pos.simulated_weight = target
-                pos.last_add_bar = pos.bars_held
+                if not self._account_driven:
+                    pos.last_add_bar = pos.bars_held
                 scores["reversal_add"] = True
                 added = True
             scores["target_weight"] = target
@@ -1309,8 +1399,9 @@ class TradingStateMachine:
                           self._metrics(row, scores=scores))
 
         # 清仓：常规清仓（XS <= th_xs_exit）或 极速清仓（XS <= th_xs_crash / 一票否决）
-        if xs <= self.syn.th_xs_exit or self.syn.veto(row):
-            del self.positions[row[SYMBOL]]
+        if xs <= self.syn.th_xs_exit or row.get("veto_flag", False):
+            if not self._account_driven:
+                del self.positions[row[SYMBOL]]
             return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_SELL,
                           row["state"],
                           self._metrics(row,
@@ -1332,7 +1423,8 @@ class TradingStateMachine:
         if self.add_requires_entry_gates:
             add_ok = add_ok and self.syn.entry_all(row)
         if add_ok and (pos.bars_held - pos.last_add_bar >= self.min_add_interval):
-            pos.last_add_bar = pos.bars_held
+            if not self._account_driven:
+                pos.last_add_bar = pos.bars_held
             sim_old = pos.simulated_weight
             target = float(scores["target_weight"])  # = base × PS × 乘子
             self._rebase_avg_cost(row, pos, sim_old, target)

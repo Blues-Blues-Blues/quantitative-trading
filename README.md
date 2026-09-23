@@ -2,7 +2,7 @@
 
 基于**真实高频数据**（万得 Level-2 逐笔 + 日频 CSV）的 A 股量化交易回测框架。项目以「数据层 → 指标层 → 策略层 → 执行引擎层 → 评估与绘图」的分层结构组织代码。
 
-当前开发状态：**真实数据接入（`data/real_loader.py`，万得 L2 parquet + 日频 CSV）、数据管道与多源时间对齐、核心因子与主体情绪特征工程、连续评分信号与状态机（ES/PS/XS + A股硬过滤）、Target_Weight 差额调仓撮合引擎、绩效评估与收益归因、Optuna 贝叶斯寻优、项目主入口（`main.py --data smoke|real`）均已实现**；冒烟模式内置 mock 数据秒级跑通全链路，真实数据模式全链路验证通过（20 只股票 × 4 个月 / 2 只 × 2 年）。
+当前开发状态：数据管道、连续评分与账户驱动的逐 Bar 回测、绩效归因和 Optuna 寻优均已实现；冒烟模式内置 mock 数据可跑通。真实模式现要求独立市场分钟数据及历史 ST 状态，补齐后需重新验证实盘数据结果。
 
 评分模块已完成**纯函数化 / 向量化架构重构**：`ES`（`_compute_es`）、`PS`（`_compute_ps`）、`Fund_Stability`（`_compute_fund_stability`）、`XS`（`_compute_xs`）均为无状态纯算子，长表整列向量化、index 对齐、缺失值中性化兜底、负底数/零除几何防护；`_build_eval_table` 预计算 `fund_stability` 整列供状态机消费，游资独舞走硬掩码否决（ES=0）/一票否决（XS=-1）而非数学衰减。
 
@@ -19,7 +19,7 @@
 - **连续评分信号**：全向量化纯函数算子——**ES**（入场分 = `sigmoid` 合成资金主体/纯净度/量价共振，游资独舞硬掩码=0）、**PS**（持仓分 = `ES×Time_Decay×Fund_Stability` 变比分片、缺失兜底）、**XS**（出局分 = 权重线性加权 + 高水位回撤、一票否决硬 -1 的纯函数）；**Fund_Stability** 在评估表预计算整列、缺列/NaN 安全降级 1.0；独立 A 股硬过滤层（ST 禁买、涨跌停禁买卖、时间窗 10:00~14:50、成交额门槛）前置否决，全部评分参数可寻优
 - **目标权重 Target_Weight**：连续评分 → 分钟级目标持仓比例（base × ES/PS × 宏观/行业乘子），驱动撮合引擎差额调仓
 - **回测撮合引擎**：事件驱动型分钟级撮合——Target_Weight 差额调仓 + 调仓死区（防过度换手）+ T+1 顺延挂起（当日买入锁定、跌停跳过）、动态滑点（订单参与率冲击模型）、佣金/印花税/过户费、单股与总杠杆上限风控，输出完整成交日志与净值曲线
-- **超参数优化**：Optuna 贝叶斯寻优（`StrategyOptimizer`），Dirichlet 式权重归一化（和为 1）、TPE 原生多重硬约束（回撤 < 15%、胜率 > 55%、盈亏比 > 1.5、有效交易 ≥ 30 笔）、样本内年化 Sharpe 最大化、优化历程收敛图；搜索空间只含决策链实际读取的参数（旧二值化闸门死参数已清理），寻优结果可直接注入 `main.py` 实盘复现
+- **超参数优化**：Optuna 贝叶斯寻优（`StrategyOptimizer` + `run_optimization.py`），Dirichlet 式权重归一化（和为 1）、TPE 原生多重硬约束、样本内年化 Sharpe 最大化 + 回撤/换手软惩罚、优化历程收敛图；搜索空间只含决策链实际读取的参数（旧二值化闸门死参数已清理），寻优结果可直接注入 `main.py` 实盘复现；真实数据寻优采用**严格三集隔离**（训练→验证→测试）与 JournalStorage 断点续跑，详见「超参数寻优」一节
 - **Walk-Forward 交叉验证**：滚动/扩展训练段的滚动样本外（OOS）验证框架，每折独立寻优并在样本外回测，输出跨折 OOS 评估报告，避免前视偏差与过度拟合
 - **绩效指标**：年化收益率、年化夏普、卡玛（Calmar）、Sortino、最大回撤、平均持仓周期、胜率/盈亏比、日收益偏度/峰度（`analytics/metrics.py` + `PerformanceAnalyzer`）
 - **实时决策日志流**：`StreamLogger` 每 Bar × 每标的输出标准 JSON（Final_MS / Global_Mod / Chain_Mod / Capital_Purity / Action / State），JSONL 落盘 + 生成器双形态
@@ -35,9 +35,9 @@
 ```
 quantitative_trading/
 ├── main.py                     # 项目主入口（--data smoke|real 模式切换）
-├── run_optimization.py         # 机器学习超参数寻优入口脚本
+├── run_optimization.py         # 超参数寻优入口（--data smoke|real，严格三集 + Journal 断点续跑）
 ├── demo_plot.py                # 演示脚本：绘制回测段价格走势与震荡区间
-├── requirements.txt            # 依赖：pandas / numpy / scipy / matplotlib / pyarrow / pyyaml / optuna / openpyxl
+├── requirements.txt            # 依赖：pandas / numpy / scipy / matplotlib / pyarrow / pyyaml / optuna / openpyxl / pytest
 ├── .gitignore                  # 排除数据目录（data/data1、data/data2）、缓存与临时脚本
 ├── config/                     # ── 全局配置 ──
 │   ├── settings.py             # 全局基础配置（回测起止日期等）
@@ -91,7 +91,6 @@ quantitative_trading/
     ├── test_data_aligner.py    # 时间对齐、防未来函数与 DataSlice 组装
     ├── test_factors.py         # 微观结构与环境因子计算
     ├── test_features.py        # 主体分层与 FeatureEngine 端到端
-    ├── test_state_machine.py   # （遗留空壳，状态机语义已迁移至 test_signals.py）
     ├── test_signals.py         # 信号合成公式与状态机全流程
     ├── test_backtest_engine.py # A 股撮合规则、T+1、成本滑点与风控
     ├── test_optimizer.py       # 贝叶斯寻优、硬约束、Walk-Forward 与收敛图
@@ -106,7 +105,7 @@ quantitative_trading/
 pip install -r requirements.txt
 ```
 
-依赖清单：`pandas`、`numpy`、`scipy`、`matplotlib`、`pyarrow`（parquet 高性能存储）、`PyYAML`（配置文件解析）、`optuna`（超参数优化）、`openpyxl`（Excel 导出）。
+依赖清单：`pandas`、`numpy`、`scipy`、`matplotlib`、`pyarrow`（parquet 高性能存储）、`PyYAML`（配置文件解析）、`optuna`（超参数优化）、`openpyxl`（Excel 导出）、`pytest`（单元测试）。
 
 ## 快速开始
 
@@ -127,15 +126,15 @@ python main.py --data real
 真实数据模式参数（区间、股票子集、评分/过滤阈值）见 `main.py` 顶部 `REAL_START / REAL_END / REAL_SYMBOLS / REAL_PARAMS`：
 
 ```python
-REAL_START = "2023-01-03"          # 回测起始
+REAL_START = "2024-01-02"          # 回测起始
 REAL_END   = "2024-12-31"          # 回测结束
-REAL_SYMBOLS = ["600171", "600460"]  # 股票子集；空列表 = 全部 20 只（全量较慢）
+REAL_SYMBOLS = ["603019"]          # 股票子集（603019=中科曙光）；空列表 = 全部 20 只（全量较慢）
 ```
 
 - 空 `REAL_SYMBOLS` 时自动发现 `data/data1` 全部标的（当前 20 只沪市）
-- 2 只 × 2 年：首次约 9 分钟（逐笔 6000 万行 + 状态机），**信号缓存命中后约 2.5 分钟**；20 只 × 4 个月约 5~6 分钟
-- `main.py` 会自动落盘**信号缓存**（`data/feature_cache/signals_*.pkl`）：回测区间、股票子集、参数任一未变化时跳过状态机重算，直接复用信号结果（寻优每 trial 参数不同因此不命中）
-- 输出到 `analytics/pictures/`，状态检查 5 项（含防未来函数断言）
+- **请使用已安装依赖的解释器运行**（如 `.venv\Scripts\python.exe`）。真实数据读取 parquet 依赖 `pyarrow`（或 `fastparquet`），缺失时 `RealDataLoader` 会在入口直接报错提示安装，不再静默降级为空表
+- 特征表按数据清单指纹、因子参数、schema 与对齐版本缓存；交易信号依赖实际成交和账户状态，因此逐 Bar 生成，不复用旧的 `signals_*.pkl`。
+- 输出到 `analytics/pictures/`（冒烟模式文件带 `smoke_` 前缀），状态检查 5 项（含防未来函数断言）
 
 ## 真实数据接入
 
@@ -154,6 +153,9 @@ data/data2/*.csv
     - hsgt_north_daily_flow.csv        北向大盘净流 + 沪深300 日频点位
     - lhb_summary_*.csv / lhb_seats_*.csv  龙虎榜净额（分类）+ 席位
     - stock_basic_info.csv             股票基础信息（代码/名称/ST）
+    - index_min.csv 或 .parquet          独立指数分钟数据，列 ts + index_code/open/high/low/close/volume/vwap/ma20/ma60
+    - breadth_min.csv 或 .parquet        独立全市场分钟广度，列 ts + advancers/decliners/adr（可含 north_net）
+    - stock_history.csv                  按日期生效的个股状态，列 symbol/trade_date/is_st/float_shares
 ```
 
 ### 用法
@@ -162,7 +164,7 @@ data/data2/*.csv
 from data.real_loader import RealDataLoader
 
 loader = RealDataLoader()
-ds = loader.load_slice(["600171", "600460"], "2023-01-03", "2024-12-31")  # 已内置对齐
+ds = loader.load_slice(["603019"], "2024-01-02", "2024-12-31")  # 已内置对齐
 ds.validate()
 ```
 
@@ -171,7 +173,9 @@ ds.validate()
 - 分钟级表（kline / l2_snapshot / tick_trades）直接用当日实时数据（当前 Bar 已收盘）
 - 日频表（macro / north_margin / industry）由 `TimeAligner` 做 T-1 全量对齐
 - 龙虎榜由 `TimeAligner` 标注 T+1 可用日（`avail_date`），T+1 前不可见
-- 缺口近似（全部当日可观测，无未来函数）：伪指数（20 标的等权分钟均线）、广度（20 标的涨跌家数）、北向净流（日频 T-1 填充）、行业资金流（指数 close 日间变化 T-1 对齐）
+- 指数和广度只从独立市场文件加载；缺失时对应市场因子保持缺失，不能把交易股票子集冒充全市场。
+- ST 和流通股本只从 `stock_history.csv` 的历史生效记录读取；缺失 ST 时开仓过滤保守阻断。缺昨收的首日涨跌停价保持缺失。
+- 运行日志列出股票池规模、独立市场数据是否存在、历史 ST 和流通市值覆盖率。
 
 ### 已知数据缺口（当前降级处理，不影响运行）
 
@@ -181,7 +185,7 @@ ds.validate()
 | 宏观缺 DXY 列 | 源文件无 DXY 列 → `dxy` 恒 NaN（加载器已支持读取，补齐数据列即生效） |
 | 9 只股票北向 2023 年 1~3 月起才有数据 | 前段 `north_sync` 为空（T-1 不填充） |
 | 股票融券余额全 NaN（仅 ETF 有值） | `margin_pressure` 降级为融资余额变化率 |
-| 涨跌停价口径（已修正） | 以 **T-1 昨收×幅度** 计算：ST±5%、创业板（300-302）/科创板（688）±20%、主板±10%，round(2)；数据周期首日无昨收以自身收盘近似 |
+| 涨跌停价口径 | 以 **T-1 昨收×幅度** 计算；缺昨收或历史 ST 时保持缺失，不使用本日收盘代替 |
 | 行业映射为按名称近似 | 内置 `DEFAULT_SYMBOL_TO_INDUSTRY`，可替换为 `config/industry_mapping.yaml` |
 
 ## 指标与市场状态
@@ -200,7 +204,7 @@ ds.validate()
 
 - **开仓**：未持仓 + A 股硬过滤全过 + ES ≥ th_es_entry → 目标 = `base_weight × ES × clip(1+Global_Mod) × clip(1+Chain_Mod)`，clip 到单股上限 `max_single_position`
 - **持仓 XS 四分链**：正常持仓（XS ≥ th_xs_reduce_high=0.2，目标=`base × PS × 乘子`）→ 容错阶梯减仓（-0.3 < XS < 0.2，目标=`simulated_weight × 0.8`）→ 常规清仓（-0.6 < XS ≤ -0.3，目标=0）→ 极速清仓（XS ≤ -0.6 或一票否决，目标=0）
-- **模拟权重**：`Position.simulated_weight` 由状态机动作维护（开仓=目标、减仓 ×0.8、加仓重算），与引擎真实成交仓位相互独立
+- **实际权重**：回测逐 Bar 从已成交股数、成本和账户权益同步策略持仓；拒单不会建仓，T+1 顺延卖单不会清除持仓。
 - **次日低开反包（Reversal / Counter-Attack）**：持仓跨入次日且深度低开（≤ th_reversal_gap=-1.5%）+ 盘口承接（OFSS > 0.2）+ 大资金逆势净流入（purity>0 且 big_flow>0）→ 豁免 XS 清仓/阶梯减仓，并在窗口内（受开仓 time 闸门共同约束）承接加仓 `target = min(simulated + base×ES×reversal_add_mult, max_single_position)`；大盘熔断（沪深300 跌破 VWAP-1.5%）时保护立即失效强制清仓
 - **硬约束**：`engine/risk_control.py` 的 `PositionSizer` 校验单股最大仓位与总账户杠杆上限，目标权重经 `max_single_position` 裁剪；`config/strategy_params.py` 提供全部默认参数（DEADZONE_TH=0.05 等）
 
@@ -211,9 +215,9 @@ ds.validate()
 - **ES 入场分**（纯向量化 `_compute_es`，长表整列计算）：`es = sigmoid(k · (w_ms·final_ms + w_purity·capital_purity + w_mrs·mrs_c))`；`final_ms`/`capital_purity` 已定 `[-1,1]` 直接使用（缺失→0，不二次 clip），大盘项 `mrs_c = clip(mrs, ±mrs_clip)/mrs_clip`；**游资独舞硬掩码**：`s_youzi_only=True` 时 `es = 0`；参数可寻优（`w_es_*` / `es_sigmoid_k` / `th_es_entry`），纯函数内 index 对齐、缺失中性化
 - **PS 持仓分**（纯向量化 `_compute_ps`）：`PS = ES × Time_Decay × Fund_Stability`，三乘数天然有界故移除外层 `clip`；`es` 缺失→0、`time_decay`/`fund_stability` 缺失→1.0 不做折减；`Time_Decay` 前 `win_decay_grace` 恒 1.0，此后按浮盈亏非对称衰减（浮盈 factor=0.975、浮亏=0.90，`max(0.01, factor)` 防负底数，`clip(factor^(eff_bars/10), 0.1, 1.0)`）
 - **Fund_Stability**（纯向量化预计算整列）：`_compute_fund_stability(cancel_ratio, obi, big_flow)` 在 `_build_eval_table` 注入 `fund_stability` 列——撤单率超阈或盘口变薄（`|OBI|` 与 `|big_flow|` 同时趋零）→ `penalty`，缺列/NaN（`fillna` 后不触发）安全降级 1.0；状态机仅消费该列，不重复计算
-- **XS 出局分**（纯函数 `_compute_xs`）：权重线性加权 + 高水位回撤 `max(0, (hwm-close)/hwm)`（`hwm≤1e-6 → 0` 防除零）clip 到 [-1,1]；`veto_flag=True` 一票否决无视权重硬返回 -1.0
+- **XS 出局分**（纯函数 `_compute_xs`）：权重线性加权 + 高水位回撤 `max(0, (hwm-close)/hwm)`（`hwm≤1e-6 → 0` 防除零）clip 到 [-1,1]；**情绪极值均值反转门控**（`final_ms>0.8` 且当前浮盈率 `>5%` 时情绪分反转为惩罚，支持高处止盈离场）；`veto_flag=True` 一票否决无视权重硬返回 -1.0
 - **A 股硬过滤层**（否决前置）：ST 禁买、涨停禁买/跌停禁卖、交易时间窗 10:00~14:50（10:00 整之前禁买，防开盘冲高骗局）、成交额门槛；未持仓时任一不过即不开仓（`hard_filters` 与状态机 BUY 口径一致）
-- **一票否决**：游资溃逃（资金流为负且散户追高超阈值）或大盘跳水（沪深300 跌破 VWAP×(1-1.5%)）→ XS=-1，强制出局
+- **一票否决**（纯向量化 `_compute_veto` 预计算整列 `veto_flag`）：游资溃逃（大资金净流出为负且散户追高超阈值）或大盘跳水（沪深300 跌破 VWAP×(1-1.5%)）→ XS=-1，强制出局；`veto_flag` 在评估表 `_build_eval_table` 预计算、缺列/NaN 保守为 False（任一腿缺失不误触发），状态机直接消费
 - **状态机动作**：BUY / ADD / SELL / DECAY_REDUCE / HOLD，输出含 `target_weight` 在内的全量评分快照（metrics）
 - **防未来**：Bar t 决策 → Bar t+1 开盘价成交；日频因子经 T-1 asof 对齐后进入分钟轴
 
@@ -236,7 +240,7 @@ from engine.risk_control import PositionSizer
 
 ds, signals = ...            # DataSlice（对齐后的行情）+ 状态机产出的 Signal 列表
 eng = BacktestEngine(
-    Account(initial_cash=1e8, max_leverage=1.0, max_single_position=0.3),
+    Account(initial_cash=1e6, max_leverage=1.0, max_single_position=0.3),
     ExecutionCost(),         # 佣金 / 印花税 / 过户费 / 动态滑点
     PositionSizer(),         # 单股/杠杆上限风控与目标权重裁剪
     ds, signals,
@@ -244,19 +248,46 @@ eng = BacktestEngine(
 trade_log, equity_curve = eng.run()   # 完整成交日志 + 逐 Bar 净值曲线
 ```
 
+## 超参数寻优（run_optimization.py）
+
+`run_optimization.py` 是独立的寻优入口（`--data smoke|real`），复用 `StrategyOptimizer` 做 TPE 贝叶斯寻优：
+
+```bash
+python run_optimization.py --data smoke            # 冒烟版：复用 Mock 数据，3 trial 快速回归链路
+python run_optimization.py --data real             # 真实数据严格三集寻优（默认 20 trial）
+python run_optimization.py --data real --trials 30 --seeds 42,7 --stability-trials 8
+```
+
+- **冒烟版**（`--data smoke`）：2~3 次 trial 验证「参数注入 → 权重归一化 → 约束检查 → 收敛图」全链路；Mock 数据仅 6 天，笔数类硬约束物理上无法满足，`best()` 回退按目标值最优试兜底属正常表现
+- **严格三集隔离**（真实模式，防前视/防过拟合）：
+
+  | 集合 | 区间 | 用途 |
+  | --- | --- | --- |
+  | 训练 | 2023-01-03 ~ 2024-06-28 | TPE 采样，目标 = 年化 Sharpe − 回撤/换手软惩罚；hard 约束在内评估 |
+  | 验证 | 2024-07-01 ~ 2024-09-30 | 训练段 top-k 候选复评，据验证段 Sharpe 选 best |
+  | 测试 | 2024-10-08 ~ 2024-12-31 | 最终评估**一次**，不参与任何选择 |
+
+- **硬约束**（真实模式 `REAL_CONSTRAINT_KWARGS`，训练段度量）：最大回撤 < 35%、胜率 > 30%、盈亏比 > 0.8、有效交易 ≥ 30 笔、年化换手 ≤ 15（宽于 `StrategyOptimizer` 默认 15%/55%/1.5，适配当前现实信号；TPE 原生支持，`constraints_func` 喂给采样器）
+- **软惩罚**（合成目标内）：`Score = Sharpe − 1.0×max(0, 回撤−0.25) − 0.03×max(0, 年化换手−6.0)`，给 TPE 平滑引导、不替代硬约束
+- **断点续跑**：`JournalStorage` 使用 `data/feature_cache/opt_study.v3.s{seed}.journal`；study 保存配置、数据和代码签名，不一致时拒绝混用旧 trial。
+- **多 seed 稳定性**：`--seeds` 首个 seed 执行完整三集，其余 seed 独立寻优并输出 best 参数对比（区间跨度大 = 该维度对随机种子敏感，选参时谨慎）
+- **完整三集流程**：训练段寻优 → `top_candidates` 取可行 top-5 → 验证段复评（验证段同时满足参数范围和绩效硬约束者中 Sharpe 最高胜出；无可行解时明确报错）→ 测试段终评一次。
+- **窗口参数固定**：真实寻优搜索空间固定 `win_inst=(1,1), win_chip_old=(1,1)`——特征缓存签名含窗口，放开采样会让每种窗口组合触发训练段特征全量重算（约 10 分钟/次），待信号层参数收敛后再做窗口专项寻优
+- **参数可行性**：TPE、训练候选和验证选择共用五项绩效指标与四个权重范围的违反量。冒烟及 Walk-Forward 允许显式标记的探索候选。
+
 ## 测试
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-当前 **190** 项单元测试全部通过（合成 mock 数据，不联网；运行约 40 秒）：
+当前 **225** 项单元测试全部通过（合成 mock 数据，不联网）：
 
 | 测试文件 | 覆盖范围 |
 | --- | --- |
 | `tests/test_data_aligner.py` | 多源时间对齐、T-1/T+1 隔离、防未来函数校验、DataSlice 组装 |
 | `tests/test_factors.py` / `tests/test_features.py` | 微观结构/环境/主体分层因子与 FeatureEngine 端到端 |
-| `tests/test_state_machine.py` / `tests/test_signals.py` | 连续评分纯函数公式（ES/PS/Fund_Stability/XS）精确值 + 向量化/NaN/零除/否决等健壮性用例、硬过滤层、状态机全流程 |
+| `tests/test_signals.py` | 连续评分纯函数公式（ES/PS/Fund_Stability/XS）精确值 + 向量化/NaN/零除/否决等健壮性用例、硬过滤层、状态机全流程 |
 | `tests/test_backtest_engine.py` | 下一 Bar 成交、T+1 挂起卖出、涨跌停拦截、成本滑点、仓位/杠杆风控、成交日志与净值曲线 |
 | `tests/test_optimizer.py` | 绩效指标纯函数、搜索空间归一化、StrategyOptimizer 端到端寻优、Walk-Forward OOS 报告 |
 | `tests/test_analytics.py` | 实时流 JSONL、绩效指标精确值、因子归因盈亏守恒、IC/Rank IC/IR 双模式、复盘清单导出、Dashboard |
@@ -280,8 +311,8 @@ python -m pytest tests/ -v
 | 实时流 `analytics/real_time_stream.py`（StreamLogger JSONL） | ✅ 已完成 |
 | 机器学习优化 `optimizer/`（search_space / bayesian_opt / walk_forward） | ✅ 已完成 |
 | 项目主入口 `main.py`（--data smoke / real） | ✅ 已完成 |
-| 单元测试 `tests/` | ✅ 190 项通过（信号 88 + 引擎 30 + 优化器 21 + 归因/IC/流 21 + 对齐 15 + 特征 15） |
-| 旧策略壳 `strategy/`（base / position / sentiment / state_machine） | 🗑️ 已废弃（空壳死代码，由 signals.py 与 risk_control 取代，待清理） |
+| 单元测试 `tests/` | ✅ 225 项通过 |
+| 旧策略壳 `strategy/`（base / position / sentiment / state_machine） | 🗑️ 已删除（空壳死代码，由 signals.py 与 risk_control 取代） |
 | Brinson 基准归因 | 🚧 规划中（当前为因子暴露分解，需基准收益） |
 
 ## Git 仓库注意事项

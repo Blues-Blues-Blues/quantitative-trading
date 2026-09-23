@@ -10,11 +10,8 @@
 - 分钟级表（kline / l2_snapshot / tick_trades）直接用当日实时数据（当前 bar 已收盘）
 - 日频表（macro / north_margin / industry）由 TimeAligner 做 T-1 全量对齐
 - 龙虎榜由 TimeAligner 标注 T+1 可用日（avail_date）
-- 缺口近似（无未来函数）：
-    * index_min：用 data1 全部标的的分钟等权价构造伪指数（当日可观测）
-    * breadth：   用 data1 全部标的每分钟涨跌家数聚合（当日可观测）
-    * north_net： 北向大盘日频净流 T-1 填充
-    * industry money_flow：用行业指数 close 日间变化（T-1 对齐），日内恒定
+- 独立指数与全市场广度从 data2/index_min、data2/breadth_min 加载；缺失时保持缺失
+- 行业 money_flow 用行业指数日间变化经 T-1 对齐，日内恒定
 - 个股→行业映射缺失：内置 DEFAULT_SYMBOL_TO_INDUSTRY（按股票名称近似），可覆盖
 
 用法：
@@ -52,9 +49,6 @@ logger = logging.getLogger("data.real_loader")
 # 项目根目录（data/ 的上级）
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DATA_ROOT = _PROJECT_ROOT / "data"
-
-# 指数代码（伪指数沿用沪深300 的 index_code 约定）
-INDEX_CODE = "000300.SH"
 
 # data1 个股→中信行业近似映射（industry_sentiment_history 中存在的行业名；
 # 真实行业映射后续可替换，见 config/industry_mapping.yaml）
@@ -117,6 +111,7 @@ class RealDataLoader:
         :param skip_tick: 跳过逐笔成交/快照加载（特征缓存命中时用，
             tick/l2_snapshot 置 None；状态机与回测只依赖 kline/特征表）
         """
+        self._ensure_parquet_engine()
         symbols = [s.split(".")[0] for s in symbols]
         t0 = pd.Timestamp.now()
         kline = self._load_kline(symbols, start, end)
@@ -139,8 +134,10 @@ class RealDataLoader:
             kline=kline,
             l2_snapshot=snap,
             tick_trades=tick,
-            index_min=self._load_index_min(kline),
-            breadth=self._load_breadth(kline),
+            index_min=self._load_market_table("index_min", INDEX_MIN_COLS,
+                                              axis),
+            breadth=self._load_market_table("breadth_min", BREADTH_COLS,
+                                            axis),
             industry=self._load_industry(symbols, axis),
             macro=self.macro.load_macro(),
             north_margin=self.macro.load_north_margin(symbols),
@@ -148,8 +145,12 @@ class RealDataLoader:
             meta={
                 "symbols": symbols, "start": start, "end": end,
                 "source": "data1+data2 (real_loader)",
-                "index_min": "标的分钟等权伪指数(近似)",
-                "breadth": "标的涨跌家数聚合(近似)",
+                "market_source": "data2 独立分钟市场文件；缺失则市场因子缺失",
+                "index_min": "data2/index_min（独立基准）",
+                "breadth": "data2/breadth_min（独立全市场广度）",
+                "n_symbols": len(symbols),
+                "st_coverage": float(kline["is_st"].notna().mean()),
+                "float_cap_coverage": float(kline["float_market_cap"].notna().mean()),
                 "industry_money_flow": "行业close日间变化T-1(近似)",
             },
         )
@@ -158,20 +159,59 @@ class RealDataLoader:
         return ds
 
     # ------------------------------------------------------------------
-    # K 线（l2_loader 解析 + 衍生列）
+    # 前置能力探测 / K 线（l2_loader 解析 + 衍生列）
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_parquet_engine() -> None:
+        """前置探测 parquet 引擎，缺失时立即显式失败（而非淹没在几百条 WARNING 后
+        抛出与真实原因无关的 AttributeError）。"""
+        try:
+            import pyarrow  # noqa: F401
+            return
+        except ImportError:
+            pass
+        try:
+            import fastparquet  # noqa: F401
+            return
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少 parquet 引擎（pyarrow / fastparquet），"
+                "请先执行 pip install pyarrow") from exc
 
     def _load_kline(self, symbols: List[str], start: str, end: str) -> pd.DataFrame:
         """分钟 K 线 + 衍生列（vwap / 市值 / 涨跌停 / ST）。"""
         k = self.l2.load_kline(symbols, start, end, freq=self.freq)
+        if k is None or k.empty:
+            # 主 kline 为空属致命情形，不可降级：显式短路，避免后续对
+            # RangeIndex 调用 .normalize() 抛出误导性的 AttributeError
+            raise ValueError(
+                f"data1 无 {symbols} 在 {start}~{end} 的行情数据，"
+                f"请检查数据目录与 parquet 引擎（pyarrow/fastparquet）")
         denom = k["volume"].replace(0, np.nan)
         k["vwap"] = k["amount"] / denom
         k["vwap"] = k["vwap"].fillna(k["close"])
-        k["float_market_cap"] = k["close"] * 1e9  # 假想 10 亿流通股本（相对值即可）
+        k["float_market_cap"] = np.nan
         # 涨跌停价：A 股规则 = T-1 收盘价 × 幅度，T 日内恒定；
         # 幅度按 ST（±5%）、创业板 300-302 / 科创板 688（±20%）、主板（±10%）区分。
-        basic = self.macro.load_stock_basic()
-        k["is_st"] = k[SYMBOL].map(lambda s: bool(basic.get(s, False)))
+        k["is_st"] = np.nan
+        history = self._load_stock_history()
+        if history is not None:
+            original_index = k.index
+            left = k.reset_index().rename(columns={k.index.name or "index": "ts"})
+            left["_row"] = np.arange(len(left))
+            left = left.sort_values("ts")
+            history = history.sort_values("trade_date")
+            left = pd.merge_asof(left, history,
+                                 left_on="ts", right_on="trade_date",
+                                 by=SYMBOL, direction="backward",
+                                 suffixes=("", "_history"))
+            left = left.sort_values("_row")
+            left["is_st"] = left["is_st_history"]
+            left["float_market_cap"] = left["close"] * left["float_shares"]
+            k = left.drop(columns=["_row", "trade_date", "is_st_history",
+                                   "float_shares"]).set_index("ts")
+            k.index.name = original_index.name
         # 昨收按 (symbol, 交易日) 取前一日最后收盘（ts 为 index；索引对该 order 独立）
         kd = k[[SYMBOL, "close"]].copy()
         kd["date"] = kd.index.normalize()
@@ -182,60 +222,50 @@ class RealDataLoader:
         k_idx = pd.MultiIndex.from_arrays([k[SYMBOL], k.index.normalize()])
         prev = _pvm.reindex(k_idx).to_numpy()
         ratio = np.where(
-            k["is_st"], 0.05,
+            k["is_st"].isna(), np.nan,
+            np.where(k["is_st"].astype(bool), 0.05,
             np.where(k[SYMBOL].str[:3].isin(("300", "301", "302"))
-                     | k[SYMBOL].str.startswith("688"), 0.20, 0.10))
-        prev = np.where(np.isfinite(prev), prev, k["close"].to_numpy())  # 首日近似
+                     | k[SYMBOL].str.startswith("688"), 0.20, 0.10)))
         k["up_limit"] = np.round(prev * (1.0 + ratio), 2)
         k["down_limit"] = np.round(prev * (1.0 - ratio), 2)
         return k[KLINE_COLS]
 
-    # ------------------------------------------------------------------
-    # 近似环境表（全部无未来函数）
-    # ------------------------------------------------------------------
+    def _load_stock_history(self) -> Optional[pd.DataFrame]:
+        """Optional effective-date stock history: symbol,trade_date,is_st,float_shares."""
+        path = self.data2 / "stock_history.csv"
+        if not path.exists():
+            logger.warning("缺少 %s；历史 ST/流通股本未知，相关交易过滤保守阻断", path)
+            return None
+        frame = pd.read_csv(path, dtype={SYMBOL: str})
+        required = {SYMBOL, "trade_date", "is_st", "float_shares"}
+        if not required <= set(frame.columns):
+            raise ValueError(f"{path} 缺少列 {required - set(frame.columns)}")
+        frame[SYMBOL] = frame[SYMBOL].str.zfill(6)
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"])
+        frame["is_st"] = frame["is_st"].astype(str).str.lower().map(
+            {"true": True, "1": True, "false": False, "0": False})
+        if frame["is_st"].isna().any():
+            raise ValueError(f"{path} 的 is_st 列含无法识别的值")
+        frame["float_shares"] = pd.to_numeric(frame["float_shares"], errors="coerce")
+        return frame.drop_duplicates([SYMBOL, "trade_date"], keep="last")
 
-    def _load_index_min(self, kline: pd.DataFrame) -> pd.DataFrame:
-        """伪指数：data1 全部标的的分钟等权价（当日可观测，无未来函数）。
-
-        ma20/ma60 为分钟滚动均线（240min≈1 日 / 720min≈3 日），供 system 闸门。
-        """
-        g = kline.groupby(kline.index)
-        idx = pd.DataFrame({
-            "open": g["open"].mean(), "high": g["high"].mean(),
-            "low": g["low"].mean(), "close": g["close"].mean(),
-            "volume": g["volume"].sum(),
-        })
-        idx["vwap"] = idx["close"]
-        idx["ma20"] = idx["close"].rolling(240, min_periods=40).mean()
-        idx["ma60"] = idx["close"].rolling(720, min_periods=120).mean()
-        idx["index_code"] = INDEX_CODE
-        return idx[INDEX_MIN_COLS]
-
-    def _load_breadth(self, kline: pd.DataFrame) -> pd.DataFrame:
-        """广度近似：data1 全部标的每分钟涨跌家数（基准=当日前收盘近似值）。"""
-        k = kline.copy()
-        k["day"] = k.index.normalize()
-        # 当日第一根 bar 的 close 作为前收盘近似（本 bar 数据，无未来函数）
-        base = (k.sort_index().groupby(["day", SYMBOL])["close"]
-                .transform("first"))
-        k["up"] = k["close"] > base
-        k["down"] = k["close"] < base
-        g = k.groupby(k.index)
-        br = pd.DataFrame({
-            "advancers": g["up"].sum(), "decliners": g["down"].sum(),
-        })
-        br["adr"] = br["advancers"] / br["decliners"].replace(0, np.nan)
-        # north_net：北向大盘日频净流 T-1 填充
-        flow = self.macro.load_north_daily_flow()
-        if flow is not None:
-            axis = br.index[~br.index.duplicated()]
-            aligned = self.aligner.align_external(
-                flow, axis, ["north_net"], date_col=TRADE_DATE)
-            br["north_net"] = aligned["north_net"].to_numpy()
-        else:
-            br["north_net"] = np.nan
-        # 消费方 indicators.environment.MRS 按列读取 north_net，必须保留
-        return br[[*BREADTH_COLS, "north_net"]]
+    def _load_market_table(self, stem: str, columns: List[str],
+                           axis: pd.DatetimeIndex) -> Optional[pd.DataFrame]:
+        """Load a market-wide minute feed independent of the trading symbol set."""
+        path = next((p for p in (self.data2 / f"{stem}.parquet",
+                                 self.data2 / f"{stem}.csv") if p.exists()), None)
+        if path is None:
+            logger.warning("缺少独立市场数据 %s；对应市场因子置缺失", stem)
+            return None
+        frame = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+        if "ts" in frame.columns:
+            frame = frame.set_index("ts")
+        frame.index = pd.to_datetime(frame.index)
+        missing = set(columns) - set(frame.columns)
+        if missing:
+            raise ValueError(f"{path} 缺少列 {sorted(missing)}")
+        frame = frame.sort_index().loc[lambda x: x.index.isin(axis)]
+        return frame
 
     def _load_industry(self, symbols: List[str], axis: pd.DatetimeIndex) -> pd.DataFrame:
         """行业情绪：行业指数 close → 分钟轴 T-1 填充，money_flow=日间变化。"""

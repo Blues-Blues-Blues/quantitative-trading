@@ -68,6 +68,7 @@ class MicroStructure:
         chip_window: int = 20,
         panic_dev: float = 0.02,
     ) -> None:
+        """保存订单流与筹码因子的参数；权重采用统一配置入口，便于回测与优化保持相同口径。"""
         if len(ofss_weights) != 4 or len(cps_weights) != 4:
             raise ValueError("ofss_weights / cps_weights 必须为 4 个权重")
         self.w = {
@@ -157,13 +158,39 @@ class MicroStructure:
             out = out.merge(p, on=["ts", SYMBOL], how="outer")
         return out.set_index("ts").sort_index()
 
-    def ofss(self, comp: pd.DataFrame) -> pd.Series:
-        """由 OFSS 成分计算综合得分。"""
-        s = (self.w["w1"] * comp["obi"]
-             + self.w["w2"] * comp["ar"]
-             + self.w["w3"] * (self.cancel_base - comp["cancel_ratio"])
-             + self.w["w4"] * comp["big_flow"])
-        return s.clip(-1.0, 1.0)
+    def ofss(self, comp) -> pd.Series:
+        """由 OFSS 成分计算综合得分（缺项动态重归一化，量纲对齐到 [-1, 1]）。
+
+        各分量均为 [-1, 1] 等比量纲：
+            obi / ar / big_flow 已由 ofss_components 归一，
+            cancel_score = clip((cancel_base - cancel_ratio)/cancel_base, -1, 1)
+            （取消撤单率绝对差口径：cr=0 → +1，cr=2*cancel_base → -1）。
+        权重动态取 self.w["w1".."w4"]，不做硬编码。
+        分子 = Σ (有效特征 * 权重)，缺失项 fillna(0.0) 不贡献分子；
+        分母 = Σ 有效权重；全缺失 → NaN；否则 clip(分子/分母, -1, 1)。
+        """
+        w1, w2, w3, w4 = (self.w["w1"], self.w["w2"],
+                          self.w["w3"], self.w["w4"])
+        cancel_score = np.clip(
+            (self.cancel_base - comp["cancel_ratio"]) / self.cancel_base,
+            -1.0, 1.0)
+        factors = {
+            "obi": comp["obi"],
+            "ar": comp["ar"],
+            "cancel_score": cancel_score,
+            "big_flow": comp["big_flow"],
+        }
+        weights = {"obi": w1, "ar": w2, "cancel_score": w3, "big_flow": w4}
+
+        numerator = 0.0
+        denominator = pd.Series(0.0, index=comp.index, dtype=float)
+        for name, factor in factors.items():
+            valid = factor.notna()
+            denominator = denominator + valid * weights[name]
+            numerator = numerator + factor.fillna(0.0) * weights[name]
+        denom_safe = denominator.replace(0.0, np.nan)  # 全缺失 → NaN
+        return pd.Series(np.clip(numerator / denom_safe, -1.0, 1.0),
+                         index=comp.index)
 
     # ------------------------------------------------------------------
     # CPS：日频筹码成分（T-1 可用时点对齐由调用方完成）
@@ -232,12 +259,35 @@ class MicroStructure:
         return out
 
     def cps(self, comp: pd.DataFrame) -> pd.Series:
-        """由筹码成分计算综合得分。"""
-        s = (self.w["w5"] * comp["lock_ratio"]
-             + self.w["w6"] * comp["accum_delta"]
-             + self.w["w7"] * comp["panic_ratio"]
-             + self.w["w8"] * comp["drift"])
-        return s.clip(-1.0, 1.0)
+        """筹码综合得分（量纲对齐到 [-1, 1] + 缺项动态重归一化）。
+
+        四个分量统一 [-1, 1]：
+            s_lock   = 2*lock_ratio - 1         锁仓 0%→+1，100%→-1
+            s_accum  = clip(accum_delta / 0.05) 净吸筹，5% 经验基准撑满量纲
+            s_panic  = clip(1 - 2*panic_ratio)  恐慌越高越空（修复旧公式越恐慌越加分）
+            s_drift  = clip(drift / 0.15)        重心漂移，15% 经验基准
+        权重动态取 self.w["w5".."w8"]，不硬编码。
+        分子 = Σ 有效特征*权重；分母 = Σ 有效权重；全缺失(w_sum==0) → NaN；
+        否则 cps = clip(分子/分母, -1, 1)。
+        """
+        w5, w6, w7, w8 = (self.w["w5"], self.w["w6"],
+                          self.w["w7"], self.w["w8"])
+        s_lock = 2.0 * comp["lock_ratio"] - 1.0
+        s_accum = np.clip(comp["accum_delta"] / 0.05, -1.0, 1.0)
+        s_panic = np.clip(1.0 - 2.0 * comp["panic_ratio"], -1.0, 1.0)
+        s_drift = np.clip(comp["drift"] / 0.15, -1.0, 1.0)
+        factors = [s_lock, s_accum, s_panic, s_drift]
+        weights = [w5, w6, w7, w8]
+
+        numerator = pd.Series(0.0, index=comp.index, dtype=float)
+        denominator = pd.Series(0.0, index=comp.index, dtype=float)
+        for factor, weight in zip(factors, weights):
+            valid = factor.notna()
+            denominator = denominator + valid * weight
+            numerator = numerator + factor.fillna(0.0) * weight
+        denom_safe = denominator.where(denominator > 0.0)  # w_sum==0 → NaN
+        res = numerator / denom_safe
+        return pd.Series(np.clip(res, -1.0, 1.0).values, index=comp.index)
 
     # ------------------------------------------------------------------
     # PSS：分钟级价格结构
@@ -251,13 +301,17 @@ class MicroStructure:
         须用 groupby.transform（保持原行序）而非 Series 索引对齐运算。
         """
         k = kline.copy()
-        k["body"] = ((k["close"] - k["open"])
-                     / (k["high"] - k["low"] + _EPS)).clip(-1, 1)
+        # body 天然有界：close/open ∈ [low, high] ⇒ |body| ≤ 1，无需 clip
+        k["body"] = (k["close"] - k["open"]) / (k["high"] - k["low"] + _EPS)
         grp = k.groupby(SYMBOL, group_keys=False)
         hi = grp["high"].transform(
             lambda s: s.rolling(self.pss_window, min_periods=2).max())
         lo = grp["low"].transform(
             lambda s: s.rolling(self.pss_window, min_periods=2).min())
-        pct = (k["close"] - lo) / (hi - lo + _EPS)
+        # 窗口无波动（一字/停牌）→ 位置分中性 0，杜绝因微小常数 eps 误判 -1.0
+        is_flat = hi <= lo
+        pct_score = np.where(is_flat, 0.0,
+                             2.0 * (k["close"] - lo) / (hi - lo) - 1.0)
+        # body 与 pct_score 均有界 [-1,1]，加权和天然落在 [-1,1]，无需外层 clip
         return (self.pss_body_w * k["body"]
-                + (1 - self.pss_body_w) * (2 * pct - 1)).clip(-1.0, 1.0)
+                + (1.0 - self.pss_body_w) * pct_score)

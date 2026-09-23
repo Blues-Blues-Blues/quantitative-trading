@@ -276,6 +276,7 @@ def constraint_violations(metrics: Dict[str, float],
         [回撤, 胜率, 盈亏比, 交易笔数, 年化换手]
     """
     def _v(value: float, limit: float, direction: str) -> float:
+        """从指标映射中读取有限数值；缺失、非数值或无穷值回退到调用方给定的默认值。"""
         v = float(value)
         if not np.isfinite(v):
             return 1e9

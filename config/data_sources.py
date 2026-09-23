@@ -100,6 +100,7 @@ def get_data_path(key: str) -> Path:
         raise KeyError(f"未知数据源 key: {key}，可用: {sorted(_DEFAULT_PATHS)}")
 
     def _abs(p: Path) -> Path:
+        """将配置中的相对路径锚定到项目根目录；绝对路径保持原样，保证从不同工作目录启动时含义一致。"""
         return p if p.is_absolute() else PROJECT_ROOT / p
 
     # 1) 环境变量（最高优先级）

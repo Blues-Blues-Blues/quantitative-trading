@@ -8,8 +8,8 @@
     1) T+1 解冻（roll_to_date）：上一交易日买入的份额转为可卖
     2) 撮合 T+1 顺延减仓目标（每 Bar 按当前价换算；可卖不足保留、跌停暂停）
     3) 撮合上一 Bar 收集的信号（先卖后买释放现金；先到先得，现金不足拒绝）
-    4) 收集当前 Bar 产生的新信号，留待下一 Bar 撮合
-    5) 收盘 mark-to-market 并记录净值曲线
+    4) 收盘 mark-to-market；按真实账户持仓生成下一 Bar 信号
+    5) 记录净值曲线；本 Bar 成交额成为下一 Bar 的流动性输入
 
 撮合与风控规则（基于 Target_Weight 差额调仓）：
 - 动作 → 目标权重：BUY/ADD → metrics['target_weight']；DECAY_REDUCE →
@@ -20,8 +20,9 @@
 - 目标股数 = (目标权重 × 总权益) 按 Bar 开盘价换算，向下取整 100 股整数倍；
   加仓受现金（扣除佣金）约束；减仓/清仓以可卖份额为限（T+1），
   可卖不足时仅卖出最大可卖量，剩余目标权重挂起顺延（每 Bar 再试，跌停暂停）。
-- 涨停（Bar high 触及 up_limit）不可买入；跌停（Bar low 触及 down_limit）不可卖出
-- 成交价 = open × (1 ± 动态滑点)，成本含佣金/印花税/过户费（见 engine.execution）
+- 开盘价达到涨停价不可买入，达到跌停价不可卖出；盘中高低价不参与开盘撮合
+- 成交价 = open × (1 ± 动态滑点)，以上一根已完成 Bar 成交额估计参与率，
+  超出涨跌停价时以涨跌停价成交；成本含佣金/印花税/过户费
 - 单股最大仓位上限与总账户杠杆上限（见 engine.risk_control / engine.portfolio）
 
 输出：完整成交日志 TradeLog 与逐 Bar 持仓净值曲线 EquityCurve。
@@ -48,15 +49,39 @@ _BAR_COLS = ["open", "high", "low", "close", "amount", "up_limit", "down_limit"]
 
 
 @dataclass
+class OrderReport:
+    """单次订单尝试的结构化结果；部分成交时分别记录已成交和待顺延数量。"""
+    ts: pd.Timestamp
+    symbol: str
+    side: str
+    filled_shares: int
+    price: float
+    status: str
+    reason: str
+    remaining_shares: int = 0
+
+
+@dataclass
 class TradeLog:
     """完整成交日志：成交单与拒绝单均记录（shares=0 表示被拒，reason 说明原因）。"""
 
     rows: List[dict] = field(default_factory=list)
+    reports: List[OrderReport] = field(default_factory=list)
 
     def add(self, **kw) -> None:
+        """追加一次撮合尝试，并按成交数量、剩余数量和原因派生结构化状态；原始行与 OrderReport 同步保存。"""
+        remaining = int(kw.pop("remaining_shares", 0))
+        status = ("pending" if kw["reason"] == "t1_lock" else
+                  "rejected" if kw["shares"] == 0 else
+                  "partial_pending" if remaining else "filled")
+        self.reports.append(OrderReport(
+            pd.Timestamp(kw["ts"]), kw["symbol"], kw["side"],
+            int(kw["shares"]), float(kw["price"]), status,
+            str(kw["reason"]), remaining))
         self.rows.append(kw)
 
     def to_frame(self) -> pd.DataFrame:
+        """把成交及拒绝记录转成稳定列序的表；空日志也返回带完整列名的空表，方便下游无需分支处理。"""
         cols = ["ts", "symbol", "side", "price", "shares", "amount",
                 "commission", "stamp_duty", "transfer_fee", "slippage_bps",
                 "cash_after", "equity_after", "reason"]
@@ -74,6 +99,7 @@ class EquityCurve:
     rows: List[dict] = field(default_factory=list)
 
     def to_frame(self) -> pd.DataFrame:
+        """把逐 Bar 账户快照转成稳定列序的表；时间列统一为 pandas 时间类型。"""
         cols = ["ts", "cash", "margin", "position_value",
                 "total_equity", "n_positions", "unrealized_pnl"]
         if not self.rows:
@@ -95,8 +121,10 @@ class BacktestEngine:
     """
 
     def __init__(self, account: Account, cost: ExecutionCost, sizer: PositionSizer,
-                 data: DataSlice, signals: Sequence[Signal],
-                 deadzone_th: float = 0.05) -> None:
+                 data: DataSlice, signals: Sequence[Signal] = (),
+                 deadzone_th: float = 0.05, state_machine=None,
+                 features: Optional[pd.DataFrame] = None) -> None:
+        """准备回测依赖、按时间索引的行情与信号，并校验信号顺序；状态机模式会先构建逐 Bar 评估表。实例只允许调用 run 一次，以免复用已变更账户状态。"""
         if not 0.0 <= deadzone_th < 1.0:
             raise ValueError(f"deadzone_th 必须在 [0, 1) 区间，当前: {deadzone_th}")
         self.deadzone_th = deadzone_th
@@ -105,6 +133,22 @@ class BacktestEngine:
         self.sizer = sizer
         self.data = data
         self.signals = list(signals)
+        self.state_machine = state_machine
+        self.features = features
+        if state_machine is not None:
+            if features is None:
+                raise ValueError("state_machine 模式需要 features")
+            state_machine.reset()
+            evaluation = state_machine._build_eval_table(data, features)
+            self._eval_by_ts = {pd.Timestamp(ts): group for ts, group in
+                                evaluation.groupby("ts", sort=True)}
+        else:
+            self._eval_by_ts = {}
+        self._has_run = False
+        self.trade_log: Optional[pd.DataFrame] = None
+        self.equity_curve: Optional[pd.DataFrame] = None
+        self.order_reports: List[OrderReport] = []
+        self.generated_signals: List[Signal] = []
 
         # 断言：信号必须按时间升序（先到先得的前提）
         ts_list = [s.timestamp for s in self.signals]
@@ -123,6 +167,7 @@ class BacktestEngine:
     # ------------------------------------------------------------------
 
     def _build_bar_map(self) -> Dict[pd.Timestamp, pd.DataFrame]:
+        """将长表行情整理成 timestamp 到 symbol 索引表的映射；撮合循环可直接按时刻取全市场 Bar，且在入口处校验必需列。"""
         k = self.data.kline
         need = [c for c in _BAR_COLS if c not in k.columns]
         if need:
@@ -143,10 +188,14 @@ class BacktestEngine:
 
         - 最后一根 Bar 产生的信号没有后续 Bar 可撮合（next-bar 语义），将被丢弃并告警。
         """
+        if self._has_run:
+            raise RuntimeError("BacktestEngine.run() 只能执行一次；请新建引擎")
+        self._has_run = True
         log = TradeLog()
         curve = EquityCurve()
         pending_signals: List[Signal] = []   # 上一 Bar 收集、本 Bar 撮合
         pending_targets: Dict[str, float] = {}  # T+1 顺延减仓目标（symbol → 目标权重）
+        previous_amount: Dict[str, float] = {}
 
         for ts in self._axis:
             date = pd.Timestamp(ts).normalize()
@@ -154,9 +203,17 @@ class BacktestEngine:
 
             # 1) T+1 解冻：上一交易日买入的份额可卖
             self.account.roll_to_date(date)
+            if bar is not None:
+                self.account.mark_to_market(
+                    {sym: row["open"] for sym, row in bar.iterrows()
+                     if pd.notna(row["open"]) and row["open"] > 0})
 
-            # 2) 撮合 T+1 顺延减仓目标（每 Bar 按当前价换算；可卖不足/跌停保留）
+            # 2) 先执行上一 Bar 的新决定；同一标的的新决定覆盖旧顺延单。
+            active_symbols = {s.symbol for s in pending_signals if s.action != ACT_HOLD}
             for sym in list(pending_targets):
+                if sym in active_symbols:
+                    del pending_targets[sym]
+                    continue
                 pos = self.account.positions.get(sym)
                 if pos is None or pos.shares <= 0:
                     del pending_targets[sym]  # 已无持仓，撤销顺延
@@ -166,24 +223,36 @@ class BacktestEngine:
                 if bar is None or sym not in bar.index:
                     continue  # 无报价，保留顺延
                 brow = bar.loc[sym]
-                if brow["low"] <= brow["down_limit"]:
+                if (pd.isna(brow["open"]) or brow["open"] <= 0 or
+                        pd.isna(brow["down_limit"]) or
+                        brow["open"] <= brow["down_limit"]):
                     continue  # 跌停暂停，保留顺延
+                brow = brow.copy()
+                brow["liquidity_amount"] = previous_amount.get(sym, 1e-9)
                 self._execute_sell_to_target(
                     sym, pending_targets[sym], ts, brow,
                     pending_targets, log, reason="t1_deferred_sell")
 
             # 3) 撮合上一 Bar 的信号（下一 Bar 开盘价；先到先得）
             for sig in pending_signals:
-                self._execute(sig, ts, bar, pending_targets, log)
+                self._execute(sig, ts, bar, pending_targets, log,
+                              previous_amount)
             pending_signals = []
-
-            # 4) 收集本 Bar 新信号 → 下一 Bar 撮合
-            pending_signals = list(self._signal_by_ts.get(ts, []))
 
             # 5) 收盘 mark-to-market + 净值曲线
             if bar is not None:
                 self.account.mark_to_market(
-                    {sym: row["close"] for sym, row in bar.iterrows()})
+                    {sym: row["close"] for sym, row in bar.iterrows()
+                     if pd.notna(row["close"]) and row["close"] > 0})
+            # 4) 收盘后决策；此时账户包含本 Bar 已成交及盯市结果。
+            if self.state_machine is not None:
+                rows = self._eval_by_ts.get(pd.Timestamp(ts))
+                if rows is not None:
+                    pending_signals = self.state_machine.on_bar(
+                        ts, rows, self.account)
+            else:
+                pending_signals = list(self._signal_by_ts.get(ts, []))
+            self.generated_signals.extend(pending_signals)
             curve.rows.append({
                 "ts": ts,
                 "cash": self.account.cash,
@@ -193,20 +262,29 @@ class BacktestEngine:
                 "n_positions": len(self.account.positions),
                 "unrealized_pnl": self.account.unrealized_pnl(),
             })
+            if bar is not None:
+                previous_amount.update({
+                    sym: (float(row["amount"])
+                          if pd.notna(row["amount"]) and row["amount"] > 0
+                          else 1e-9)
+                    for sym, row in bar.iterrows()})
 
         # 尾部校验
         assert self.account.cash >= -1e-6, "回测结束现金为负"
         if pending_signals:
             logger.warning("%d 个信号在最后一根 Bar 产生，无后续 Bar 可成交，已丢弃",
                            len(pending_signals))
-        return log.to_frame(), curve.to_frame()
+        self.trade_log, self.equity_curve = log.to_frame(), curve.to_frame()
+        self.order_reports = log.reports
+        return self.trade_log, self.equity_curve
 
     # ------------------------------------------------------------------
     # 信号撮合（基于 Target_Weight 差额调仓）
     # ------------------------------------------------------------------
 
     def _execute(self, sig: Signal, ts: pd.Timestamp, bar: Optional[pd.DataFrame],
-                 pending_targets: Dict[str, float], log: TradeLog) -> None:
+                 pending_targets: Dict[str, float], log: TradeLog,
+                 previous_amount: Optional[Dict[str, float]] = None) -> None:
         """撮合单个信号（成交于 Bar ts 的开盘价）。
 
         HOLD 不触发调仓；BUY/ADD/DECAY_REDUCE/SELL 映射为目标权重后差额调仓。
@@ -217,7 +295,11 @@ class BacktestEngine:
             return
         if sig.action == ACT_HOLD:
             return  # HOLD：目标权重仅作监控，不调仓
-        brow = bar.loc[sym]
+        brow = bar.loc[sym].copy()
+        if pd.isna(brow["open"]) or float(brow["open"]) <= 0:
+            self._log_reject(log, ts, sym, sig.action, "invalid_open")
+            return
+        brow["liquidity_amount"] = (previous_amount or {}).get(sym, 1e-9)
         pos = self.account.positions.get(sym)
         current_weight = (pos.shares * float(brow["open"]) / self.account.total_equity
                           if pos is not None and pos.shares > 0 else 0.0)
@@ -272,13 +354,19 @@ class BacktestEngine:
             return
 
         if delta > 0.0:  # 建仓 / 加仓
-            if brow["high"] >= brow["up_limit"]:
+            if pd.isna(brow["up_limit"]):
+                self._log_reject(log, ts, sym, action, "missing_limit")
+                return
+            if brow["open"] >= brow["up_limit"]:
                 self._log_reject(log, ts, sym, action, "limit_up")
                 return
             self._execute_buy_to_target(sym, target, action, ts, brow,
                                         pending_targets, log)
         elif delta < 0.0:  # 减仓 / 清仓
-            if brow["low"] <= brow["down_limit"]:
+            if pd.isna(brow["down_limit"]):
+                self._log_reject(log, ts, sym, action, "missing_limit")
+                return
+            if brow["open"] <= brow["down_limit"]:
                 self._log_reject(log, ts, sym, action, "limit_down")
                 return
             reason = "signal_sell" if action == ACT_SELL else "decay_reduce"
@@ -298,7 +386,7 @@ class BacktestEngine:
         受单股上限 / 总杠杆 / 当前可用现金（扣除佣金过户费）约束。
         """
         open_price = float(brow["open"])
-        bar_amount = float(brow["amount"])
+        bar_amount = float(brow.get("liquidity_amount", 1e-9))
         equity = self.account.total_equity
         target_value = target * equity
         pos = self.account.positions.get(sym)
@@ -331,6 +419,7 @@ class BacktestEngine:
 
         base_amount = shares * open_price  # 滑点前估值（卖侧 est_amount 同口径）
         price0 = self.cost.buy_price(open_price, base_amount, bar_amount)
+        price0 = min(price0, float(brow["up_limit"]))
         amount = shares * price0
         commission, transfer = self.cost.buy_fees(amount)
         total_cost = amount + commission + transfer
@@ -345,7 +434,7 @@ class BacktestEngine:
         log.add(ts=ts, symbol=sym, side=action, price=price0, shares=shares,
                 amount=amount, commission=commission, stamp_duty=0.0,
                 transfer_fee=transfer,
-                slippage_bps=self.cost.slippage_bps(base_amount, bar_amount),
+                slippage_bps=(price0 / open_price - 1.0) * 1e4,
                 cash_after=self.account.cash,
                 equity_after=self.account.total_equity, reason="filled")
 
@@ -378,14 +467,20 @@ class BacktestEngine:
 
         sell_shares = min(sell_shares, pos.sellable_shares)
         if sell_shares <= 0:
-            pending_targets[sym] = target  # T+1 锁定 → 顺延
-            self._log_reject(log, ts, sym, reject_side, "t1_lock")
+            # T+1 锁定 → 顺延：这是设计行为（每 Bar 记一次），并非失败拒绝，
+            # 后续 Bar 会继续尝试直至可卖份额解冻。reason 保留 "t1_lock" 以兼容
+            # 既有下游判定，展示层负责标注「顺延中」。
+            pending_targets[sym] = target
+            self._log_reject(log, ts, sym, reject_side, "t1_lock",
+                             remaining_shares=pos.shares - target_shares)
             return
 
         self._execute_sell(sym, ts, brow, sell_shares, reason=reason, log=log)
         after = self.account.positions.get(sym)
         if after is not None and after.shares > target_shares:
             pending_targets[sym] = target  # 仍有锁定份额未减 → 顺延
+            log.reports[-1].status = "partial_pending"
+            log.reports[-1].remaining_shares = after.shares - target_shares
         else:
             pending_targets.pop(sym, None)
 
@@ -400,9 +495,10 @@ class BacktestEngine:
             return
 
         open_price = float(brow["open"])
-        bar_amount = float(brow["amount"])
+        bar_amount = float(brow.get("liquidity_amount", 1e-9))
         est_amount = shares * open_price
         price0 = self.cost.sell_price(open_price, est_amount, bar_amount)
+        price0 = max(price0, float(brow["down_limit"]))
         gross = shares * price0
         commission, stamp, transfer = self.cost.sell_fees(gross)
         proceeds = gross - commission - stamp - transfer
@@ -411,7 +507,7 @@ class BacktestEngine:
         log.add(ts=ts, symbol=sym, side=ACT_SELL, price=price0, shares=shares,
                 amount=gross, commission=commission, stamp_duty=stamp,
                 transfer_fee=transfer,
-                slippage_bps=self.cost.slippage_bps(est_amount, bar_amount),
+                slippage_bps=(1.0 - price0 / open_price) * 1e4,
                 cash_after=self.account.cash,
                 equity_after=self.account.total_equity, reason=reason)
 
@@ -421,7 +517,9 @@ class BacktestEngine:
 
     @staticmethod
     def _log_reject(log: TradeLog, ts: pd.Timestamp, sym: str,
-                    side: str, reason: str) -> None:
+                    side: str, reason: str, remaining_shares: int = 0) -> None:
+        """记录未成交的订单尝试；统一填零成交和费用字段，使拒绝原因也能进入标准成交日志。"""
         log.add(ts=ts, symbol=sym, side=side, price=0.0, shares=0, amount=0.0,
                 commission=0.0, stamp_duty=0.0, transfer_fee=0.0,
-                slippage_bps=0.0, cash_after=0.0, equity_after=0.0, reason=reason)
+                slippage_bps=0.0, cash_after=0.0, equity_after=0.0,
+                reason=reason, remaining_shares=remaining_shares)

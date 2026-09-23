@@ -21,6 +21,7 @@ import pandas as pd
 import pytest
 
 from data.dataslice import DataSlice
+from strategy.gates import CrossSectionalRankGate
 from strategy.signals import (
     ACT_ADD, ACT_BUY, ACT_DECAY_REDUCE, ACT_HOLD, ACT_SELL,
     S_NOISE, S_PUSH, S_YOUZI_ONLY,
@@ -336,18 +337,122 @@ class TestSignalSynthesizer:
         f = mk_features(axis)  # retail_flow=-1e5 占绝对量很小 → 追涨度 0
         assert syn._retail_chase(f).iloc[0] == pytest.approx(0.0)
 
+    def test_retail_chase_dead_state(self):
+        """死寂状态：连续 30 分钟资金流全 0 → 输出精确 0.0，
+        不产生 ZeroDivisionError 或 NaN。"""
+        axis = cn_minutes(["2024-01-02"])  # 一整天分钟轴，远超 30
+        n = len(axis)
+        f = pd.DataFrame({
+            "symbol": ["600000"] * n,
+            "retail_flow": [0.0] * n,
+            "inst_flow": [0.0] * n,
+            "youzi_flow": [0.0] * n,
+        }, index=axis)
+        syn = SignalSynthesizer(chase_window=30)
+        out = syn._retail_chase(f)
+        assert out.notna().all()
+        assert np.allclose(out.to_numpy(), 0.0)
+
+    def test_retail_chase_negative_clipped_zero(self):
+        """追涨截断：散户净卖出 -100 万 → clip 精确压制为 0.0。"""
+        axis = cn_minutes(["2024-01-02"])
+        n = len(axis)
+        f = pd.DataFrame({
+            "symbol": ["600000"] * n,
+            "retail_flow": [-1e6] * n,   # 散户净卖出 -100 万
+            "inst_flow": [0.0] * n,
+            "youzi_flow": [0.0] * n,
+        }, index=axis)
+        syn = SignalSynthesizer(chase_window=30)
+        out = syn._retail_chase(f)
+        assert out.notna().all()
+        assert np.allclose(out.to_numpy(), 0.0)
+
+    def test_retail_chase_nan_neutral_zero(self):
+        """冷启动/无交易：资金流全 NaN → 纯净兜底为 0.0（无追涨），非 NaN。"""
+        axis = cn_minutes(["2024-01-02"])
+        n = len(axis)
+        f = pd.DataFrame({
+            "symbol": ["600000"] * n,
+            "retail_flow": [np.nan] * n,
+            "inst_flow": [np.nan] * n,
+            "youzi_flow": [np.nan] * n,
+        }, index=axis)
+        syn = SignalSynthesizer(chase_window=30)
+        out = syn._retail_chase(f)
+        assert out.notna().all()
+        assert np.allclose(out.to_numpy(), 0.0)
+
     def test_rs_industry_ms_t_minus_1_visibility(self):
-        """日频 RS / Industry_MS：D0 不可见(NaN)、D1 中性 0、D2 起为正。"""
+        """日频 RS / Industry_MS：D0 中性 0、D1 中性 0、D2 起为正。"""
         ds, features = full_env(_D3)
         syn = bull_syn()
         ev = TradingStateMachine(synthesizer=syn)._build_eval_table(ds, features)
         d0, d1, d2 = (pd.Timestamp(x) for x in ("2024-01-02", "2024-01-03", "2024-01-04"))
-        assert ev.loc[ev["ts"].dt.normalize() == d0, "rs"].isna().all()
-        assert ev.loc[ev["ts"].dt.normalize() == d0, "industry_ms"].isna().all()
+        assert (ev.loc[ev["ts"].dt.normalize() == d0, "rs"] == 0.0).all()
+        assert (ev.loc[ev["ts"].dt.normalize() == d0, "industry_ms"] == 0.0).all()
         assert (ev.loc[ev["ts"].dt.normalize() == d1, "rs"] == 0.0).all()
         assert (ev.loc[ev["ts"].dt.normalize() == d1, "industry_ms"] == 0.0).all()
         assert (ev.loc[ev["ts"].dt.normalize() == d2, "rs"] > 0).all()
         assert (ev.loc[ev["ts"].dt.normalize() == d2, "industry_ms"] > 0).all()
+
+    def test_industry_ms_clip_t_minus_1(self):
+        """截断+防漏+T-1：22 天行业资金流每日翻倍(flow_ret≈1.0) → 20 日累加远超 1.0，
+        T+1 日起被精确 clip 锁定在 1.0，且不超过 [-1,1]；首日(D0)中性 0。"""
+        dates = pd.bdate_range("2024-01-02", periods=22)
+        axis = cn_minutes(dates)
+        raw = mk_industry(axis)
+        days = pd.DatetimeIndex(sorted(set(axis.normalize())))
+        day_idx = {d: i for i, d in enumerate(days)}
+        raw["money_flow"] = [1e8 * (2.0 ** day_idx[t.normalize()]) for t in axis]
+        ds = DataSlice(kline=mk_kline(axis), industry=raw,
+                       meta={"symbols": ["600000"]})
+        syn = SignalSynthesizer(symbol_to_industry=_MAPPING, industry_window=20)
+        ms = syn._industry_ms(ds, axis).set_index("ts")["industry_ms"]
+
+        # 时间窗已充分积累 → 被 clip 锁死在 1.0，不越界
+        assert ms.max() <= 1.0 and ms.min() >= -1.0
+        assert np.isclose(ms.max(), 1.0)
+        # 首日（首个交易日）无前序数据 → 中性 0
+        d0 = pd.Timestamp(dates[0])
+        assert (ms[ms.index.normalize() == d0] == 0.0).all()
+
+    def test_industry_ms_all_nan_neutral_zero(self):
+        """无映射兜底：行业资金流全 NaN → 稳定输出 0.0，不抛异常。"""
+        dates = pd.bdate_range("2024-01-02", periods=5)
+        axis = cn_minutes(dates)
+        raw = mk_industry(axis)
+        raw["money_flow"] = np.nan
+        ds = DataSlice(kline=mk_kline(axis), industry=raw,
+                       meta={"symbols": ["600000"]})
+        syn = SignalSynthesizer(symbol_to_industry=_MAPPING)
+        out = syn._industry_ms(ds, axis)
+        assert not out.empty
+        assert out["industry_ms"].notna().all()
+        assert np.allclose(out["industry_ms"].to_numpy(), 0.0)
+
+    def test_rs_temporal_drift_clip_and_neutral(self):
+        """时序隔离 + 绝对边界 + 中性兜底：
+        - D2 单日 +300% 突变，当日(D2)RS 只含昨日信息（0.0），D3 才见并 clip 锁 1.0；
+        - 首根(D0)RS 中性 0.0。"""
+        dates = ("2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05")
+        axis = cn_minutes(dates, freq="30min")
+        kline = mk_kline(axis, close_override={
+            "2024-01-02 15:00": 10.0,
+            "2024-01-03 15:00": 10.0,
+            "2024-01-04 15:00": 40.0,   # D2 单日 +300%
+            "2024-01-05 15:00": 40.0,
+        })
+        idx = mk_index(axis)          # 大盘平走 → ret_i=0
+        ds = DataSlice(kline=kline, index_min=idx, meta={"symbols": ["600000"]})
+        syn = SignalSynthesizer(rs_window=5)
+        rs = syn._relative_strength(ds, axis).set_index("ts")["rs"]
+
+        d0, d2, d3 = (pd.Timestamp(x)
+                      for x in ("2024-01-02", "2024-01-04", "2024-01-05"))
+        assert (rs[rs.index.normalize() == d0] == 0.0).all()   # 首根中性 0
+        assert (rs[rs.index.normalize() == d2] == 0.0).all()   # D2 不含当日跳空(仅含昨日)
+        assert (rs[rs.index.normalize() == d3] == 1.0).all()   # D3 见跳空并 clip 锁 1.0
 
 
 # ----------------------------------------------------------------------
@@ -658,22 +763,38 @@ class TestExitScore:
         row["close"] = 10.5  # 创新高 → 回撤 0
         assert syn.drawdown_from_high(row, pos) == pytest.approx(0.0)
 
-    def test_xs_runaway_veto(self):
-        """游资溃逃：big_flow<0 且 Retail_Chase>阈值 → XS=-1.0。"""
-        syn, row = _row(big_flow=-0.1, retail_chase=0.9)
-        assert syn.veto(row) is True
-        assert syn.calculate_exit_score(row, _pos()) == -1.0
+    def test_compute_veto_vectorized_differential(self):
+        """纯向量化 _compute_veto：NaN→False、游资溃逃/大盘跳水/正常分片正确。
 
-    def test_xs_index_dive_veto(self):
-        """大盘跳水：沪深300 跌破 VWAP*(1-1.5%) → XS=-1.0。"""
-        syn, row = _row(index_close=2900.0, index_vwap=3000.0)
-        assert syn.veto(row) is True
-        assert syn.calculate_exit_score(row, _pos()) == -1.0
+        行0: 全 NaN → 各腿不受触发 → False
+        行1: 游资溃逃（big_flow<0 且 retail_chase>th）→ True
+        行2: 大盘跳水（index_close < index_vwap*(1-1.5%)）→ True
+        行3: 正常（无溃逃、无跳水）→ False
+        """
+        syn = bull_syn()
+        idx = cn_minutes(_D3)
+        n = len(idx)
+        flow = pd.Series(([np.nan, -0.1, 0.2, 0.1] * (n // 4 + 1))[:n], index=idx)
+        chase = pd.Series(([np.nan, 0.9, 0.1, 0.1] * (n // 4 + 1))[:n], index=idx)
+        idx_c = pd.Series(([np.nan, 3005.0, 2900.0, 3005.0] * (n // 4 + 1))[:n],
+                          index=idx)
+        idx_v = pd.Series(([np.nan, 3000.0, 3000.0, 3000.0] * (n // 4 + 1))[:n],
+                          index=idx)
+        v = syn._compute_veto(flow, chase, idx_c, idx_v)
+        assert isinstance(v, pd.Series) and v.index.equals(idx)
+        assert v.iloc[0::4].all().item() is False     # NaN 全不触发
+        assert v.iloc[1::4].all().item() is True      # 游资溃逃
+        assert v.iloc[2::4].all().item() is True      # 大盘跳水
+        assert v.iloc[3::4].all().item() is False     # 正常
 
-    def test_xs_no_veto_when_inputs_missing(self):
-        """一票否决输入缺失（无 big_flow/指数）→ 不触发（保守不误杀）。"""
-        syn, row = _row(big_flow=np.nan, index_close=np.nan, index_vwap=np.nan)
-        assert syn.veto(row) is False
+    def test_xs_veto_flag_end_to_end(self):
+        """极端因子 + veto_flag=True → calculate_exit_score 无视分数返回 -1.0。"""
+        syn, row = _row()
+        row["veto_flag"] = True          # 模拟评估表预计算列
+        row["final_ms"] = 1.0
+        row["capital_purity"] = 1.0
+        row["close"] = 5.0
+        assert syn.calculate_exit_score(row, _pos(high_price_watermark=10.0)) == -1.0
 
     def test_xs_zero_watermark_division_defense(self):
         """纯函数零除防御：hwm=0 → dd=0，安全返回基于 ms/purity 的有效分数。"""
@@ -701,6 +822,37 @@ class TestExitScore:
         ws = (syn.w_xs_ms, syn.w_xs_purity, syn.w_xs_drawdown)
         xs = syn._compute_xs(1.0, 1.0, 10.0, 5.0, True, ws)  # 高ms/高purity/深回撤
         assert xs == -1.0
+
+    def test_xs_overheated_mean_reversion_flips_ms(self):
+        """均值反转门控：final_ms>0.8 且 pnl_ratio>0.05 → 情绪分被翻转为惩罚项。
+
+        指定 final_ms=0.9, purity=0.8, dd=0.0, pnl_ratio=0.10：
+        无门控 XS = 0.5*0.9 + 0.3*0.8 = +0.69（正向 → 持仓/加仓方向）；
+        有门控 adjusted_ms=-0.9 → XS = 0.5*(-0.9) + 0.3*0.8 = -0.21（负向 → 出局方向）。
+        断言：最终 XS 严格为负（符号翻转证明门控生效），且等于 -0.21 精确值。
+        注：-0.21 的绝对值未触达 th_xs_exit=-0.3 / th_xs_crash=-0.6（因 purity=0.8
+        提供了 +0.24 正分对冲），此处仅验证翻转机制，不验证阈值触发。
+        """
+        syn = SignalSynthesizer()
+        ws = (syn.w_xs_ms, syn.w_xs_purity, syn.w_xs_drawdown)
+        xs = syn._compute_xs(0.9, 0.8, 10.0, 10.0, False, ws, pnl_ratio=0.10)  # dd=0
+        assert xs == pytest.approx(-0.21)
+        assert xs < 0.0
+        # 无门控对照组：同一分数但 pnl_ratio 未过热 → 不翻转 → 正向
+        xs_neutral = syn._compute_xs(0.9, 0.8, 10.0, 10.0, False, ws, pnl_ratio=0.0)
+        assert xs_neutral == pytest.approx(0.69)
+        assert xs_neutral > 0.0
+
+    def test_xs_gate_boundaries_do_not_flip(self):
+        """门控边界防御：final_ms 恰好=0.8 或 pnl_ratio 恰好=0.05 均不触发翻转。"""
+        syn = SignalSynthesizer()
+        ws = (syn.w_xs_ms, syn.w_xs_purity, syn.w_xs_drawdown)
+        # final_ms 恰好 0.8（不 >0.8），即便 pnl 过热也不翻转
+        a = syn._compute_xs(0.8, 0.0, 10.0, 10.0, False, ws, pnl_ratio=0.10)
+        assert a == pytest.approx(syn.w_xs_ms * 0.8)
+        # pnl_ratio 恰好 0.05（不 >0.05），即便 ms 过热也不翻转
+        b = syn._compute_xs(0.9, 0.0, 10.0, 10.0, False, ws, pnl_ratio=0.05)
+        assert b == pytest.approx(syn.w_xs_ms * 0.9)
 
 
 class TestHardFilters:
@@ -737,6 +889,17 @@ class TestHardFilters:
 
 class TestCompatibilityGates:
 
+    def test_rank_gate_blocks_first_buy_and_target(self):
+        syn, row = _row()
+        syn.rank_gate = CrossSectionalRankGate("final_ms", top_quantile=0.2)
+        sm = TradingStateMachine(syn)
+        row["rank_pct_final_ms"] = 0.5
+        assert sm._on_flat(row).action == ACT_HOLD
+        assert syn.generate_target_weights(row, None) == 0.0
+        row["rank_pct_final_ms"] = 1.0
+        assert sm._on_flat(row).action == ACT_BUY
+        assert syn.generate_target_weights(row, None) > 0.0
+
     def test_entry_gates_pass_in_bull(self):
         syn, row = _row()
         gates = syn.entry_gates(row)
@@ -763,7 +926,8 @@ class TestCompatibilityGates:
         assert syn.exit_any(row, _pos()) is True
 
     def test_exit_triggers_circuit_on_veto(self):
-        syn, row = _row(index_close=2900.0, index_vwap=3000.0)
+        syn, row = _row()
+        row["veto_flag"] = True  # 评估表预计算列（一票否决）
         assert syn.exit_triggers(row, _pos())["circuit"] is True
 
     def test_exit_triggers_inactive_in_bull(self):
@@ -978,6 +1142,21 @@ class TestTargetWeights:
         assert syn.generate_target_weights(row, pos) \
             == pytest.approx(0.2 * syn.reduce_step_ratio)
 
+    def test_reduce_step_anchored_stable_over_iterations(self):
+        """连续 5 根 K 线进入减仓带：Target_Weight 锚定在
+        base_weight*reduce_step_ratio，而非逐根 ×ratio 指数衰减趋近 0。"""
+        syn, row = self._tw(final_ms=0.2, capital_purity=0.3)
+        pos = _pos(simulated_weight=0.3)  # 起始模拟权重高于锚定点
+        assert 0.0 < syn.calculate_exit_score(row, pos) < syn.th_xs_reduce_high
+        anchor = syn.base_weight * syn.reduce_step_ratio
+        targets = []
+        for _ in range(5):
+            tw = syn.generate_target_weights(row, pos)
+            targets.append(tw)
+            pos.simulated_weight = tw  # 复现 _on_holding 的模拟权重更新
+        # 首根收敛到锚定点，后续保持恒定（无递归衰减）
+        assert all(t == pytest.approx(anchor) for t in targets)
+
     def test_holding_rebalance_by_ps(self):
         syn, row = self._tw()
         pos = _pos()
@@ -1125,6 +1304,7 @@ class TestReversal:
         pos = self._pos_next_day()
         assert syn.reversal_active(row, pos) is True  # 承接中（big>0）
         assert syn.reversal_overridden(row) is True  # 但大盘跳水解除保护
+        row["veto_flag"] = True  # 评估表预计算列（一票否决）
         sm = TradingStateMachine(synthesizer=syn, min_add_interval=0)
         sm.positions["600000"] = pos  # SELL 分支会 del positions[sym]
         sig = sm._on_holding(row, pos)

@@ -10,7 +10,7 @@ Optuna Trial，验证：
 
 说明：冒烟数据仅 6 天，"有效交易 ≥ 30 笔"等硬约束在物理上无法满足，
 因此所有 trial 都会判为不可行 —— 这正是约束检查机制在正常工作的表现，
-best() 会回退为按目标值（年化 Sharpe）最优的 trial 兜底返回。
+冒烟可显式允许标记为不可行的探索候选；真实训练/验证严格要求可行。
 
 用法：
     python run_optimization.py
@@ -81,7 +81,7 @@ def _print_trial_detail(study: optuna.Study, opt: StrategyOptimizer,
         weights = tuple(float(w) for w in params["weights"])
         w_north_derived = params["weights"][-1]
         feasible = search_space.is_feasible(params)
-        violations = constraint_violations(metrics, **opt.constraint_kwargs)
+        violations = opt.violations(params, metrics)
 
         logger.info("Trial %d：目标值(合成=Sharpe−惩罚)=%s",
                     trial.number, "NaN" if trial.value is None else f"{trial.value:.4f}")
@@ -126,7 +126,7 @@ def run_optimization_smoke() -> None:
 
     # 对照：冒烟显式参数在寻优前先跑一次，确认流水线本身可成交
     metrics, engine = opt.backtest(ds, dict(SMOKE_PARAMS))
-    trade_log, _ = engine.run()
+    trade_log = engine.trade_log
     logger.info("基线（SMOKE_PARAMS）回测：成交 %d 笔 / 有效交易 %d 笔，"
                 "Sharpe=%s", len(trade_log[trade_log["shares"] > 0]),
                 metrics["n_trades"],
@@ -136,8 +136,10 @@ def run_optimization_smoke() -> None:
     logger.info("Optimize 完成：共 %d 个 Trial", len(study.trials))
     _print_trial_detail(study, opt, search_space)
 
-    # 最优参数与指标（硬约束无可行解时 best() 兜底为按目标值最优）
-    best_params, best_metrics = opt.best(study)
+    # 冒烟探索允许无可行解，但会显式记录违反量。
+    best_params, best_metrics = opt.best(study, allow_exploratory=True)
+    if best_metrics.get("feasible") is False:
+        logger.warning("冒烟候选仅供探索，违反量=%s", best_metrics["violations"])
     logger.info("-" * 78)
     logger.info("最优参数：weights=%s 阈值=%s 窗口=%s",
                 tuple(round(w, 4) for w in best_params["weights"]),
@@ -218,7 +220,7 @@ def run_optimization_real(n_trials: int = REAL_TRIALS,
         if idx == 0:
             # 基线：当前主入口默认参数在训练段的表现（对照组）
             metrics, engine = opt.backtest(ds_train, dict(SMOKE_PARAMS))
-            trade_log, _ = engine.run()
+            trade_log = engine.trade_log
             logger.info("训练段基线（REAL 默认参数）：成交 %d 笔 / 有效交易 %d 笔 / "
                         "Sharpe=%s / 回撤=%.2f%% / 年化换手=%s / 总盈亏=%+.0f 元",
                         len(trade_log[trade_log["shares"] > 0]), metrics["n_trades"],
@@ -227,13 +229,13 @@ def run_optimization_real(n_trials: int = REAL_TRIALS,
 
         study = opt.optimize(
             n_trials=seg_trials,
-            study_name=f"opt_real_s{seed}",
+            study_name=f"opt_real_v3_s{seed}",
             storage_path=os.path.join(
-                "data", "feature_cache", f"opt_study.s{seed}.journal"))
+                "data", "feature_cache", f"opt_study.v3.s{seed}.journal"))
         logger.info("Optimize 完成：seed=%d 累计 %d 个 Trial", seed, len(study.trials))
         _print_trial_detail(study, opt, opt.search_space)
 
-        # 训练段最优（约束无可行解时 best() 兜底为按目标值最优）
+        # 真实训练段严格要求可行解。
         best_params, ts_metrics = opt.best(study)
         results[seed] = best_params
         logger.info("seed=%d 训练段最优：Sharpe=%s 有效交易=%d 笔 胜率=%.0f%% "
@@ -271,8 +273,7 @@ def _select_via_validation(opt: StrategyOptimizer, study: optuna.Study,
     rows: List[Tuple[Dict[str, object], Dict[str, float], Dict[str, float], bool]] = []
     for params, ts_m in cands:
         v_m, _ = opt.backtest(ds_valid, params)
-        v_ok = all(float(vv) <= 1e-9 for vv in
-                   constraint_violations(v_m, **opt.constraint_kwargs))
+        v_ok = all(float(vv) <= 1e-9 for vv in opt.violations(params, v_m))
         rows.append((params, ts_m, v_m, v_ok))
         logger.info("[top-k] 训练(Sharpe=%.4f) → 验证段 Sharpe=%s 回撤=%.2f%% "
                     "年化换手=%s 有效交易=%d 约束%s",
@@ -286,8 +287,7 @@ def _select_via_validation(opt: StrategyOptimizer, study: optuna.Study,
         logger.info("验证段选 best：%d 个可行候选中按验证段 Sharpe 最高者 "
                     "(Sharpe=%.4f)", len(feasible), chosen[2]["sharpe"])
     else:
-        chosen = rows[0]
-        logger.warning("验证段无满足硬约束的候选，回退训练段 top-1")
+        raise ValueError("验证段无满足参数空间及回测硬约束的候选")
     return chosen[0], chosen[1]
 
 
@@ -295,7 +295,7 @@ def _final_test_eval(opt: StrategyOptimizer, ds_test: DataSlice,
                      params: Dict[str, object]) -> None:
     """测试段终评（仅评估一次，不参与任何选择）。"""
     t_metrics, t_engine = opt.backtest(ds_test, params)
-    t_log, _ = t_engine.run()
+    t_log = t_engine.trade_log
     logger.info("测试段（%s~%s）终评：成交 %d 笔 / 有效交易 %d / "
                 "Sharpe=%s / 回撤=%.2f%% / 年化换手=%s / 总盈亏=%+.0f 元",
                 TEST_START, TEST_END,

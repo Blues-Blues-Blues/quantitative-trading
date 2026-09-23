@@ -36,11 +36,11 @@ logger = logging.getLogger("indicators.feature_engine")
 # ---- 特征持久化缓存（整区间 + 签名 key）----
 # 命中条件 = 参数签名 + 数据指纹 + 区间 + 标的，全部一致才复用，
 # 跳过高耗时的原始逐笔（tick/l2_snapshot）加载与因子重算。
-_CACHE_SCHEMA_VERSION = "3"   # FEATURE_COLS / 因子计算逻辑变化时递增（强制全部失效）
+_CACHE_SCHEMA_VERSION = "4"   # FEATURE_COLS / 因子计算逻辑变化时递增（强制全部失效）
                               # 1→2：特征数值列统一强制 float64（修复 object dtype 往返不一致）
                               # 2→3：增量拼接去重改为按行键 (ts, symbol)（索引仅 ts，长表多标）
                               #      （原按 index 去重会删掉同 ts 的第二个标的 → 数据减半）
-_ALIGN_VERSION = "1"          # TimeAligner 行为变化时递增
+_ALIGN_VERSION = "2"          # TimeAligner 行为变化时递增
 _DEFAULT_CACHE_DIR = (Path(__file__).resolve().parent.parent
                       / "data" / "feature_cache")
 # 数据指纹扫描目录（用户补充数据后指纹变化 → 旧缓存自动失效）
@@ -48,7 +48,6 @@ _DEFAULT_FINGERPRINT_DIRS = (
     Path(__file__).resolve().parent.parent / "data" / "data1" / "data",
     Path(__file__).resolve().parent.parent / "data" / "data2",
 )
-_fingerprint_memo: Dict[str, str] = {}
 
 FEATURE_COLS: List[str] = [
     SYMBOL,
@@ -62,14 +61,14 @@ FEATURE_COLS: List[str] = [
     # 宏观与行业环境共振
     "mrs", "grs", "irs", "global_mod", "chain_mod",
     # 龙虎榜（T+1 可用）
-    "dt_net",
+    "dt_net", "dt_avail",
 ]
 
 # 日频因子的值列（chip / 北向 / 两融）
 _CHIP_COLS = ["lock_ratio", "accum_delta", "panic_ratio", "drift"]
 
 # 数值特征列（symbol 除外）：缓存往返前统一强制 float64
-_NUMERIC_COLS = [c for c in FEATURE_COLS if c != SYMBOL]
+_NUMERIC_COLS = [c for c in FEATURE_COLS if c not in (SYMBOL, "dt_avail")]
 
 
 class FeatureEngine:
@@ -91,6 +90,7 @@ class FeatureEngine:
         aligner: Optional[TimeAligner] = None,
         symbol_to_industry: Optional[Dict[str, str]] = None,
     ) -> None:
+        """注入因子计算器、时间对齐器和行业映射；缺省组件使用项目默认实现，缺少行业映射时 IRS 类特征按上层约定保留缺失。"""
         self.agent = agent or AgentProfiling()
         self.micro = micro or MicroStructure()
         self.env = env or Environment()
@@ -139,6 +139,7 @@ class FeatureEngine:
 
     def _minute_factors(self, feat: pd.DataFrame, ds: DataSlice) -> pd.DataFrame:
         # 资金流（含归一化基准）
+        """计算分钟内可用的资金流、订单流、筹码与同步因子；输出以 (时间, 标的) 为行键，供后续与日频和环境因子合并。"""
         if ds.tick_trades is not None and not ds.tick_trades.empty:
             norm_base = self._norm_base(ds.kline, ds.time_axis())
             flows = self.agent.net_flows(ds.tick_trades, norm_base)
@@ -173,6 +174,7 @@ class FeatureEngine:
     def _daily_factors(self, feat: pd.DataFrame, ds: DataSlice,
                        axis: pd.DatetimeIndex) -> pd.DataFrame:
         # 北向 / 两融
+        """将北向、两融及日频筹码特征先按可用日期对齐，再向分钟轴前向填充；当前交易日尚未发布的数据不得提前进入特征。"""
         if ds.north_margin is not None and not ds.north_margin.empty:
             ns = self.agent.north_sync(ds.north_margin)
             mp = self.agent.margin_pressure(ds.north_margin)
@@ -228,6 +230,7 @@ class FeatureEngine:
 
     def _environment_factors(self, feat: pd.DataFrame, ds: DataSlice) -> pd.DataFrame:
         # MRS（取首个指数代码作为全市场状态）
+        """计算市场、宏观和行业环境特征，并映射到个股分钟轴；缺少来源表时保留 NaN，避免伪造中性值。"""
         mrs = self.env.mrs(ds.index_min, ds.breadth)
         if not mrs.empty:
             code = mrs["index_code"].iloc[0]
@@ -273,31 +276,43 @@ class FeatureEngine:
 
     def _dragon_tiger(self, feat: pd.DataFrame, ds: DataSlice,
                       axis: pd.DatetimeIndex) -> pd.DataFrame:
+        """合并龙虎榜披露并映射到分钟轴；每条值只在其 avail_date 之后生效，同时保留可用日期供防未来数据校验。"""
         if ds.dragon_tiger is None or ds.dragon_tiger.empty:
             feat["dt_net"] = pd.NA
+            feat["dt_avail"] = pd.NaT
             return feat
 
         d = ds.dragon_tiger.dropna(subset=["avail_date"]).copy()
         if d.empty:
             feat["dt_net"] = pd.NA
+            feat["dt_avail"] = pd.NaT
             return feat
-        agg = d.groupby([SYMBOL, "avail_date"])["net_amount"].sum().reset_index()
+        agg = d.groupby([SYMBOL, "avail_date"], as_index=False).agg(
+            net_amount=("net_amount", "sum"),
+            trade_date=("trade_date", "max"))
 
         # avail_date（披露次日 00:00）起可用：按分钟轴日期 reindex + ffill
         rows = []
         for sym, g in agg.groupby(SYMBOL):
-            s = g.set_index("avail_date")["net_amount"]
-            mapped = s.reindex(axis.normalize(), method="ffill")
+            events = g.set_index("avail_date")[["net_amount", "trade_date"]]
+            mapped = events.reindex(axis.normalize(), method="ffill")
+            source_dates = pd.Series(events.index, index=events.index)
+            source = source_dates.reindex(axis.normalize(), method="ffill")
             rows.append(pd.DataFrame(
                 {"ts": axis, SYMBOL: sym,
-                 "dt_net": mapped.to_numpy(),
-                 "dt_avail": mapped.index.to_numpy()}))
+                 "dt_net": mapped["net_amount"].to_numpy(),
+                 "dt_avail": source.to_numpy(),
+                 "dt_trade_date": mapped["trade_date"].to_numpy()}))
         out = pd.concat(rows)
 
         # 防未来函数断言：每行使用时间(ts)必须晚于其数据可用日
-        TimeAligner.verify_no_lookahead(out["ts"], out["dt_avail"],
+        valid = out["dt_net"].notna()
+        TimeAligner.verify_no_lookahead(out.loc[valid, "ts"],
+                                        out.loc[valid, "dt_avail"],
                                         name="dragon_tiger/dt_net")
-        feat = feat.merge(out[["ts", SYMBOL, "dt_net"]], on=["ts", SYMBOL],
+        if (out.loc[valid, "dt_trade_date"] >= out.loc[valid, "dt_avail"]).any():
+            raise ValueError("龙虎榜来源日期不得晚于或等于实际可用日期")
+        feat = feat.merge(out[["ts", SYMBOL, "dt_net", "dt_avail"]], on=["ts", SYMBOL],
                           how="left")
         return feat
 
@@ -334,31 +349,27 @@ class FeatureEngine:
 
     @classmethod
     def data_fingerprint(cls, dirs: Sequence[Path]) -> str:
-        """数据目录指纹：max(mtime_ns) + 总字节数 + 文件数。
-
-        用户补充/修改数据后 mtime 或大小变化 → 指纹变化 → 旧缓存失效。
-        同进程内结果记忆化，避免每次回测重复扫描 3 万文件。
-        """
-        dirs = tuple(str(d) for d in dirs)
-        if dirs in _fingerprint_memo:
-            return _fingerprint_memo[dirs]
-        max_mt, total, n = 0, 0, 0
-        for d in dirs:
-            root = Path(d)
+        """Stable manifest hash, rescanned so changes in a live process invalidate cache."""
+        digest = hashlib.sha256()
+        for d in sorted(map(Path, dirs), key=str):
+            root = d.resolve()
             if not root.is_dir():
                 continue
             for base, _, files in os.walk(root):
-                for f in files:
+                for f in sorted(files):
                     try:
-                        st = (Path(base) / f).stat()
+                        path = Path(base) / f
+                        st = path.stat()
                     except OSError:
                         continue
-                    max_mt = max(max_mt, st.st_mtime_ns)
-                    total += st.st_size
-                    n += 1
-        fp = f"{max_mt:x}_{total:x}_{n}"
-        _fingerprint_memo[dirs] = fp
-        return fp
+                    rel = path.relative_to(root).as_posix()
+                    digest.update(f"{root}|{rel}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+                    if st.st_size <= 65536 and path.suffix.lower() in (".csv", ".yaml", ".json"):
+                        try:
+                            digest.update(path.read_bytes())
+                        except OSError:
+                            pass
+        return digest.hexdigest()[:16]
 
     def cache_file_name(self, start: str, end: str,
                         symbols: Sequence[str], fp: str) -> str:
@@ -391,6 +402,7 @@ class FeatureEngine:
 
     @staticmethod
     def _read_features(path: Path) -> pd.DataFrame:
+        """读取特征缓存并恢复标准行键与列类型；缓存中时间戳按纳秒精度写入，数值列按统一 schema 转为 float64。"""
         feat = pd.read_parquet(path)
         if "ts" in feat.columns:
             feat = feat.set_index("ts")
@@ -400,6 +412,7 @@ class FeatureEngine:
 
     @staticmethod
     def _write_features(feat: pd.DataFrame, path: Path) -> None:
+        """按缓存 schema 写出特征表；写盘时将索引还原为 ts 列，保证 parquet 往返和增量拼接使用相同行键。"""
         path.parent.mkdir(parents=True, exist_ok=True)
         feat.reset_index().rename(columns={"index": "ts"}).to_parquet(
             path, index=False)

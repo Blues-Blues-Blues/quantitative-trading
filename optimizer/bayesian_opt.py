@@ -17,7 +17,8 @@
     optimizer = StrategyOptimizer(data=train_ds, ...)
     study = optimizer.optimize()
     params, metrics = optimizer.best(study)      # 样本内最优参数与指标
-    oos_log, oos_curve = optimizer.backtest(oos_ds, params)  # 样本外回测
+    oos_metrics, engine = optimizer.backtest(oos_ds, params)
+    oos_log, oos_curve = engine.trade_log, engine.equity_curve
 """
 
 
@@ -32,10 +33,14 @@ def _window_end_str(params):  # 定义于 import 之前，避免类型注解前�
 
 import logging
 import os
+import hashlib
+import json
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
+import pandas as pd
 from optuna.samplers import TPESampler
 
 from analytics.metrics import constraint_violations, evaluate
@@ -44,7 +49,7 @@ from engine.backtest import BacktestEngine
 from engine.execution import ExecutionCost
 from engine.portfolio import Account
 from engine.risk_control import PositionSizer
-from indicators.feature_engine import FeatureEngine
+from indicators.feature_engine import FeatureEngine, _DEFAULT_FINGERPRINT_DIRS
 from indicators.microstructure import MicroStructure
 from optimizer.search_space import SearchSpace
 from strategy.signals import SignalSynthesizer, TradingStateMachine
@@ -108,7 +113,7 @@ class StrategyOptimizer:
 
     def backtest(self, ds: DataSlice, params: Dict[str, object]
                  ) -> Tuple[Dict[str, float], BacktestEngine]:
-        """在任意数据切片上以给定参数跑完整流水线，返回 (metrics, engine)。"""
+        """运行一次完整流水线；返回指标和持有同次日志/曲线的已运行引擎。"""
         micro = MicroStructure(chip_window=int(params["chip_window"]))
         fe = FeatureEngine(micro=micro, symbol_to_industry=self.symbol_to_industry)
         # 真实数据寻优（use_feature_cache=True）：特征按 (区间,标的) 落盘缓存，
@@ -166,11 +171,10 @@ class StrategyOptimizer:
             symbol_to_industry=self.symbol_to_industry,
         )
         sm = TradingStateMachine(synthesizer=syn)
-        signals = sm.run(ds, features)
-
         engine = BacktestEngine(
-            Account(**self.account_kwargs), self.cost, self.sizer, ds, signals,
-            deadzone_th=float(params.get("deadzone_th", 0.05)))
+            Account(**self.account_kwargs), self.cost, self.sizer, ds,
+            deadzone_th=float(params.get("deadzone_th", 0.05)),
+            state_machine=sm, features=features)
         trade_log, equity_curve = engine.run()
         return evaluate(equity_curve, trade_log), engine
 
@@ -220,10 +224,15 @@ class StrategyOptimizer:
         return float(score)
 
     def constraints_func(self, trial: optuna.Trial) -> List[float]:
-        """硬约束违反量（4 个，>= 0；0 = 满足，NaN → 最大违反）。"""
-        _, metrics = self._params_and_metrics(trial)
-        violations = constraint_violations(metrics, **self.constraint_kwargs)
-        return [float(v) if np.isfinite(v) else _NAN_VIOLATION for v in violations]
+        """Unified metric and search-space violations (0 means feasible)."""
+        params, metrics = self._params_and_metrics(trial)
+        return self.violations(params, metrics)
+
+    def violations(self, params: Dict[str, object],
+                   metrics: Dict[str, float]) -> List[float]:
+        values = (constraint_violations(metrics, **self.constraint_kwargs)
+                  + self.search_space.weight_violations(params))
+        return [float(v) if np.isfinite(v) else _NAN_VIOLATION for v in values]
 
     # ------------------------------------------------------------------
     # 寻优入口与结果
@@ -234,6 +243,9 @@ class StrategyOptimizer:
                  storage_path: Optional[str] = None) -> optuna.Study:
         """运行贝叶斯寻优，返回 Optuna Study。
 
+        n_trials 缺省（None）时使用构造时的 self.n_trials——绝不传 None 给
+        study.optimize（optuna 语义下 None = 无限运行，会把 WalkForward 等
+        无参调用场景卡死）。
         storage_path 非空时使用持久化存储（JournalStorage 单文件）：
         支持中途停止 / 断点续跑——已跑 trial 全部保留，重复调用从断点
         继续新增 trial（n_trials 为"本次新增数"）。显式传 n_trials=0
@@ -258,84 +270,99 @@ class StrategyOptimizer:
         study = optuna.create_study(
             study_name=study_name, storage=storage,
             direction="maximize", sampler=sampler, load_if_exists=load_if)
+        project = Path(__file__).resolve().parent.parent
+        code_digest = hashlib.sha256()
+        for relative in ("strategy/signals.py", "engine/backtest.py",
+                         "engine/execution.py", "indicators/feature_engine.py",
+                         "data/aligner.py", "optimizer/search_space.py"):
+            code_digest.update((project / relative).read_bytes())
+        kline_digest = hashlib.sha256(
+            pd.util.hash_pandas_object(self.data.kline, index=True)
+            .to_numpy().tobytes()).hexdigest()
+        signature = hashlib.sha256(json.dumps({
+            "version": 3,
+            "space": vars(self.search_space),
+            "constraints": self.constraint_kwargs,
+            "account": self.account_kwargs,
+            "cost": vars(self.cost),
+            "sizer": vars(self.sizer),
+            "industry": self.symbol_to_industry,
+            "code": code_digest.hexdigest(),
+            "source_fingerprint": FeatureEngine.data_fingerprint(
+                _DEFAULT_FINGERPRINT_DIRS),
+            "kline": kline_digest,
+            "data": self.data.meta,
+            "symbols": self.data.symbols(),
+            "axis": [str(self.data.time_axis().min()),
+                     str(self.data.time_axis().max())],
+        }, sort_keys=True, default=str).encode()).hexdigest()
+        old_signature = study.user_attrs.get("configuration_signature")
+        if old_signature is None and study.trials:
+            raise ValueError("Journal 含旧约束的 trial；请更换 study 名称或存储路径")
+        if old_signature is not None and old_signature != signature:
+            raise ValueError("Journal 配置或数据签名不一致；请新建 study")
+        if old_signature is None:
+            study.set_user_attr("configuration_signature", signature)
         if load_if:
             study.sampler = sampler  # 续跑场景重绑含硬约束的采样器
-        study.optimize(self.objective,
-                       n_trials=None if n_trials is None
-                       else max(0, int(n_trials)))
+        actual_trials = (self.n_trials if n_trials is None
+                         else max(0, int(n_trials)))
+        study.optimize(self.objective, n_trials=actual_trials)
         return study
 
     def _trial_violations(self, trial: optuna.Trial) -> List[float]:
         """该 trial 的硬约束违反量（需先在 _cache 中有评估结果）。"""
-        _, metrics = self._cache[trial.number]
-        return constraint_violations(metrics, **self.constraint_kwargs)
+        params, metrics = self._cache[trial.number]
+        return self.violations(params, metrics)
 
-    def best(self, study: optuna.Study) -> Tuple[Dict[str, object], Dict[str, float]]:
-        """返回 (最优参数, 其样本内指标)。
-
-        本进程已评估（_cache 中）的 trial 内：
-        - 优先返回「满足全部硬约束（self.constraint_kwargs 口径）且目标值
-          最优」的 trial；
-        - 无可行 trial 时，回退为按目标值（Sharpe）最优的已评估 trial 兜底。
-
-        断点续跑场景（本次进程未新增任何 trial、全部从 Journal 加载，
-        _cache 为空）：按目标值降序逐一对候选 trial 重建参数并回测重算，
-        返回首个满足硬约束者（最多 _MAX_RE_EVAL 个）；仍无可行解则回退为
-        目标值最优。
-        """
-        cached = [t for t in study.trials
-                  if t.value is not None and t.number in self._cache]
-        if cached:
-            feasible = [t for t in cached
-                        if all(float(v) <= 1e-9
-                               for v in self._trial_violations(t))]
-            pool = feasible or cached
-            best_trial = max(pool, key=lambda t: float(t.value))
-            if not feasible:
-                logger.warning(
-                    "无满足硬约束的 trial，回退为按目标值最优（trial %d）",
-                    best_trial.number)
-            else:
-                logger.info("满足硬约束的最优 trial: %d（Sharpe=%.4f）",
-                            best_trial.number, float(best_trial.value))
-            return self._cache[best_trial.number]
-
+    def best(self, study: optuna.Study, allow_exploratory: bool = False
+             ) -> Tuple[Dict[str, object], Dict[str, float]]:
+        """Return the best feasible trial; exploratory fallback is explicit and marked."""
         ranked = [t for t in study.trials if t.value is not None]
         if not ranked:
             raise ValueError("study 无任何有效 trial") from None
         ranked.sort(key=lambda t: float(t.value), reverse=True)
-        logger.info("断点续跑：%d 个 Journal trial 无进程内缓存，"
-                    "按目标值降序重算候选指标（上限 %d 个）",
-                    len(ranked), _MAX_RE_EVAL)
-        for trial in ranked[:_MAX_RE_EVAL]:
-            params = SearchSpace.params_from_trial(trial)
-            metrics = self._evaluate(params)  # 训练段单点重算，补足未落盘指标
-            self._cache[trial.number] = (params, metrics)
-            if all(float(v) <= 1e-9 for v in
-                   constraint_violations(metrics, **self.constraint_kwargs)):
-                logger.info("续跑恢复：trial %d 满足硬约束（Sharpe=%.4f）",
+        for trial in ranked:
+            stored = trial.system_attrs.get("constraints")
+            if (trial.number not in self._cache and stored is not None
+                    and any(float(v) > 1e-9 for v in stored)):
+                continue
+            if trial.number not in self._cache:
+                params = SearchSpace.params_from_trial(trial)
+                self._cache[trial.number] = (params, self._evaluate(params))
+            params, metrics = self._cache[trial.number]
+            if all(float(v) <= 1e-9 for v in self.violations(params, metrics)):
+                logger.info("满足硬约束的最优 trial: %d（目标值=%.4f）",
                             trial.number, float(trial.value))
                 return params, metrics
+        if not allow_exploratory:
+            raise ValueError("无满足参数空间及回测硬约束的 trial")
         best_trial = ranked[0]
+        if best_trial.number not in self._cache:
+            params = SearchSpace.params_from_trial(best_trial)
+            self._cache[best_trial.number] = (params, self._evaluate(params))
         params, metrics = self._cache[best_trial.number]
-        logger.warning("续跑恢复：前 %d 个候选均不满足硬约束，"
-                       "回退为按目标值最优（trial %d）",
-                       min(_MAX_RE_EVAL, len(ranked)), best_trial.number)
-        return params, metrics
+        logger.warning("无满足硬约束的候选，"
+                       "探索模式回退为目标值最优（trial %d）",
+                       best_trial.number)
+        return params, {**metrics, "feasible": False,
+                        "violations": self.violations(params, metrics)}
 
     def top_candidates(self, study: optuna.Study, k: int = 5,
-                       max_re_eval: int = _MAX_RE_EVAL
+                       max_re_eval: int = _MAX_RE_EVAL,
+                       allow_exploratory: bool = False
                        ) -> List[Tuple[Dict[str, object], Dict[str, float]]]:
         """约束可行候选（按目标值降序，至多 k 个）。
 
         供「训练段 top-k → 验证段复评」使用（严格三集：验证段参与选参、
         测试段仅终评）。进程内已有缓存（本进程刚跑完）直接取；
         Journal 断点续跑缺缓存的 trial 按目标值降序重算指标（上限
-        max_re_eval 个）。无可行候选时降级为按目标值最优的 k 个。
+        max_re_eval 个）。无可行候选时默认报错；探索模式才返回标记候选。
 
         :return: [(params, 训练段metrics), ...]，目标值降序
         """
         def _metrics_of(t: optuna.Trial) -> Dict[str, float]:
+            """优先复用该 trial 已计算的训练指标，缺失时才执行回测；恢复旧 study 时可避免重复评估。"""
             if t.number in self._cache:
                 return self._cache[t.number][1]
             params = SearchSpace.params_from_trial(t)
@@ -347,7 +374,12 @@ class StrategyOptimizer:
         missing = [t for t in study.trials
                    if t.value is not None and t.number not in self._cache]
         missing.sort(key=lambda t: float(t.value), reverse=True)
-        for t in missing[:max_re_eval]:
+        stored_feasible = [t for t in missing
+                           if t.system_attrs.get("constraints") is not None
+                           and all(float(v) <= 1e-9 for v in
+                                   t.system_attrs["constraints"])]
+        recovery_pool = stored_feasible if stored_feasible else missing
+        for t in recovery_pool:
             _metrics_of(t)
 
         ranked = [t for t in study.trials
@@ -355,14 +387,17 @@ class StrategyOptimizer:
         ranked.sort(key=lambda t: float(t.value), reverse=True)
         feasible = [t for t in ranked
                     if all(float(v) <= 1e-9 for v in
-                           constraint_violations(
-                               self._cache[t.number][1],
-                               **self.constraint_kwargs))]
+                           self.violations(*self._cache[t.number]))]
+        if not feasible and not allow_exploratory:
+            raise ValueError("无满足参数空间及回测硬约束的候选")
         pool = feasible or ranked
         if not feasible:
             logger.warning("top_candidates：无满足硬约束的 trial，"
                            "降级按目标值取前 %d", k)
-        return [(self._cache[t.number][0], dict(self._cache[t.number][1]))
+        return [(self._cache[t.number][0],
+                 {**self._cache[t.number][1], "feasible": False,
+                  "violations": self._trial_violations(t)} if not feasible
+                 else dict(self._cache[t.number][1]))
                 for t in pool[:k]]
 
     # ------------------------------------------------------------------

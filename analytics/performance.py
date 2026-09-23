@@ -148,6 +148,7 @@ class PerformanceAnalyzer:
                     transform=ax.transAxes)
             return ax
         def _bins(series: pd.Series) -> list:
+            """根据样本量生成分组边界；边界需单调且不越过有效样本范围，避免分位数组出现空组。"""
             try:
                 return pd.qcut(series, min(bins, series.nunique()),
                                duplicates="drop")
@@ -255,6 +256,7 @@ class PerformanceAnalyzer:
 
 
 def _equity_series(curve: pd.DataFrame) -> pd.Series:
+    """把净值输入统一整理为按时间排序的 Series，兼容带时间列的表和已索引序列。"""
     if not isinstance(curve, pd.DataFrame) or curve.empty:
         return pd.Series(dtype=float)
     if "total_equity" not in curve.columns:
@@ -264,6 +266,7 @@ def _equity_series(curve: pd.DataFrame) -> pd.Series:
 
 
 def _plot_position(ax: plt.Axes, curve: pd.DataFrame) -> None:
+    """绘制持仓暴露辅助图；缺少可识别的仓位列时跳过该面板，不影响主绩效图。"""
     if curve is None or curve.empty:
         ax.text(0.5, 0.5, "no data", ha="center", va="center",
                 transform=ax.transAxes)
@@ -318,6 +321,7 @@ def _trials_frame(study_or_frame: object) -> Optional[pd.DataFrame]:
 
 
 def _mid(interval: object) -> str:
+    """返回区间的中点值；空区间使用下游约定的缺失值。"""
     try:
         if hasattr(interval, "mid"):
             return f"{float(interval.mid):.2f}"

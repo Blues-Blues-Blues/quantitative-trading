@@ -31,6 +31,7 @@ class PositionSizer:
         mrs_sensitivity: float = 10.0,    # MRS → 系数 的线性灵敏度
         chain_scale_floor: float = 0.5,   # 链式调节系数下界
     ) -> None:
+        """保存基础仓位、杠杆及环境调节参数，并检查参数范围；目标权重还会在账户层受到单股和总杠杆上限约束。"""
         if not 0.0 < base_position <= 1.0:
             raise ValueError(f"base_position 必须在 (0, 1] 区间，当前: {base_position}")
         if not 0.0 < max_single_position <= 1.0:
