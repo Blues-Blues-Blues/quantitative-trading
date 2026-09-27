@@ -23,7 +23,9 @@
 - **Walk-Forward 交叉验证**：滚动/扩展训练段的滚动样本外（OOS）验证框架，每折独立寻优并在样本外回测，输出跨折 OOS 评估报告，避免前视偏差与过度拟合
 - **绩效指标**：年化收益率、年化夏普、卡玛（Calmar）、Sortino、最大回撤、平均持仓周期、胜率/盈亏比、日收益偏度/峰度（`analytics/metrics.py` + `PerformanceAnalyzer`）
 - **实时决策日志流**：`StreamLogger` 每 Bar × 每标的输出标准 JSON（Final_MS / Global_Mod / Chain_Mod / Capital_Purity / Action / State），JSONL 落盘 + 生成器双形态
-- **收益归因**：`AttributionEngine` 因子暴露分解——把每笔已实现盈亏按入场时点拆解到宏观共振（Global_Mod）/ 行业共振（Chain_Mod）/ 个股情绪（Agent_MS）
+- **已实现盈亏分摊**：`AttributionEngine` 通过决策/成交 ID 追溯买入批次，按三项入场分数绝对值分配平均成本盈亏，保留未归因原因与覆盖率
+
+- **动态组合暴露**：`ExposureAnalyzer` 在收盘按实际持仓市值/总权益加权三项有符号分数；保留现金影响和逐因子缺失覆盖率
 - **因子预测能力检验**：因子 IC / Rank IC / IR 时序分析（横截面 Rank IC 与单标的时序相关双模式，前瞻窗口可配）+ IC 时间桶热力图
 - **多子图 Dashboard**：净值回撤图、动态仓位图、归因柱状图、参数敏感度热力图（`plot_report`）
 - **20 日人工复盘清单**：自动导出每笔交易触发前后 N 个交易日的日线指标切片 + 逐笔资金流清单（Excel 三 sheet / CSV）
@@ -82,7 +84,9 @@ quantitative_trading/
 │   │                           #   平均持仓周期、日收益偏度/峰度、FIFO 交易配对
 │   ├── performance.py          # PerformanceAnalyzer：指标总表、四子图 Dashboard、
 │   │                           #   参数敏感度热力图、20 日人工复盘清单导出（Excel/CSV）
-│   ├── attribution.py          # AttributionEngine：因子暴露分解归因（宏观/行业/个股情绪）
+│   ├── attribution.py          # 入场分数绝对值盈亏分摊 + IC 分析
+│   ├── exposure.py             # 实际持仓收盘策略分数加权暴露
+│   ├── reporting.py            # 报告生命周期、按日 Parquet、质量诊断与图表
 │   ├── ic_analyzer.py          # 因子 IC / Rank IC / IR 双模式分析 + Q1~Q5 分位分层净值
 │   ├── real_time_stream.py     # StreamLogger：实时/仿真决策日志流（标准 JSONL + 生成器）
 │   ├── plotter.py              # 绘图模块：价格走势 / 震荡区间标注
@@ -275,13 +279,175 @@ python run_optimization.py --data real --trials 30 --seeds 42,7 --stability-tria
 - **窗口参数固定**：真实寻优搜索空间固定 `win_inst=(1,1), win_chip_old=(1,1)`——特征缓存签名含窗口，放开采样会让每种窗口组合触发训练段特征全量重算（约 10 分钟/次），待信号层参数收敛后再做窗口专项寻优
 - **参数可行性**：TPE、训练候选和验证选择共用五项绩效指标与四个权重范围的违反量。冒烟及 Walk-Forward 允许显式标记的探索候选。
 
+## 已实现盈亏分摊与收盘暴露报告
+
+常规 `main.py --data smoke` 与 `--data real` 默认启用报告。每次运行写入独立目录：
+`analytics/reports/<mode>_<start>_<end>_<UTC时间_随机短串>/`，不覆盖历史运行。
+
+```powershell
+& '.\.venv\Scripts\python.exe' main.py --data smoke
+& '.\.venv\Scripts\python.exe' main.py --data smoke --report-dir 'analytics/reports'
+& '.\.venv\Scripts\python.exe' main.py --data smoke --no-analysis-report
+```
+
+**盈亏口径**：买入费用计入平均成本，卖出净额扣除平均成本后得到已实现盈亏 P。
+FIFO 仅确定卖出消耗哪些来源批次，各批次先获得 `P × matched_shares / sell_shares`，
+再按 `abs(entry_factor) / sum(abs(三项因子))` 分配。三因子固定为
+`global_mod / chain_mod / agent_ms`，原始符号保留。任一因子缺失/非法，或全零，
+整批次进入 `other`；不对剩余因子重新归一化，不用退出因子，不计算未平仓浮盈。
+每笔 SELL 仍算一笔交易，`summary.n_trades` 计主导分类的卖出笔数。
+`summary.weight` 是因子 PnL / 总 PnL，总 PnL 为零时留空，不是风险权重。
+例如任务书 C3 的两笔 SELL 总盈亏 475 元，三个因子分摊为 220.1 / 154.1 / 100.8 元。
+
+**暴露口径**：每个 Bar 实际成交和收盘盯市后，使用同一 Bar 的已知因子值：
+`exposure[f,t] = Σ market_value[i,t] / total_equity[t] × factor_value[f,i,t]`。
+保留有符号原值和现金影响，不做标准化、截尾或重新归一化。
+因子独立计算市值覆盖率；有缺失时 `exposure` 留空，`observed_exposure` 保存已知贡献之和，
+缺失股票的贡献也留空。空仓时暴露为 0、coverage=1、status=flat。
+这是策略分数加权暴露，不是统计 beta；盈亏分摊也不代表因果收益贡献、因子收益回归或 Brinson。
+
+**追溯与校验**：全部 Signal（含 HOLD）在引擎入队时复制并分配可复现的 signal_id；
+正股数成交有独立 fill_id，拒单没有 fill_id，decision_ts 保留原决策时间。
+同时间戳按 event_seq 保留实际执行顺序。外部 ID 保留且必须唯一，顺延成交保留同一来源。
+旧日志无来源 ID 时仍可计算平均成本盈亏，但其分摊归入 `unmatched_signal`，不猜测时间关联。
+重复 ID、来源矛盾、超卖或负股数直接报错。
+
+| 产物 | 内容 |
+| --- | --- |
+| `manifest.json` | schema_version=1、模式/区间/股票、参数、初始资金、行业映射摘要、数据来源、代码内容哈希、方法和运行状态 |
+| `attribution_trades.csv` | 每 SELL 一行的已实现盈亏和分摊 |
+| `attribution_batches.csv` | 来源批次、决策/成交 ID、原始因子、分摊权重及金额 |
+| `attribution_summary.csv` | 三因子及 other 的 pnl、weight、n_trades |
+| `unattributed_batches.csv` | 未归因批次及固定原因分类 |
+| `quality.json` | 买入成交关联率、已卖出股数覆盖率、绝对盈亏覆盖率、other 原因统计、未平仓股数、守恒误差；另含逐因子暴露均值/绝对均值/峰值及缺失 Bar 数 |
+| `positions/date=YYYY-MM-DD.parquet` | 当日实际收盘持仓 |
+| `exposure_contributions/date=YYYY-MM-DD.parquet` | 当日逐股票、逐因子贡献 |
+| `exposure_timeseries/date=YYYY-MM-DD.parquet` | 当日全部 Bar 的暴露、已知贡献、覆盖率和投入权益比例 |
+| `attribution.png` / `exposure.png` / `dashboard.png` | 盈亏分摊、日末暴露/覆盖率、绩效面板 |
+
+金额守恒误差上限 1e-6 元，权重校验容差 1e-12；CSV 不提前四舍五入，JSON 非有限值写 null。
+覆盖率采用股数和 `Σabs(批次PnL)`，不以可能相互抵消的净盈亏作分母。
+无卖出状态为 `no_closed_trades`，图表说明无已实现盈亏；覆盖不全为 `partial` 并告警；
+结构错误或守恒失败为 `failed`。未平仓不会为报告强制平仓。
+数据来源指纹不可得时明确标记 `unavailable`；文件统计清单缓存键不宣称是已验证的数据内容哈希。
+
+writer 仅缓冲一个交易日，跨日及 finalize 时落盘；图表使用日末摘要，分钟序列保留在分日文件。
+默认目录已忽略入库，自定义目录不自动修改 Git 配置。
+`StrategyOptimizer.backtest()`、Optuna trial 和 Walk-Forward 默认没有快照回调或详细报告。
+
+本任务的短验证命令（不执行真实回测或寻优）：
+
+```powershell
+& '.\.venv\Scripts\python.exe' -m pytest tests/test_analytics.py tests/test_backtest_engine.py tests/test_signals.py tests/test_exposure.py tests/test_analysis_reporting.py -q
+& '.\.venv\Scripts\python.exe' main.py --data smoke
+```
+
+## 离线回测可视化（任务书 1.1）
+
+安装 `requirements.txt` 中的依赖后，正常主回测在原分析运行目录内额外生成
+`analytics/reports/<本次运行目录>/backtest.html`，终端打印绝对路径与归因、可视化两个状态。
+本次验证 Plotly **6.9.0**；HTML 内嵌一份 Plotly.js 与日频数据，无需联网、服务或相邻文件。
+请手动用桌面 Edge / Chrome 打开，也可只复制该 HTML 到中文或带空格的目录。
+报告生成不会自动开启浏览器。
+
+日常使用：在 PowerShell 中切到项目根目录，用内置的 6 个交易日、2 只股票先试运行：
+
+```powershell
+Set-Location 'D:\quant trade\quantitative trading'
+.\.venv\Scripts\python.exe main.py --data smoke
+```
+
+结束后复制终端 `HTML 报告：` 后的绝对路径到 Edge 地址栏，或在资源管理器中双击
+对应的 `backtest.html`。只查看已经生成的报告不需要 Python，也不需要重跑回测。
+代码更新不会改写历史 HTML；请打开新生成的报告。
+
+使用本地真实数据时，先在 `main.py` 调整 `REAL_START`、`REAL_END`、`REAL_SYMBOLS`
+（空列表代表全部已发现股票），并确认 `REAL_PARAMS` 是希望使用的固定策略参数，再手动运行：
+
+```powershell
+.\.venv\Scripts\python.exe main.py --data real
+```
+
+该命令执行真实数据回测，不启动参数寻优；运行时间取决于日期范围、股票数和特征缓存。
+当前日期和股票配置在 Python 文件内，不是 `--start` / `--symbols` 命令行参数；
+`--ic-start` / `--ic-end` 只用于 IC 分析，不控制这里的回测范围。
+
+`--report-dir` 仍可自定义根目录：绝对路径直接使用，相对路径始终相对项目根目录，
+与启动时的工作目录无关。每次沿用 writer 的唯一运行目录，不覆盖历史报告。
+`--no-analysis-report` 同时关闭 HTML、归因与暴露 writer；旧 PNG 绘图行为保持不变。
+优化器、Walk-Forward、普通引擎调用及模块导入不自动导出 HTML，也不加载 Plotly。
+原有 `finalize(log, signals, curve)` 返回 quality 字典并保留旧产物，HTML 状态为 `skipped`；
+主入口传 `kline=ds.kline`，不会走此兼容降级路径。
+
+页面顶部包含完整区间的资金、收益、真实成交笔数、已实现盈亏和最大回撤摘要，
+下方为净值、当日最深回撤、股票与策略收益对比，以及单列展开的所有股票。
+每股提供日 K / 收盘线切换、MA5/20/60、账户成本、四类实际成交、成交量、股数和仓位。
+图例可隐藏均线及成本；点击同日成交组查看当天全部实际成交，表格支持股票、动作、日期筛选，
+每页 50 条；点击明细用真实成交价定位。筛选不会重算账户摘要，翻页和切图保留选中项。
+
+日期缩放默认联动。关闭后，各股票和账户图独立，同一股票的三个图仍同步；
+重新开启采用最近操作的范围。顶部日期输入和“恢复全区间”始终作用于全部图。
+框选仅缩放日期轴，拖动可在 Plotly 工具栏选择；表格日期筛选与图形缩放独立。
+
+数据口径：时间统一为上海本地时间，行情先裁至实际首末账户 Bar 再按可用 Bar 聚合。
+首尾可能为不完整交易日，不额外下载预热行情或调整复权，未知复权明确标注。
+缺行情日保留 null 断线；MA 按有效日收盘滚动计算，缺少共同起点 Bar 的股票不参与收益比较。
+股票收益使用准确首 Bar 的 open，账户收益使用初始资金；缩放不改变基准。
+成本线按账户平均成本重建，不含手续费；卖出盈亏复用现有 metrics 的含费平均成本算法。
+回撤使用全 Bar 累计峰值后取每日最深值，避免遗漏日内回撤。
+所有实际成交、逐股日末股数、市值、权益和盈亏 ID 均严格对账；缺快照不会补成空仓。
+
+`manifest.json` 中的 `visualization` 独立记录 `complete / partial / skipped / failed`。
+缺行情或共同基准为可展示的 `partial`；重复 ID、超卖、成本股数或市值不一致会失败并抛错。
+失败保留已有分析产物，HTML 通过临时文件原子写入；正常无成交或未清仓不视为错误。
+报告不改变策略、撮合、T+1、费用或盈亏计算规则。
+
+指定短回归（不运行 `tests/test_optimizer.py`、参数寻优或真实两年回测）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_visualization_data.py tests/test_html_report.py tests/test_analysis_reporting.py tests/test_exposure.py tests/test_analytics.py tests/test_backtest_engine.py -q
+```
+
+可重复生成 4 股 / 20 股各 500 日的合成样例，并在无界面的系统 Edge 中执行真实离线交互验收：
+
+```powershell
+# 仅浏览器验收需要此可选工具；日常导出无需安装
+.\.venv\Scripts\python.exe -m pip install playwright
+.\.venv\Scripts\python.exe tests/visualization_acceptance.py
+```
+
+脚本不下载行情、不运行引擎或寻优，输出独立运行目录的 HTML、截图与 `acceptance.json`，
+记录生成耗时、文件大小、浏览器版本、首次就绪耗时及错误/网络请求。
+若环境禁止启动浏览器，脚本明确失败，不将写文件成功视为交互通过。
+手工复核可断网打开单文件，依次切换价格模式和图例、缩放并切换联动、输入日期/恢复、
+点击同日成交及分页明细；Chrome 未在本次单独实测。
+
+2026-09-27 验收：Windows 11、Python 3.14.3、Plotly 6.9.0、Edge 154.0.4258.37。
+复查后指定六文件 **142 passed**；最终 JS 再经浏览器验收。
+本轮另修复了图例隐藏“选中成交”后再点明细不能恢复标记的问题，以及最终 manifest
+写入失败前提前打印 HTML 成功路径的问题，并补充对应回归断言。
+执行六文件时额外设置 `Study.optimize` 和网络连接失败哨兵，未运行参数寻优、Walk-Forward 或真实两年回测。
+复制单个 HTML 后在禁用网络的 Edge 中验证了切图、图例、框选、联动开关、单日/倒置/越界日期、
+恢复、重叠汇总点击、超过 50 笔分页、真实价格选中、窗口外定位、懒加载与窗口尺寸变化；
+两种规模均无未捕获 JS 异常、无外部资源请求。
+
+| 合成规模 | 生成耗时 | 单文件大小（十进制 MB） | 顶部图表与控件就绪 |
+| --- | ---: | ---: | ---: |
+| 4 股 × 500 日 | 2.265 秒 | 7.22 MB | 1.798 秒 |
+| 20 股 × 500 日 | 8.597 秒 | 15.90 MB | 2.432 秒 |
+
+股票图按滚动延迟初始化，上述为本机实测而非固定性能承诺。最终样例运行目录分别为
+`analytics/reports/synthetic_4stocks_500days_eb5dadc2/` 和
+`analytics/reports/synthetic_20stocks_500days_d84aedf8/`，各含 `backtest.html` 和 `acceptance.json`。
+未验证：Chrome 独立运行、其他操作系统及真实两年数据性能；首尾/中途行情完整性没有新增交易日历检测。
+
 ## 测试
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-当前 **225** 项单元测试全部通过（合成 mock 数据，不联网）：
+本次因子暴露任务运行下方指定的五个测试文件（合成 mock 数据，不联网）；完整测试目录未在本次重新执行，不把历史数量视为当前全量通过结果：
 
 | 测试文件 | 覆盖范围 |
 | --- | --- |
@@ -290,7 +456,9 @@ python -m pytest tests/ -v
 | `tests/test_signals.py` | 连续评分纯函数公式（ES/PS/Fund_Stability/XS）精确值 + 向量化/NaN/零除/否决等健壮性用例、硬过滤层、状态机全流程 |
 | `tests/test_backtest_engine.py` | 下一 Bar 成交、T+1 挂起卖出、涨跌停拦截、成本滑点、仓位/杠杆风控、成交日志与净值曲线 |
 | `tests/test_optimizer.py` | 绩效指标纯函数、搜索空间归一化、StrategyOptimizer 端到端寻优、Walk-Forward OOS 报告 |
-| `tests/test_analytics.py` | 实时流 JSONL、绩效指标精确值、因子归因盈亏守恒、IC/Rank IC/IR 双模式、复盘清单导出、Dashboard |
+| `tests/test_analytics.py` | 实时流 JSONL、绩效精确值、平均成本批次归因及来源校验、IC/Rank IC/IR、复盘清单、Dashboard |
+| `tests/test_exposure.py` | 有符号权益加权、现金影响、缺失覆盖率、空仓和未来因子隔离 |
+| `tests/test_analysis_reporting.py` | 分日文件、JSON、报告开关一致性、无交易/未平仓及失败状态 |
 
 ## 开发状态
 
@@ -307,13 +475,13 @@ python -m pytest tests/ -v
 | 信号合成与状态机 `strategy/signals.py`（ES/PS/XS + A股硬过滤 + 一票否决） | ✅ 已完成（评分算子已纯函数化/向量化重构） |
 | 回测撮合引擎 `engine/`（backtest / execution / portfolio / risk_control） | ✅ 已完成（差额调仓 + 死区 + T+1 顺延） |
 | 绩效指标 `analytics/metrics.py` + `performance.py`（PerformanceAnalyzer） | ✅ 已完成（含 Calmar/Sortino/持仓周期/复盘清单/Dashboard） |
-| 收益归因 `analytics/attribution.py`（因子暴露分解 + IC/Rank IC/IR） | ✅ 已完成 |
+| 收益分摊与暴露 `analytics/attribution.py` + `exposure.py`（含 IC/Rank IC/IR） | ✅ 已完成 |
 | 实时流 `analytics/real_time_stream.py`（StreamLogger JSONL） | ✅ 已完成 |
 | 机器学习优化 `optimizer/`（search_space / bayesian_opt / walk_forward） | ✅ 已完成 |
 | 项目主入口 `main.py`（--data smoke / real） | ✅ 已完成 |
-| 单元测试 `tests/` | ✅ 225 项通过 |
+| 单元测试 `tests/` | 本次指定五个文件的结果见 `debug/factor_exposure_todo.md` 交付记录 |
 | 旧策略壳 `strategy/`（base / position / sentiment / state_machine） | 🗑️ 已删除（空壳死代码，由 signals.py 与 risk_control 取代） |
-| Brinson 基准归因 | 🚧 规划中（当前为因子暴露分解，需基准收益） |
+| Brinson 基准归因 | 🚧 规划中（当前为入场分数盈亏分摊与策略分数暴露，需另行定义基准和模型） |
 
 ## Git 仓库注意事项
 

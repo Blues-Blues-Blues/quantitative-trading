@@ -22,6 +22,7 @@ data/parquet/
 data/strategy/
 data/logs/
 analytics/pictures/
+analytics/reports/
 
 # 真实高频/日频数据（大体积，严禁入库）
 data/data1/

@@ -22,6 +22,8 @@ from test_optimizer import TRADE_PARAMS, bull_slice  # noqa: E402
 
 from analytics.attribution import AttributionEngine  # noqa: E402
 from analytics.metrics import closed_trades  # noqa: E402
+from analytics.metrics import match_trade_batches
+from analytics.attribution import _as_signals_frame
 from analytics.performance import PerformanceAnalyzer  # noqa: E402
 from analytics.real_time_stream import (  # noqa: E402
     REQUIRED_FIELDS, StreamLogger, to_stream_frame,
@@ -46,7 +48,8 @@ def pipeline():
     opt = StrategyOptimizer(data=ds, symbol_to_industry=_MAPPING,
                             account_kwargs={"initial_cash": 1e8})
     _, engine = opt.backtest(ds, TRADE_PARAMS)
-    return engine.equity_curve, engine.trade_log
+    assert engine.snapshot_sink is None  # 固定参数单点回测不启用报告，不调用 optimize。
+    return engine.equity_curve, engine.trade_log, engine.generated_signals
 
 
 # ----------------------------------------------------------------------
@@ -119,7 +122,7 @@ def _curve(equity: list, days=("2024-01-02", "2024-01-03", "2024-01-04")):
 class TestPerformanceAnalyzer:
 
     def test_analyze_end_to_end(self, pipeline):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         m = PerformanceAnalyzer.analyze(curve, log)
         assert m["n_trades"] >= 1
         assert 0.0 <= m["win_rate"] <= 1.0
@@ -144,7 +147,7 @@ class TestPerformanceAnalyzer:
         assert np.isposinf(PerformanceAnalyzer.analyze(curve, pd.DataFrame())["sortino"])
 
     def test_avg_holding_period(self, pipeline):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         m = PerformanceAnalyzer.analyze(curve, log)
         assert np.isfinite(m["avg_holding_minutes"]) and m["avg_holding_minutes"] >= 0
 
@@ -183,21 +186,9 @@ class TestPerformanceAnalyzer:
 
 class TestAttributionEngine:
 
-    @staticmethod
-    def _signals_for(trades):
-        rows = []
-        for i, t in enumerate(trades):
-            rows.append({"timestamp": t["entry_ts"], "symbol": t["symbol"],
-                         "action": "BUY", "state": "S_push",
-                         "global_mod": [0.7, 0.1, 0.5][i % 3],
-                         "chain_mod": [0.2, 0.8, 0.3][i % 3],
-                         "agent_ms": [0.5, 0.4, 0.2][i % 3]})
-        return pd.DataFrame(rows)
-
     def test_attribute_conserves_pnl(self, pipeline):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         trades = closed_trades(log)
-        sig = self._signals_for(trades)
         trades_df, summary = AttributionEngine.attribute(log, sig)
         assert len(trades_df) == len(trades)
         # 盈亏守恒：逐笔拆解之和 = 归因合计 = 总盈亏
@@ -213,7 +204,7 @@ class TestAttributionEngine:
                            + p["pnl_agent_ms"], p["pnl"])
 
     def test_attribute_no_signals_other(self, pipeline):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         _, summary = AttributionEngine.attribute(log, pd.DataFrame())
         other = summary[summary["factor"] == "other"].iloc[0]
         assert other["n_trades"] == len(closed_trades(log))
@@ -237,9 +228,9 @@ class TestAttributionEngine:
         assert np.isfinite(row["ic_mean"]) or np.isfinite(row["ic_ir"])
 
     def test_plot_attribution(self, pipeline, tmp_path):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         _, summary = AttributionEngine.attribute(
-            log, self._signals_for(closed_trades(log)))
+            log, sig)
         path = AttributionEngine.plot_attribution(
             summary, str(tmp_path / "attr.png"))
         assert os.path.exists(path)
@@ -259,7 +250,7 @@ class TestAttributionEngine:
 class TestReviewExport:
 
     def test_export_xlsx(self, pipeline, tmp_path):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         path = PerformanceAnalyzer.export_review_slices(
             bull_slice(), log, days=20, path=str(tmp_path / "review.xlsx"))
         assert os.path.exists(path)
@@ -271,17 +262,17 @@ class TestReviewExport:
         assert ws.cell(1, 2).value == "symbol"
 
     def test_export_csv(self, pipeline, tmp_path):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         out = PerformanceAnalyzer.export_review_slices(
             bull_slice(), log, fmt="csv", path=str(tmp_path / "review_csv"))
         for name in ("summary", "daily_slices", "tick_flows"):
             assert os.path.exists(os.path.join(out, f"{name}.csv"))
 
     def test_plot_report(self, pipeline, tmp_path):
-        curve, log = pipeline
+        curve, log, sig = pipeline
         trades = closed_trades(log)
         _, summary = AttributionEngine.attribute(
-            log, TestAttributionEngine._signals_for(trades))
+            log, sig)
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots()
         PerformanceAnalyzer.sensitivity_heatmap(
@@ -324,3 +315,201 @@ def _mk_ic_data(n_symbols=1, days=4):
     kline = pd.DataFrame(krows).set_index("ts")
     features = pd.DataFrame(frows).set_index("ts")
     return kline, features
+
+
+# 固定账本对应任务书 C2/C3；真实 Signal 与下一分钟成交通过 ID 关联。
+def allocation_ledger(fees=True):
+    dates = pd.to_datetime(["2024-01-02 10:01", "2024-01-03 10:01",
+                            "2024-01-04 10:01", "2024-01-05 10:01"])
+    quantities = [200, 100, 150, 150] if fees else [100, 100, 100, 100]
+    prices = [10, 20, 16, 14]
+    rows = []
+    for i, (ts, qty, price) in enumerate(zip(dates, quantities, prices)):
+        rows.append(dict(ts=ts, symbol="A", side=["BUY", "ADD", "SELL", "SELL"][i],
+                         price=price, shares=qty, amount=price * qty,
+                         commission=5 if fees else 0,
+                         stamp_duty=([0, 0, .5, 1][i] if fees else 0),
+                         transfer_fee=([1, 1, .5, 1][i] if fees else 0),
+                         fill_id=f"f{i}", signal_id=f"s{i}", event_seq=i+1,
+                         decision_ts=ts - pd.Timedelta(minutes=1)))
+    signals = [Signal("A", dates[i] - pd.Timedelta(minutes=1), ["BUY", "ADD"][i],
+                      "S_push", dict(zip(["global_mod", "chain_mod", "agent_ms"], values)),
+                      signal_id=f"s{i}")
+               for i, values in enumerate([(-.5, .3, .2), (.2, .5, .3)])]
+    return pd.DataFrame(rows), signals
+
+
+class TestAllocationContract:
+    def test_c2_average_cost_not_fifo_cost(self):
+        log, signals = allocation_ledger(False)
+        log = log.iloc[:3]
+        trades, summary = AttributionEngine.attribute(log, signals)
+        batches = match_trade_batches(log)
+        assert trades.pnl.tolist() == pytest.approx([100], abs=1e-6)
+        assert batches.buy_fill_id.tolist() == ["f0"]
+        assert batches.allocated_pnl.tolist() == pytest.approx([100], abs=1e-6)
+        assert summary.pnl.sum() == pytest.approx(100, abs=1e-6)
+
+    def test_c3_fees_partial_sells_and_source_weights(self):
+        log, signals = allocation_ledger()
+        trades, summary = AttributionEngine.attribute(log, signals)
+        batches = AttributionEngine.attribute_batches(log, signals)
+        assert len(trades) == len(closed_trades(log)) == 2
+        assert len(batches) == 3
+        assert trades.pnl.tolist() == pytest.approx([388, 87], abs=1e-6)
+        assert batches.allocated_pnl.tolist() == pytest.approx([388, 29, 58], abs=1e-6)
+        assert batches.matched_shares.tolist() == [150, 50, 100]
+        assert summary.pnl.tolist() == pytest.approx([220.1, 154.1, 100.8, 0], abs=1e-6)
+        assert summary.n_trades.sum() == 2
+        assert trades.factor.tolist() == ["global_mod", "chain_mod"]
+        assert batches.iloc[0].entry_global_mod == -.5
+        assert batches.iloc[0].weight_global_mod == pytest.approx(.5, abs=1e-12)
+        quality = AttributionEngine.quality_report(log, signals, batches)
+        assert quality["status"] == "complete"
+        assert quality["matched_buy_fill_rate"] == quality["attributed_sold_share_rate"] == 1
+        assert quality["remaining_open_shares"] == 0
+        assert abs(quality["conservation_error"]) <= 1e-6
+        # 字段位置无关，不能再以 row[0]/row[6] 提取。
+        assert closed_trades(log[log.columns[::-1]]) == closed_trades(log)
+
+    def test_t01_normalization_equivalence_and_no_mutation(self):
+        import copy
+        log, signals = allocation_ledger()
+        original = copy.deepcopy(signals)
+        nested = pd.DataFrame([s.to_dict() for s in signals])
+        original_nested = nested.copy(deep=True)
+        flat = nested.drop(columns="metrics").join(pd.DataFrame([s.metrics for s in signals]))
+        expected = AttributionEngine.attribute_batches(log, signals)
+        for value in [nested, flat]:
+            pd.testing.assert_frame_equal(expected, AttributionEngine.attribute_batches(log, value))
+        pd.testing.assert_frame_equal(nested, original_nested)
+        assert signals == original
+        assert all(_as_signals_frame(nested)[f].dtype == "float64" for f in ["global_mod", "chain_mod", "agent_ms"])
+
+    def test_conflicting_columns_and_duplicate_ids(self):
+        log, signals = allocation_ledger()
+        nested = pd.DataFrame([s.to_dict() for s in signals])
+        nested["global_mod"] = 100.0
+        with pytest.raises(ValueError, match="冲突"):
+            AttributionEngine.attribute(log, nested)
+        with pytest.raises(ValueError, match="signal_id"):
+            AttributionEngine.attribute(log, signals + [signals[0]])
+        log.loc[1, "fill_id"] = log.loc[0, "fill_id"]
+        with pytest.raises(ValueError, match="fill_id"):
+            AttributionEngine.attribute(log, signals)
+
+    @pytest.mark.parametrize("field,value", [("symbol", "B"), ("action", "SELL"),
+                                             ("timestamp", pd.Timestamp("2024-01-02 10:01"))])
+    def test_source_conflicts_raise(self, field, value):
+        log, signals = allocation_ledger()
+        setattr(signals[0], field, value)
+        with pytest.raises(ValueError, match="矛盾"):
+            AttributionEngine.attribute(log, signals)
+
+    @pytest.mark.parametrize("value,reason", [
+        (None, "missing_factor"), (np.nan, "missing_factor"),
+        ("bad", "non_numeric_factor"), (np.inf, "non_finite_factor"),
+        (-np.inf, "non_finite_factor")])
+    def test_bad_factors_are_auditable(self, value, reason):
+        log, signals = allocation_ledger()
+        signals[0].metrics["chain_mod"] = value
+        batches = AttributionEngine.attribute_batches(log, signals)
+        assert batches.iloc[0].other_reason == reason
+        assert batches.iloc[0].pnl_other == pytest.approx(388)
+        assert batches.iloc[0].weight_other == 1
+        assert batches.iloc[0].pnl_global_mod == 0
+        assert AttributionEngine.quality_report(log, signals, batches)["status"] == "partial"
+
+    def test_reason_priority_zero_and_legacy(self):
+        log, signals = allocation_ledger()
+        signals[0].metrics = {"global_mod": "bad", "chain_mod": np.inf}
+        signals[1].metrics = dict(global_mod=0, chain_mod=0, agent_ms=0)
+        batches = AttributionEngine.attribute_batches(log, signals)
+        assert batches.other_reason.tolist() == ["missing_factor", "missing_factor", "zero_factors"]
+        legacy = log.drop(columns=["signal_id", "fill_id", "decision_ts", "event_seq"])
+        old = AttributionEngine.attribute_batches(legacy, signals)
+        assert set(old.other_reason) == {"unmatched_signal"}
+        assert old.buy_fill_id.str.startswith("legacy_fill_").all()
+        assert old.pnl_other.sum() == pytest.approx(475)
+
+    def test_abs_pnl_coverage_when_profits_cancel(self):
+        log, signals = allocation_ledger(False)
+        signals[1].metrics = {}
+        batches = AttributionEngine.attribute_batches(log, signals)
+        quality = AttributionEngine.quality_report(log, signals, batches)
+        assert quality["total_realized_pnl"] == 0
+        assert quality["attributed_abs_pnl_rate"] == .5
+        assert quality["attributed_sold_share_rate"] == .5
+        assert AttributionEngine.attribute(log, signals)[1].weight.isna().all()
+
+    @pytest.mark.parametrize("shares", [-1, 301, 1.5])
+    def test_invalid_quantities_raise(self, shares):
+        log, signals = allocation_ledger()
+        log["shares"] = log.shares.astype(float)
+        log.loc[2, "shares"] = shares
+        with pytest.raises(ValueError):
+            match_trade_batches(log)
+
+    def test_same_timestamp_legacy_preserves_input_order(self):
+        log, _ = allocation_ledger(False)
+        log = log.iloc[:3].drop(columns=["event_seq", "fill_id", "signal_id", "decision_ts"])
+        log["ts"] = log.iloc[0].ts
+        assert closed_trades(log)[0]["pnl"] == 100
+
+    def test_multiple_buy_fills_share_signal_but_not_fill(self):
+        log, signals = allocation_ledger()
+        log.loc[1, ["signal_id", "decision_ts"]] = ["s0", signals[0].timestamp]
+        batches = AttributionEngine.attribute_batches(log, signals)
+        assert set(batches.buy_signal_id) == {"s0"}
+        assert set(batches.buy_fill_id) == {"f0", "f1"}
+        assert batches.pnl_global_mod.sum() == pytest.approx(475 * .5)
+
+    def test_valid_nested_value_and_shanghai_timezone(self):
+        log, signals = allocation_ledger()
+        nested = pd.DataFrame([s.to_dict() for s in signals])
+        nested["global_mod"] = np.nan
+        nested["timestamp"] = nested.timestamp.dt.tz_localize("Asia/Shanghai").dt.tz_convert("UTC")
+        pd.testing.assert_frame_equal(AttributionEngine.attribute_batches(log, signals),
+                                      AttributionEngine.attribute_batches(log, nested))
+
+    def test_zero_realized_pnl_has_null_absolute_coverage(self):
+        log, signals = allocation_ledger(False)
+        log = log.iloc[:3].copy()
+        log.loc[2, "amount"] = 1500
+        batches = AttributionEngine.attribute_batches(log, signals)
+        quality = AttributionEngine.quality_report(log, signals, batches)
+        assert quality["total_realized_pnl"] == 0
+        assert quality["attributed_abs_pnl_rate"] is None
+        assert quality["attributed_sold_share_rate"] == 1
+        assert quality["status"] == "complete"
+
+    def test_mixed_valid_and_other_batches_preserve_sell_count(self):
+        log, signals = allocation_ledger()
+        signals[1].metrics = {}
+        trades, summary = AttributionEngine.attribute(log, signals)
+        assert len(trades) == 2
+        assert trades.factor.tolist() == ["global_mod", "other"]
+        assert np.isnan(trades.iloc[1].entry_global_mod)
+        other = summary[summary.factor.eq("other")].iloc[0]
+        assert other.pnl == pytest.approx(58)
+        assert other.n_trades == 1
+        assert summary.pnl.sum() == pytest.approx(475)
+
+    def test_empty_input_schema(self):
+        from analytics.attribution import SIGNAL_COLUMNS, ATTR_BATCH_COLUMNS, TRADE_COLUMNS
+        assert set(SIGNAL_COLUMNS) <= set(_as_signals_frame([]))
+        trades, summary = AttributionEngine.attribute(pd.DataFrame(), [])
+        batches = AttributionEngine.attribute_batches(pd.DataFrame(), [])
+        assert list(trades) == TRADE_COLUMNS and list(batches) == ATTR_BATCH_COLUMNS
+        assert summary.factor.tolist() == ["Global_Mod", "Chain_Mod", "Agent_MS", "other"]
+
+    def test_finite_large_scores_do_not_overflow_weights(self):
+        log, signals = allocation_ledger()
+        signals[0].metrics = dict(global_mod=-1e308, chain_mod=1e308, agent_ms=0)
+        batches = AttributionEngine.attribute_batches(log, signals)
+        row = batches.iloc[0]
+        assert row.weight_global_mod == pytest.approx(.5, abs=1e-12)
+        assert row.weight_chain_mod == pytest.approx(.5, abs=1e-12)
+        assert row.pnl_global_mod == pytest.approx(194, abs=1e-6)
+        trades, _ = AttributionEngine.attribute(log, signals)
+        assert trades.iloc[0].entry_global_mod == -1e308

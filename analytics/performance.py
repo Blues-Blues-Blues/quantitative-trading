@@ -65,7 +65,9 @@ class PerformanceAnalyzer:
     def plot_report(equity_curve: pd.DataFrame, trade_log: pd.DataFrame,
                     attribution_summary: Optional[pd.DataFrame] = None,
                     study: Optional[object] = None,
-                    path: str = "analytics/pictures/dashboard.png") -> str:
+                    path: str = "analytics/pictures/dashboard.png",
+                    attribution_quality: Optional[dict] = None,
+                    exposure_daily: Optional[pd.DataFrame] = None) -> str:
         """四子图 Dashboard：净值回撤 / 动态仓位 / 归因柱状图 / 参数敏感度热力图。"""
         fig, axes = plt.subplots(2, 2, figsize=(16, 11))
         # 1) 净值 + 回撤
@@ -73,13 +75,13 @@ class PerformanceAnalyzer:
         s = _equity_series(equity_curve)
         ax.plot(s.index, s.values, color="#1f77b4", linewidth=1.0)
         ax.set_ylabel("total equity")
-        ax.set_title("Equity curve & drawdown")
+        ax.set_title("Daily-close equity & drawdown" if exposure_daily is not None else "Equity curve & drawdown")
         peak = s.cummax()
         dd = (peak - s) / peak * 100
         ax2 = ax.twinx()
         ax2.fill_between(dd.index, dd.values, 0, color="#d62728", alpha=0.35)
         ax2.set_ylabel("drawdown (%)")
-        ax2.set_ylim(bottom=dd.max() * 1.1 if len(dd) else 1)
+        ax2.set_ylim(bottom=max(float(dd.max()) * 1.1, 1e-6) if len(dd) else 1, top=0)
 
         # 2) 动态仓位
         ax = axes[0, 1]
@@ -88,7 +90,11 @@ class PerformanceAnalyzer:
 
         # 3) 归因柱状图
         ax = axes[1, 0]
-        if attribution_summary is not None and not attribution_summary.empty:
+        if ((attribution_quality and attribution_quality["status"] == "no_closed_trades")
+                or (attribution_summary is not None and "n_trades" in attribution_summary
+                    and attribution_summary.n_trades.sum() == 0)):
+            ax.text(0.5, 0.5, "No closed trades / no realized PnL", ha="center", transform=ax.transAxes)
+        elif attribution_summary is not None and not attribution_summary.empty:
             s2 = attribution_summary.set_index("factor")["pnl"]
             colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#999999"]
             bars = ax.bar(s2.index, s2.values, color=colors[:len(s2)],
@@ -103,11 +109,20 @@ class PerformanceAnalyzer:
             ax.text(0.5, 0.5, "no attribution data", ha="center",
                     va="center", transform=ax.transAxes)
         ax.set_ylabel("attributed PnL (CNY)")
-        ax.set_title("Attribution by factor exposure")
+        title = "Realized PnL / absolute entry-score allocation"
+        if attribution_quality:
+            coverage = attribution_quality["attributed_sold_share_rate"]
+            title += f"\n{attribution_quality['status']} | sold-share coverage: " + (f"{coverage:.1%}" if coverage is not None else "N/A")
+        ax.set_title(title)
 
         # 4) 参数敏感度热力图
         ax = axes[1, 1]
-        if study is not None:
+        if exposure_daily is not None:
+            for factor, group in exposure_daily.groupby("factor", sort=False):
+                ax.plot(group.ts, group.exposure, marker=".", label=factor)
+            ax.set_title("Daily close signed score exposure (gaps = missing)")
+            ax.legend()
+        elif study is not None:
             PerformanceAnalyzer.sensitivity_heatmap(study, ax=ax)
         else:
             ax.text(0.5, 0.5, "no optimization history", ha="center",
@@ -115,6 +130,13 @@ class PerformanceAnalyzer:
             ax.set_title("Parameter sensitivity")
 
         fig.suptitle("Strategy performance dashboard", fontsize=14)
+        # 日末摘要使用简短日期，避免长区间横坐标标签互相覆盖。
+        if exposure_daily is not None:
+            import matplotlib.dates as mdates
+            for dated_ax in (axes[0, 0], axes[0, 1], axes[1, 1]):
+                locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
+                dated_ax.xaxis.set_major_locator(locator)
+                dated_ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         fig.tight_layout(rect=(0, 0, 1, 0.97))
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)

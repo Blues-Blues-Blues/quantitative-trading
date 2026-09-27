@@ -340,7 +340,8 @@ def _tick(t0: float, label: str) -> float:
 
 def run_pipeline(ds: DataSlice, params: Dict[str, object],
                  symbol_to_industry: Dict[str, str], label: str,
-                 rank_gate=None) -> None:
+                 rank_gate=None, analysis_report: bool = True,
+                 report_dir: str = "analytics/reports") -> None:
     """全链路主流程（数据 → 特征 → 状态机 → 回测 → 绩效 → 绘图 → 检查）。"""
     logger.info("=" * 78)
     logger.info("%s全链路启动：%d 只股票（%s）", label, len(ds.symbols()),
@@ -416,15 +417,43 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
     t0 = _tick(t0, "信号评估表准备")
 
     # ---- 环节 4：回测撮合引擎 ----
-    engine = BacktestEngine(
-        Account(initial_cash=INITIAL_CASH),
-        ExecutionCost(),
-        PositionSizer(),
-        ds,
-        deadzone_th=float(params.get("deadzone_th", 0.05)),
-        state_machine=sm, features=features,
-    )
-    trade_log, equity_curve = engine.run()
+    from contextlib import nullcontext
+    account, cost, sizer = Account(initial_cash=INITIAL_CASH), ExecutionCost(), PositionSizer()
+    writer = None
+    if analysis_report:
+        import hashlib
+        import json
+        from analytics.reporting import AnalysisReportWriter
+        axis = ds.time_axis()
+        cache_path = fe.cache_path(ds)
+        mapping_json = json.dumps(symbol_to_industry, ensure_ascii=False, sort_keys=True)
+        requested = ds.meta.get("symbols")
+        requested = requested if isinstance(requested, list) and all(isinstance(s, str) and s for s in requested) else []
+        report_symbols = list(dict.fromkeys(requested + ds.symbols()))
+        writer = AnalysisReportWriter(
+            report_dir, mode="smoke" if ds.meta.get("smoke") else "real",
+            start=f"{axis.min():%Y-%m-%d}", end=f"{axis.max():%Y-%m-%d}", symbols=report_symbols,
+            metadata=dict(strategy_parameters=dict(requested=params, resolved=vars(syn)),
+                          execution_parameters=dict(cost=vars(cost), sizer=vars(sizer),
+                              deadzone_th=float(params.get("deadzone_th", 0.05)),
+                              max_leverage=account.max_leverage, max_single_position=account.max_single_position),
+                          initial_cash=INITIAL_CASH,
+                          volume_unit="股",
+                          industry_mapping_summary=dict(n_symbols=len(symbol_to_industry),
+                              sha256=hashlib.sha256(mapping_json.encode("utf-8")).hexdigest(),
+                              industries=dict(Counter(symbol_to_industry.values()))),
+                          data_source=ds.meta,
+                          data_fingerprint=(dict(kind="file_stat_manifest_cache_key", value=cache_path.name,
+                                                 content_hash_verified=False)
+                                            if cache_path is not None else "unavailable")))
+    with writer if writer is not None else nullcontext():
+        engine = BacktestEngine(account, cost, sizer, ds,
+            deadzone_th=float(params.get("deadzone_th", 0.05)),
+            state_machine=sm, features=features,
+            snapshot_sink=writer.snapshot if writer is not None else None)
+        trade_log, equity_curve = engine.run()
+        if writer is not None:
+            writer.finalize(trade_log, engine.generated_signals, equity_curve, kline=ds.kline)
     signals = engine.generated_signals
     act_cnt = Counter(s.action for s in signals)
     logger.info("状态机输出：%d 个信号 → %s", len(signals),
@@ -472,13 +501,14 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
     logger.info("可视化输出：%s", ", ".join(chart_paths))
 
 
-def run_smoke() -> None:
+def run_smoke(analysis_report: bool = True, report_dir: str = "analytics/reports") -> None:
     """冒烟模式：内置 Mock 数据跑通全链路。"""
     run_pipeline(build_smoke_slice(), SMOKE_PARAMS,
-                 SYMBOL_TO_INDUSTRY, "冒烟测试")
+                 SYMBOL_TO_INDUSTRY, "冒烟测试",
+                 analysis_report=analysis_report, report_dir=report_dir)
 
 
-def run_real() -> None:
+def run_real(analysis_report: bool = True, report_dir: str = "analytics/reports") -> None:
     """真实数据模式：data1（万得 L2）+ data2（日频 CSV）→ 全链路回测。
 
     回测标的由 REAL_SYMBOLS 指定（空列表 = 全部标的）。
@@ -510,7 +540,8 @@ def run_real() -> None:
                 100 * ds.meta.get("st_coverage", 0.0),
                 100 * ds.meta.get("float_cap_coverage", 0.0))
     run_pipeline(ds, REAL_PARAMS, loader.symbol_to_industry, "真实数据",
-                 rank_gate=_build_rank_gate(REAL_PARAMS))
+                 rank_gate=_build_rank_gate(REAL_PARAMS),
+                 analysis_report=analysis_report, report_dir=report_dir)
 
 
 def _build_rank_gate(params: Dict[str, object]):
@@ -731,6 +762,8 @@ if __name__ == "__main__":
                     help="真实数据横截面因子有效性分析（IC/IC_IR/Q1~Q5 分层）")
     ap.add_argument("--ic-start", default=REAL_START, help="IC 分析起始日")
     ap.add_argument("--ic-end", default=REAL_END, help="IC 分析结束日")
+    ap.add_argument("--no-analysis-report", action="store_true", help="关闭 HTML、归因与收盘暴露报告")
+    ap.add_argument("--report-dir", default="analytics/reports", help="报告根目录（相对路径以项目根目录解析）")
     args = ap.parse_args()
     # 统一日志目录（data/logs 已在 .gitignore 排除）：控制台 + 追加写入 run.log，
     # 目录不存在自动创建；日志格式与内容与原来一致。
@@ -748,6 +781,6 @@ if __name__ == "__main__":
         if args.analyze_ic:
             run_ic_flow(args.ic_start, args.ic_end)
         else:
-            run_real()
+            run_real(not args.no_analysis_report, args.report_dir)
     else:
-        run_smoke()
+        run_smoke(not args.no_analysis_report, args.report_dir)

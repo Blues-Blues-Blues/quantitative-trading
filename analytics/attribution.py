@@ -1,6 +1,6 @@
-"""收益归因分析：因子暴露分解 + 因子 IC / Rank IC / IR 时序。
+"""按入场分数绝对值分摊已实现盈亏，以及因子 IC / Rank IC / IR。
 
-因子暴露分解（归因）：
+描述性盈亏分摊（不代表因果贡献或统计因子收益）：
     把每笔已实现盈亏按「入场时点」的因子绝对暴露占比拆解到三大来源：
         Global_Mod（宏观共振）、Chain_Mod（行业共振）、Agent_MS（个股情绪/盘口）
     例如：一笔 +1000 元的交易，入场时 |Global|=0.73、|Chain|=0.3、|Agent|=0.58，
@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from analytics.metrics import closed_trades
+from analytics.metrics import (_local_time, _prepare_trade_log, _match_trade_batches, BATCH_COLUMNS)
 
 # 归因因子：metrics 快照键 → 展示名
 ATTRIBUTION_FACTORS: List[str] = ["global_mod", "chain_mod", "agent_ms"]
@@ -35,12 +35,152 @@ DEFAULT_IC_FACTORS: List[str] = [
 ]
 
 
+OTHER_REASONS = ["unmatched_signal", "missing_factor", "non_numeric_factor",
+                 "non_finite_factor", "zero_factors"]
+SIGNAL_COLUMNS = ["signal_id", "timestamp", "decision_ts", "symbol", "action"] + ATTRIBUTION_FACTORS
+ENTRY_COLUMNS = [f"entry_{f}" for f in ATTRIBUTION_FACTORS]
+WEIGHT_COLUMNS = [f"weight_{f}" for f in ATTRIBUTION_FACTORS + ["other"]]
+PNL_COLUMNS = [f"pnl_{f}" for f in ATTRIBUTION_FACTORS + ["other"]]
+ATTR_BATCH_COLUMNS = BATCH_COLUMNS + ENTRY_COLUMNS + WEIGHT_COLUMNS + PNL_COLUMNS + ["other_reason"]
+TRADE_COLUMNS = ["symbol", "entry_ts", "exit_ts", "shares", "entry_price", "proceeds",
+                 "pnl", "sell_fill_id", "factor"] + ENTRY_COLUMNS + PNL_COLUMNS
+
+
+def _factor_value(value):
+    """区分缺失、非法字符串和非有限值，保留审计原因。"""
+    if value is None or value is pd.NA:
+        return np.nan, "missing_factor"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return np.nan, "non_numeric_factor"
+    if np.isnan(numeric):
+        return np.nan, "missing_factor"
+    if not np.isfinite(numeric):
+        return np.nan, "non_finite_factor"
+    return numeric, ""
+
+
 def _as_signals_frame(signals: object) -> pd.DataFrame:
-    """Signal 列表或 DataFrame → 标准信号表（timestamp/symbol/action/state + 指标列）。"""
-    if isinstance(signals, pd.DataFrame):
-        return signals
-    from strategy.signals import TradingStateMachine
-    return TradingStateMachine.to_frame(signals)
+    """规范化嵌套/展开信号，不修改调用方；有效同名因子矛盾和重复 ID 均报错。"""
+    frame = signals.copy(deep=True) if isinstance(signals, pd.DataFrame) else pd.DataFrame(
+        [s.to_dict() for s in (signals if signals is not None else [])])
+    rows = []
+    for row in frame.to_dict("records"):
+        sid = row.get("signal_id")
+        if sid is not None and pd.isna(sid):
+            sid = None
+        if sid == "":
+            sid = None
+        if sid is not None and not isinstance(sid, str):
+            raise ValueError("signal_id 必须为字符串")
+        ts = _local_time(row.get("timestamp"))
+        decision = _local_time(row.get("decision_ts", ts))
+        if pd.isna(ts) or pd.isna(decision) or ts != decision:
+            raise ValueError("timestamp 与 decision_ts 必须相同且非空")
+        out = dict(signal_id=sid, timestamp=ts, decision_ts=decision,
+                   symbol=str(row["symbol"]), action=row["action"])
+        nested = row.get("metrics")
+        nested = nested if isinstance(nested, dict) else {}
+        reasons = []
+        for factor in ATTRIBUTION_FACTORS:
+            candidates = [_factor_value(d[factor]) for d in (row, nested) if factor in d]
+            valid = [v for v, reason in candidates if not reason]
+            if len(valid) == 2 and abs(valid[0] - valid[1]) > 1e-12:
+                raise ValueError(f"顶层与 metrics 因子冲突: {factor}")
+            reason = "" if valid else next((r for r in OTHER_REASONS
+                if any(error == r for _, error in candidates)), "missing_factor")
+            out[factor] = valid[0] if valid else np.nan
+            out[f"reason_{factor}"] = reason
+            reasons.append(reason)
+        out["factor_reason"] = next((r for r in OTHER_REASONS if r in reasons), "")
+        if not out["factor_reason"] and sum(abs(out[f]) for f in ATTRIBUTION_FACTORS) <= 1e-12:
+            out["factor_reason"] = "zero_factors"
+        rows.append(out)
+    result = pd.DataFrame(rows, columns=SIGNAL_COLUMNS + [f"reason_{f}" for f in ATTRIBUTION_FACTORS] + ["factor_reason"])
+    result["signal_id"] = pd.Series([row["signal_id"] for row in rows], dtype=object)
+    for f in ATTRIBUTION_FACTORS:
+        result[f] = result[f].astype("float64")
+    if result.signal_id.dropna().duplicated().any():
+        raise ValueError("重复 signal_id")
+    return result
+
+
+def _buy_sources(frame, signals):
+    """只按 ID 关联实际 BUY/ADD 成交；匹配成功后再核对股票、动作与决策时刻。"""
+    lookup = {r["signal_id"]: r for r in signals.to_dict("records") if r["signal_id"] is not None}
+    sources = {}
+    buys = frame[frame.shares.gt(0) & frame.side.isin(["BUY", "ADD"])]
+    for buy in buys.to_dict("records"):
+        source = lookup.get(buy["signal_id"])
+        if source is not None:
+            if (source["symbol"] != buy["symbol"] or source["action"] not in ("BUY", "ADD")
+                    or pd.isna(buy["decision_ts"]) or source["decision_ts"] != buy["decision_ts"]
+                    or source["decision_ts"] >= buy["ts"]):
+                raise ValueError(f"成交与来源信号矛盾: {buy['fill_id']}")
+        sources[buy["fill_id"]] = source
+    return sources
+
+
+def _analyze(trade_log, signals):
+    """一次账本配对后生成逐批次、逐 SELL 和质量结果，供报告层复用。"""
+    trades, matched, remaining = _match_trade_batches(trade_log)
+    frame = _prepare_trade_log(trade_log)
+    sources = _buy_sources(frame, _as_signals_frame(signals))
+    batches = []
+    for row in matched.to_dict("records"):
+        source = sources.get(row["buy_fill_id"])
+        reason = "unmatched_signal" if source is None else source["factor_reason"]
+        values = [source[f] if source is not None else np.nan for f in ATTRIBUTION_FACTORS]
+        weights = [0.0, 0.0, 0.0, 1.0]
+        pnls = [0.0, 0.0, 0.0, row["allocated_pnl"]]
+        if not reason:
+            weights = list(_exposure_weights(dict(zip(ATTRIBUTION_FACTORS, values)))) + [0.0]
+            pnls = [row["allocated_pnl"] * w for w in weights]
+            pnls[2] = row["allocated_pnl"] - pnls[0] - pnls[1]
+        row.update(zip(ENTRY_COLUMNS, values))
+        row.update(zip(WEIGHT_COLUMNS, weights))
+        row.update(zip(PNL_COLUMNS, pnls))
+        row["other_reason"] = reason
+        batches.append(row)
+    batches = pd.DataFrame(batches, columns=ATTR_BATCH_COLUMNS)
+    rows = []
+    by_sell = {key: group for key, group in batches.groupby("sell_fill_id", sort=False)}
+    for trade in trades:
+        group = by_sell[trade["sell_fill_id"]]
+        row = dict(trade)
+        for f in ENTRY_COLUMNS:
+            row[f] = (float((group[f] * (group.matched_shares / trade["shares"])).sum())
+                      if group[f].notna().all() else np.nan)
+        for f in PNL_COLUMNS:
+            row[f] = float(group[f].sum())
+        weighted = [(group[f] * group.matched_shares).sum() for f in WEIGHT_COLUMNS]
+        row["factor"] = (ATTRIBUTION_FACTORS + ["other"])[int(np.argmax(weighted))]
+        if abs(sum(row[f] for f in PNL_COLUMNS) - row["pnl"]) > 1e-6:
+            raise ValueError("逐 SELL 归因不守恒")
+        rows.append(row)
+    trades_df = pd.DataFrame(rows, columns=TRADE_COLUMNS)
+    summary = _summarize_attribution(trades_df)
+    total = float(trades_df.pnl.sum())
+    error = float(summary.pnl.sum() - total)
+    if abs(error) > 1e-6:
+        raise ValueError("总归因不守恒")
+    good = batches.other_reason.eq("")
+    shares = int(batches.matched_shares.sum())
+    abs_pnl = float(batches.allocated_pnl.abs().sum())
+    reasons = {reason: dict(rows=int((batches.other_reason == reason).sum()),
+                           shares=int(batches.loc[batches.other_reason == reason, "matched_shares"].sum()),
+                           pnl=float(batches.loc[batches.other_reason == reason, "allocated_pnl"].sum()))
+               for reason in OTHER_REASONS}
+    quality = dict(
+        matched_buy_fill_rate=sum(v is not None for v in sources.values()) / len(sources) if sources else None,
+        attributed_sold_share_rate=int(batches.loc[good, "matched_shares"].sum()) / shares if shares else None,
+        attributed_abs_pnl_rate=float(batches.loc[good, "allocated_pnl"].abs().sum()) / abs_pnl if abs_pnl else None,
+        total_realized_pnl=total, factor_pnl={f: float(batches[f"pnl_{f}"].sum()) for f in ATTRIBUTION_FACTORS},
+        other_pnl=float(batches.pnl_other.sum()), other_reasons=reasons,
+        remaining_open_shares=remaining, conservation_error=error,
+        status="no_closed_trades" if not trades else "complete" if good.all() else "partial")
+    return trades_df, summary, batches, quality
 
 
 class AttributionEngine:
@@ -51,61 +191,36 @@ class AttributionEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def attribute(trade_log: pd.DataFrame,
-                  signals: object) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """每笔平仓按入场因子暴露拆解已实现盈亏。
-
-        :return: (trades_df, summary_df)
-            trades_df 列：symbol, entry_ts, exit_ts, pnl, 入场三因子值,
-                          pnl_global_mod, pnl_chain_mod, pnl_agent_ms, factor
-            summary_df 行：Global_Mod / Chain_Mod / Agent_MS / other,
-                           列为 pnl、weight 与 n_trades
-        """
-        trades = closed_trades(trade_log)
-        sig = _as_signals_frame(signals)
-        if not sig.empty:
-            sig["timestamp"] = pd.to_datetime(sig["timestamp"])
-
-        rows: List[Dict[str, object]] = []
-        for t in trades:
-            row: Dict[str, object] = {
-                "symbol": t["symbol"], "entry_ts": t["entry_ts"],
-                "exit_ts": t["exit_ts"], "pnl": t["pnl"],
-                "factor": "other",
-                "entry_global_mod": float("nan"),
-                "entry_chain_mod": float("nan"),
-                "entry_agent_ms": float("nan"),
-            }
-            for f in ATTRIBUTION_FACTORS:
-                row[f"pnl_{f}"] = 0.0
-            if not sig.empty:
-                entry = sig[(sig["timestamp"] == t["entry_ts"])
-                            & (sig["symbol"] == t["symbol"])
-                            & (sig["action"].isin(("BUY", "ADD")))]
-                if not entry.empty:
-                    e = entry.iloc[0]
-                    row["entry_global_mod"] = e.get("global_mod", np.nan)
-                    row["entry_chain_mod"] = e.get("chain_mod", np.nan)
-                    row["entry_agent_ms"] = e.get("agent_ms", np.nan)
-            # 绝对暴露占比分解
-            exps = {f: float(row[f"entry_{f}"]) for f in ATTRIBUTION_FACTORS}
-            weights = _exposure_weights(exps)
-            if weights is None:
-                rows.append(row)
-                continue
-            for factor, w in zip(ATTRIBUTION_FACTORS, weights):
-                row[f"pnl_{factor}"] = t["pnl"] * w
-            row["factor"] = _dominant_factor(exps)
-            rows.append(row)
-
-        trades_df = pd.DataFrame(rows)
-        summary = _summarize_attribution(trades_df)
-        return trades_df, summary
+    def attribute(trade_log: pd.DataFrame, signals: object) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """按入场分数绝对值分摊已实现盈亏；返回每 SELL 一行及四分类汇总。"""
+        trades, summary, _, _ = _analyze(trade_log, signals)
+        return trades, summary
 
     @staticmethod
-    def plot_attribution(summary: pd.DataFrame, path: str) -> str:
+    def attribute_batches(trade_log: pd.DataFrame, signals: object) -> pd.DataFrame:
+        """返回保留来源 ID、带符号原始因子、权重与 other 原因的批次表。"""
+        return _analyze(trade_log, signals)[2]
+
+    @staticmethod
+    def quality_report(trade_log: pd.DataFrame, signals: object, batches_df: pd.DataFrame) -> dict:
+        """重新核对传入批次表属于该账本及信号，返回覆盖率、剩余股数和守恒诊断。"""
+        _, _, expected, quality = _analyze(trade_log, signals)
+        try:
+            pd.testing.assert_frame_equal(expected, batches_df, check_dtype=False, atol=1e-6, rtol=0)
+        except AssertionError as exc:
+            raise ValueError("批次表与账本/信号不一致") from exc
+        return quality
+
+    @staticmethod
+    def plot_attribution(summary: pd.DataFrame, path: str, quality: Optional[dict] = None) -> str:
         """归因柱状图：各因子贡献盈亏（元）。"""
         fig, ax = plt.subplots(figsize=(8, 5))
+        if ((quality and quality["status"] == "no_closed_trades")
+                or ("n_trades" in summary and summary.n_trades.sum() == 0)):
+            ax.text(0.5, 0.5, "No closed trades / no realized PnL", ha="center", transform=ax.transAxes)
+            fig.savefig(path, dpi=120)
+            plt.close(fig)
+            return path
         s = summary.set_index("factor")["pnl"]
         colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#999999"]
         bars = ax.bar(s.index, s.values,
@@ -116,7 +231,11 @@ class AttributionEngine:
                     f"{v:,.0f}", ha="center",
                     va="bottom" if v >= 0 else "top", fontsize=9)
         ax.set_ylabel("attributed PnL (CNY)")
-        ax.set_title("Attribution: profit decomposed by factor exposure")
+        title = "Realized PnL * abs(entry score) / sum(abs(entry scores))"
+        if quality:
+            rate = quality["attributed_sold_share_rate"]
+            title += f"\n{quality['status']} | sold-share coverage: {rate:.1%}"
+        ax.set_title(title)
         ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
         fig.savefig(path, dpi=120)
@@ -209,7 +328,10 @@ def _exposure_weights(exps: Dict[str, float]) -> Optional[Tuple[float, ...]]:
     denom = sum(abs(v) for v in vals)
     if denom <= 1e-12:
         return None
-    return tuple(abs(v) / denom for v in vals)
+    # 等价数值计算，防止有限的大数相加溢出；不改变分摊的绝对值占比口径。
+    scale = max(abs(v) for v in vals)
+    scaled = [abs(v) / scale for v in vals]
+    return tuple(v / sum(scaled) for v in scaled)
 
 
 def _dominant_factor(exps: Dict[str, float]) -> str:
@@ -223,14 +345,8 @@ def _summarize_attribution(trades_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for factor in ATTRIBUTION_FACTORS + ["other"]:
         name = ATTRIBUTION_NAMES.get(factor, "other")
-        if factor == "other":
-            # 无平仓交易时 trades_df 为空（零列），须先短路避免取列 KeyError
-            mask = trades_df["factor"] == "other" if len(trades_df) else None
-            pnl = float(trades_df.loc[mask, "pnl"].sum()) if len(trades_df) else 0.0
-            n = int(mask.sum()) if mask is not None else 0
-        else:
-            pnl = float(trades_df[f"pnl_{factor}"].sum()) if len(trades_df) else 0.0
-            n = int((trades_df["factor"] == factor).sum()) if len(trades_df) else 0
+        pnl = float(trades_df[f"pnl_{factor}"].sum()) if len(trades_df) else 0.0
+        n = int((trades_df["factor"] == factor).sum()) if len(trades_df) else 0
         rows.append({"factor": name, "pnl": pnl,
                      "weight": (pnl / total if total != 0.0 else float("nan")),
                      "n_trades": n})

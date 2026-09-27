@@ -163,12 +163,14 @@ class Signal:
     action: str
     state: str
     metrics: Dict[str, object] = field(default_factory=dict)
+    signal_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, object]:
         """将信号转换为日志与序列化使用的普通字典；保留指标字典以便回溯决策依据。"""
         return {
             "symbol": self.symbol, "timestamp": self.timestamp,
             "action": self.action, "state": self.state, "metrics": self.metrics,
+            "signal_id": self.signal_id, "decision_ts": self.timestamp,
         }
 
 

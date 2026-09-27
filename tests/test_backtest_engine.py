@@ -589,3 +589,78 @@ class TestTargetRebalanceT1:
                        (log["reason"] == "limit_down")].empty
         assert log[(log["reason"] == "t1_deferred_sell")].empty  # 不挂起
         assert "600000" in eng.account.positions
+
+
+class TestExecutionProvenance:
+    def test_next_bar_link_uses_original_signal(self):
+        from analytics.attribution import AttributionEngine
+        axis = pd.to_datetime(["2024-01-02 10:00", "2024-01-02 10:01", "2024-01-02 10:02",
+                               "2024-01-03 10:00", "2024-01-03 10:01"])
+        ds = DataSlice(kline=mk_kline(axis))
+        values = dict(global_mod=-.5, chain_mod=.3, agent_ms=.2, target_weight=.2)
+        signals = [Signal("600000", axis[0], ACT_BUY, "S_push", values),
+                   Signal("600000", axis[1], ACT_ADD, "S_push", dict(values, global_mod=.9)),
+                   Signal("600000", axis[3], ACT_SELL, "S_push")]
+        snapshots = []
+        engine = BacktestEngine(Account(1e8), ExecutionCost(), PositionSizer(), ds, signals,
+                                snapshot_sink=lambda *args: snapshots.append(args))
+        log, _ = engine.run()
+        buy = log[log.side.eq(ACT_BUY)].iloc[0]
+        assert buy.ts == axis[1] and buy.decision_ts == axis[0]
+        assert buy.signal_id == "sig_00000001"
+        assert snapshots[0][1].empty  # 尚未成交的 BUY 不能提前建立暴露
+        assert snapshots[1][1].shares.sum() > 0
+        assert snapshots[-1][1].empty
+        trades, _ = AttributionEngine.attribute(log, engine.generated_signals)
+        assert trades.iloc[0].entry_global_mod == -.5
+        assert all(s.signal_id is None for s in signals)  # 调用方未被修改
+
+    def test_rejection_and_deterministic_external_ids(self):
+        ds, _ = full_env()
+        first, second = pd.Timestamp("2024-01-02 10:00"), pd.Timestamp("2024-01-02 11:00")
+        ds.kline.loc[pd.Timestamp("2024-01-02 10:30"), "open"] = ds.kline.loc[pd.Timestamp("2024-01-02 10:30"), "up_limit"]
+        signals = [Signal("600000", first, ACT_BUY, "S_push", {"target_weight": .2}),
+                   Signal("600000", second, ACT_BUY, "S_push", {"target_weight": .2}, "sig_00000001")]
+        engine, (log, _) = run_backtest(ds, signals)
+        assert [s.signal_id for s in engine.generated_signals] == ["sig_00000002", "sig_00000001"]
+        assert log.iloc[0].reason == "limit_up" and pd.isna(log.iloc[0].fill_id)
+        assert log.iloc[0].signal_id == "sig_00000002"
+        assert log.iloc[1].fill_id == "fill_00000001"
+        assert log.event_seq.tolist() == list(range(1, len(log)+1))
+        assert engine.order_reports[0].decision_ts == first
+        assert engine.order_reports[0].fill_id is None
+        with pytest.raises(ValueError, match="signal_id"):
+            BacktestEngine(Account(1e8), ExecutionCost(), PositionSizer(), ds, [signals[1], signals[1]])
+
+    def test_partial_sell_and_deferred_fill_share_original_source(self):
+        ds, _ = full_env(dates=_D4)
+        signals = [Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY, "S_push", {"target_weight": .2}),
+                   Signal("600000", pd.Timestamp("2024-01-03 09:30"), ACT_ADD, "S_push", {"target_weight": .3}),
+                   Signal("600000", pd.Timestamp("2024-01-03 10:00"), ACT_SELL, "S_push")]
+        engine, (log, _) = run_backtest(ds, signals)
+        sells = log[log.side.eq(ACT_SELL) & log.shares.gt(0)]
+        assert len(sells) == 2
+        assert sells.signal_id.nunique() == 1
+        assert sells.fill_id.nunique() == 2
+        assert (sells.decision_ts == signals[2].timestamp).all()
+        assert sells.iloc[-1].reason == "t1_deferred_sell"
+        assert sells.iloc[-1].ts == pd.Timestamp("2024-01-04 09:30")
+        assert engine.account.positions == {}
+
+    def test_superseding_pending_target_is_auditable(self):
+        ds, _ = full_env()
+        signals = [Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY, "S_push", {"target_weight": .2}),
+                   Signal("600000", pd.Timestamp("2024-01-02 11:00"), ACT_SELL, "S_push"),
+                   Signal("600000", pd.Timestamp("2024-01-02 13:00"), ACT_ADD, "S_push", {"target_weight": .3})]
+        engine, _ = run_backtest(ds, signals)
+        pending = next(r for r in engine.order_reports if r.reason == "t1_lock")
+        assert pending.signal_id == "sig_00000002"
+        assert pending.superseded_by == "sig_00000003"
+        assert pending.cancelled_ts == pd.Timestamp("2024-01-02 13:30")
+
+    def test_default_engine_does_not_construct_snapshots(self, monkeypatch):
+        ds, signals = full_env()
+        monkeypatch.setattr(BacktestEngine, "_send_snapshot", lambda *args: pytest.fail("unexpected snapshot allocation"))
+        engine, _ = run_backtest(ds, signals)
+        assert engine.snapshot_sink is None
+        assert not hasattr(engine, "position_snapshots")

@@ -128,59 +128,125 @@ def return_skew_kurtosis(equity_curve: pd.DataFrame) -> Tuple[float, float]:
 # ----------------------------------------------------------------------
 
 
-def closed_trades(trade_log: pd.DataFrame) -> List[Dict[str, object]]:
-    """FIFO 加权平均成本配对 → 每笔平仓记录（含进出场时间）。
+BATCH_COLUMNS = ["symbol", "sell_fill_id", "buy_fill_id", "buy_signal_id",
+                 "entry_ts", "exit_ts", "matched_shares", "allocated_pnl",
+                 "buy_decision_ts"]
 
-    每笔返回：{symbol, entry_ts, exit_ts, shares, entry_price,
-               proceeds, pnl}
-    - entry_ts 取配对批次中最早的一笔 BUY/ADD 时间（FIFO 出队顺序）
-    - pnl = 卖出净额 - 卖出份额 × 加权平均成本（含买入费用）
-    与 trade_stats / holding_period / 归因共用同一配对逻辑。
-    """
-    if trade_log is None or len(trade_log) == 0:
-        return []
-    filled = trade_log[trade_log["shares"] > 0].copy()
-    if filled.empty:
-        return []
-    filled["ts"] = pd.to_datetime(filled["ts"])
-    filled = filled.sort_values(["ts", "symbol"])
 
-    trades: List[Dict[str, object]] = []
-    for sym, g in filled.groupby("symbol"):
-        qty = 0.0          # 当前持有股数
-        cost = 0.0         # 当前持有总成本（含买入费用）
-        lots: List[Tuple[pd.Timestamp, float]] = []   # FIFO 批次 (ts, qty)
-        for row in g.itertuples(index=False, name=None):
-            ts, side, shares, amount = row[0], row[2], row[4], row[5]
-            if side in ("BUY", "ADD"):
+def _local_time(value):
+    """统一为无时区的上海本地时间；不把 UTC 时刻直接去掉时区。"""
+    if value is None or pd.isna(value):
+        return pd.NaT
+    ts = pd.Timestamp(value)
+    return ts.tz_convert("Asia/Shanghai").tz_localize(None) if ts.tzinfo else ts
+
+
+def _prepare_trade_log(trade_log):
+    """按显式事件顺序处理；旧日志用输入行序生成内部成交键，不伪造信号来源。"""
+    cols = ["ts", "symbol", "side", "shares", "amount", "commission",
+            "stamp_duty", "transfer_fee", "fill_id", "signal_id", "decision_ts"]
+    if trade_log is None or trade_log.empty:
+        return pd.DataFrame(columns=cols)
+    frame = trade_log.copy(deep=True)
+    frame["ts"] = frame["ts"].map(_local_time)
+    if frame["ts"].isna().any():
+        raise ValueError("成交时间缺失")
+    frame["symbol"] = frame["symbol"].astype(str)
+    frame["_input_order"] = np.arange(len(frame))
+    for col in ("shares", "amount", "commission", "stamp_duty", "transfer_fee"):
+        frame[col] = pd.to_numeric(frame[col], errors="raise")
+        if frame[col].isna().any() or not np.isfinite(frame[col]).all():
+            raise ValueError(f"成交字段 {col} 必须为有限数值")
+    if (frame.shares < 0).any() or (frame.shares % 1 != 0).any():
+        raise ValueError("成交股数必须为非负整数")
+    sort = ["ts", "_input_order"]
+    if "event_seq" in frame:
+        seq = pd.to_numeric(frame.event_seq, errors="raise")
+        if not np.isfinite(seq).all() or (seq % 1 != 0).any() or seq.duplicated().any():
+            raise ValueError("event_seq 必须是唯一整数")
+        frame["event_seq"] = seq.astype("int64")
+        sort = ["ts", "event_seq"]
+    frame = frame.sort_values(sort, kind="stable").reset_index(drop=True)
+    for col in ("fill_id", "signal_id"):
+        if col not in frame:
+            frame[col] = None
+        # Pandas 的字符串推断会把 None 重新变成 NaN；明确保留 object 空 ID。
+        frame[col] = pd.Series([None if pd.isna(v) or v == "" else v for v in frame[col]],
+                               index=frame.index, dtype=object)
+        if any(v is not None and not isinstance(v, str) for v in frame[col]):
+            raise ValueError(f"{col} 必须为字符串")
+    ids = frame.fill_id.dropna()
+    if ids.duplicated().any():
+        raise ValueError("重复 fill_id")
+    used = set(ids)
+    for i in frame.index[frame.shares.gt(0) & frame.fill_id.isna()]:
+        key = f"legacy_fill_{i + 1:08d}"
+        while key in used:
+            key += "_legacy"
+        frame.at[i, "fill_id"] = key
+        used.add(key)
+    if "decision_ts" not in frame:
+        frame["decision_ts"] = pd.NaT
+    frame["decision_ts"] = frame.decision_ts.map(_local_time)
+    return frame
+
+
+def _match_trade_batches(trade_log):
+    """平均成本只计算一次盈亏；FIFO 队列仅分配股数来源，不使用批次原始买价。"""
+    from collections import deque
+    frame = _prepare_trade_log(trade_log)
+    trades, batches = [], []
+    remaining_shares = 0
+    for sym, group in frame[frame.shares.gt(0)].groupby("symbol", sort=True):
+        qty, cost = 0, 0.0
+        lots = deque()
+        for row in group.to_dict("records"):
+            shares = int(row["shares"])
+            if row["side"] in ("BUY", "ADD"):
                 qty += shares
-                cost += amount + row[6] + row[8]      # 成交额 + 佣金 + 过户费
-                lots.append((ts, shares))
+                cost += row["amount"] + row["commission"] + row["transfer_fee"]
+                lots.append(dict(row, remaining=shares))
                 continue
-            if side != "SELL" or qty <= 0:
-                continue
-            sell_shares = min(shares, qty)
-            avg_cost = cost / qty if qty > 0 else 0.0
-            proceeds = amount - row[6] - row[7] - row[8]  # 毛额 - 佣金 - 印花税 - 过户费
-            entry_ts = lots[0][0] if lots else ts
-            pnl = proceeds - sell_shares * avg_cost
-            trades.append({"symbol": sym, "entry_ts": entry_ts,
-                           "exit_ts": ts, "shares": float(sell_shares),
-                           "entry_price": float(avg_cost),
-                           "proceeds": float(proceeds), "pnl": float(pnl)})
-            # FIFO 消耗批次
-            remain = sell_shares
-            while remain > 0 and lots:
-                lot_ts, lot_qty = lots[0]
-                if lot_qty <= remain:
-                    remain -= lot_qty
-                    lots.pop(0)
-                else:
-                    lots[0] = (lot_ts, lot_qty - remain)
-                    remain = 0.0
-            qty -= sell_shares
-            cost -= sell_shares * avg_cost
-    return trades
+            if row["side"] != "SELL":
+                raise ValueError(f"未知成交方向: {row['side']}")
+            if shares > qty:
+                raise ValueError(f"{sym} 超卖: {shares} > {qty}")
+            avg = cost / qty
+            proceeds = row["amount"] - row["commission"] - row["stamp_duty"] - row["transfer_fee"]
+            pnl = float(proceeds - shares * avg)
+            trades.append(dict(symbol=sym, entry_ts=lots[0]["ts"], exit_ts=row["ts"],
+                               shares=float(shares), entry_price=float(avg),
+                               proceeds=float(proceeds), pnl=pnl, sell_fill_id=row["fill_id"]))
+            left, allocated = shares, 0.0
+            while left:
+                lot = lots[0]
+                matched = min(left, lot["remaining"])
+                # 最后一行承接浮点余差，保证同一笔 SELL 的批次金额严格守恒。
+                part = pnl - allocated if matched == left else pnl * matched / shares
+                batches.append(dict(symbol=sym, sell_fill_id=row["fill_id"],
+                                    buy_fill_id=lot["fill_id"], buy_signal_id=lot["signal_id"],
+                                    entry_ts=lot["ts"], exit_ts=row["ts"],
+                                    matched_shares=matched, allocated_pnl=part,
+                                    buy_decision_ts=lot["decision_ts"]))
+                allocated += part
+                left -= matched
+                lot["remaining"] -= matched
+                if not lot["remaining"]:
+                    lots.popleft()
+            qty -= shares
+            cost = cost - shares * avg if qty else 0.0
+        remaining_shares += qty
+    return trades, pd.DataFrame(batches, columns=BATCH_COLUMNS), remaining_shares
+
+
+def match_trade_batches(trade_log: pd.DataFrame) -> pd.DataFrame:
+    """每行是一笔卖出所消耗的买入批次；allocated_pnl 是平均成本盈亏的股数分摊。"""
+    return _match_trade_batches(trade_log)[1]
+
+
+def closed_trades(trade_log: pd.DataFrame) -> List[Dict[str, object]]:
+    """每笔 SELL 一行，保留平均成本及最早来源批次时间；与归因共用配对算法。"""
+    return _match_trade_batches(trade_log)[0]
 
 
 def holding_period(trade_log: pd.DataFrame, unit: str = "minutes") -> float:
