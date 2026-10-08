@@ -156,6 +156,26 @@ class RealDataLoader:
         )
         # 统一对齐：macro T-1、龙虎榜 T+1、各表排序去重
         ds = self.aligner.align_slice(ds)
+        closes = pd.to_numeric(ds.kline["close"], errors="coerce")
+        decision_mask = closes.gt(0) & np.isfinite(closes)
+        ds.meta["st_coverage_decision_bars"] = float(
+            ds.kline.loc[decision_mask, "is_st"].notna().mean())
+        axis = ds.kline.loc[decision_mask].index
+        for key, table, value_col in (("index_min", ds.index_min, "close"),
+                                      ("breadth", ds.breadth, "adr")):
+            paths = [self.data2 / f"{key if key == 'index_min' else 'breadth_min'}{ext}"
+                     for ext in (".parquet", ".csv")]
+            present = next((p for p in paths if p.exists()), None)
+            valid = (pd.to_numeric(table[value_col], errors="coerce").notna()
+                     if table is not None and value_col in table else pd.Series(dtype=bool))
+            covered = table.index[valid].unique() if table is not None else pd.DatetimeIndex([])
+            ds.meta[f"{key}_diagnostics"] = {
+                "file_exists": present is not None,
+                "path": str(present) if present is not None else None,
+                "first_ts": str(table.index.min()) if table is not None and len(table) else None,
+                "last_ts": str(table.index.max()) if table is not None and len(table) else None,
+                "coverage_decision_axis": float(axis.isin(covered).mean()) if len(axis) else 0.0,
+            }
         return ds
 
     # ------------------------------------------------------------------
@@ -237,7 +257,7 @@ class RealDataLoader:
             logger.warning("缺少 %s；历史 ST/流通股本未知，相关交易过滤保守阻断", path)
             return None
         frame = pd.read_csv(path, dtype={SYMBOL: str})
-        required = {SYMBOL, "trade_date", "is_st", "float_shares"}
+        required = {SYMBOL, "trade_date", "is_st"}
         if not required <= set(frame.columns):
             raise ValueError(f"{path} 缺少列 {required - set(frame.columns)}")
         frame[SYMBOL] = frame[SYMBOL].str.zfill(6)
@@ -246,6 +266,8 @@ class RealDataLoader:
             {"true": True, "1": True, "false": False, "0": False})
         if frame["is_st"].isna().any():
             raise ValueError(f"{path} 的 is_st 列含无法识别的值")
+        if "float_shares" not in frame:
+            frame["float_shares"] = np.nan
         frame["float_shares"] = pd.to_numeric(frame["float_shares"], errors="coerce")
         return frame.drop_duplicates([SYMBOL, "trade_date"], keep="last")
 

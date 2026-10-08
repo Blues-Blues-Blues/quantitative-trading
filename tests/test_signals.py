@@ -21,6 +21,7 @@ import pandas as pd
 import pytest
 
 from data.dataslice import DataSlice
+from engine.portfolio import Account
 from strategy.gates import CrossSectionalRankGate
 from strategy.signals import (
     ACT_ADD, ACT_BUY, ACT_DECAY_REDUCE, ACT_HOLD, ACT_SELL,
@@ -1101,6 +1102,7 @@ class TestTargetWeights:
         assert tw == pytest.approx(syn.base_weight * es * scale)
         assert 0.0 < tw <= syn.max_single_position
 
+
     def test_flat_weak_signal_zero(self):
         syn, row = self._tw(final_ms=-2.0, capital_purity=-1.0, mrs=-1.0)
         assert syn.generate_target_weights(row, None) == 0.0
@@ -1339,3 +1341,114 @@ class TestReversal:
                              big_flow=5e6, capital_purity=0.2)
         pos = self._pos_next_day(entry_time=pd.Timestamp("2024-01-04 09:30"))
         assert syn.reversal_active(row, pos) is False
+
+
+def test_hard_stop_precedes_reversal(monkeypatch):
+    syn = SignalSynthesizer(stop_loss_pct=.08)
+    row = bull_eval_row(syn).copy()
+    row["close"] = 8.9
+    pos = _pos(simulated_weight=.2)
+    pos.avg_cost = 10.0
+    pos.high_price_watermark = 11.0
+    monkeypatch.setattr(syn, "reversal_active", lambda *args: True)
+    monkeypatch.setattr(syn, "reversal_overridden", lambda *args: False)
+    sig = TradingStateMachine(syn)._on_holding(row, pos)
+    assert sig.action == ACT_SELL
+    assert sig.metrics["target_weight"] == 0.0
+    assert sig.metrics["exit_cause"] == "stop_loss"
+
+
+def test_stop_disabled_preserves_original_xs_decision():
+    syn = SignalSynthesizer()
+    row = bull_eval_row(syn).copy()
+    row["close"] = 8.9
+    pos = _pos(simulated_weight=.2)
+    pos.avg_cost = 10.0
+    assert syn.hard_exit_reason(row, pos) is None
+
+
+def test_trailing_stop_uses_visible_high_watermark():
+    syn = SignalSynthesizer(trailing_stop_pct=.1)
+    row = bull_eval_row(syn).copy()
+    row["close"] = 10.7
+    pos = _pos(simulated_weight=.2)
+    pos.avg_cost = 8.0
+    pos.high_price_watermark = 12.0
+    sig = TradingStateMachine(syn)._on_holding(row, pos)
+    assert sig.action == ACT_SELL
+    assert sig.metrics["exit_cause"] == "trailing_stop"
+    assert sig.metrics["target_weight"] == 0.0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"stop_loss_pct": 0.0}, {"trailing_stop_pct": 1.0},
+    {"th_es_entry": .5, "th_es_reentry": .4},
+])
+def test_new_risk_thresholds_validate(kwargs):
+    with pytest.raises(ValueError):
+        SignalSynthesizer(**kwargs)
+
+
+def test_reentry_gate_and_target_weight_agree():
+    syn = SignalSynthesizer(th_es_entry=.2)
+    row = bull_eval_row(syn).copy()
+    es = syn.calculate_entry_score(row)
+    assert .2 < es < 1.0
+    syn.th_es_reentry = min(1.0, es + .01)
+    sm = TradingStateMachine(syn, reentry_cooldown_trading_days=1)
+    sm._trade_day_index = 0
+    sm._trade_day = pd.Timestamp(row["ts"]).normalize()
+    sm.on_confirmed_exit(row["symbol"], row["ts"], "stop_loss")
+    cooled = sm._on_flat(row)
+    assert cooled.action == ACT_HOLD and cooled.metrics["target_weight"] == 0.0
+    sm._trade_day_index = 1
+    blocked = sm._on_flat(row)
+    assert blocked.action == ACT_HOLD and blocked.metrics["target_weight"] == 0.0
+    assert not syn.entry_all(row, entry_threshold=syn.th_es_reentry)
+    syn.th_es_reentry = max(.2, es - .01)
+    allowed = sm._on_flat(row)
+    assert allowed.action == ACT_BUY and allowed.metrics["target_weight"] > 0
+
+
+def test_cooldown_starts_after_confirmed_flat():
+    syn = SignalSynthesizer(stop_loss_pct=.08, th_es_entry=.2)
+    sm = TradingStateMachine(syn, reentry_cooldown_trading_days=1)
+    account = Account(initial_cash=1e6)
+    day = pd.Timestamp("2024-01-04 10:00")
+    account.buy("600000", day, 10.0, 10000, 100000)
+    row = bull_eval_row(syn).copy()
+    row["ts"] = day
+    row["close"] = 8.9
+    signal = sm.on_bar(day, pd.DataFrame([row]), account)[0]
+    assert signal.action == ACT_SELL
+    assert not sm.last_confirmed_exit  # 仅发信号不启动冷静期
+    row["ts"] = day + pd.Timedelta(minutes=1)
+    still_holding = sm.on_bar(row["ts"], pd.DataFrame([row]), account)[0]
+    assert still_holding.action == ACT_SELL
+    assert not sm.last_confirmed_exit  # 当日 T+1 未卖出
+    next_day = pd.Timestamp("2024-01-05 10:00")
+    account.roll_to_date(next_day)
+    account.sell("600000", next_day, 9.0, 10000, 90000)
+    sm.on_confirmed_exit("600000", next_day, "stop_loss")
+    row["ts"], row["close"] = next_day, 10.0
+    blocked = sm.on_bar(next_day, pd.DataFrame([row]), account)[0]
+    assert blocked.action == ACT_HOLD and blocked.metrics["target_weight"] == 0.0
+    row["ts"] = pd.Timestamp("2024-01-08 10:00")
+    allowed = sm.on_bar(row["ts"], pd.DataFrame([row]), account)[0]
+    assert allowed.action == ACT_BUY and allowed.metrics["target_weight"] > 0
+
+
+def test_max_holding_counts_global_trading_days():
+    syn = SignalSynthesizer()
+    sm = TradingStateMachine(syn, max_holding_trading_days=2)
+    account = Account(initial_cash=1e6)
+    account.buy("600000", pd.Timestamp("2024-01-03 10:00"), 10.0, 10000, 100000)
+    row = bull_eval_row(syn).copy()
+    row["ts"], row["close"] = pd.Timestamp("2024-01-04 10:00"), 10.0
+    first = sm.on_bar(row["ts"], pd.DataFrame([row]), account)[0]
+    assert first.metrics.get("exit_cause") != "max_holding_trading_days"
+    sm.on_bar(pd.Timestamp("2024-01-05 09:30"), pd.DataFrame(), account)
+    row["ts"] = pd.Timestamp("2024-01-05 10:00")
+    second = sm.on_bar(row["ts"], pd.DataFrame([row]), account)[0]
+    assert second.action == ACT_SELL
+    assert second.metrics["exit_cause"] == "max_holding_trading_days"

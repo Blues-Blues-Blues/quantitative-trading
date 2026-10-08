@@ -270,11 +270,14 @@ class SignalSynthesizer:
         th_purity: float = 0.0,
         th_ms_exit: float = -0.1,
         th_slippage: float = 0.03,
-        win_hold_max: int = 240,
+        win_hold_max: int = 240,  # 兼容旧配置；不参与 max_holding_trading_days 规则
         th_grs_circuit: float = -1.5,
         symbol_to_industry: Optional[Dict[str, str]] = None,
         # ---- 横截面排序闸门（可选，默认关闭）----
         rank_gate: Optional["CrossSectionalRankGate"] = None,
+        stop_loss_pct: Optional[float] = None,
+        trailing_stop_pct: Optional[float] = None,
+        th_es_reentry: Optional[float] = None,
     ) -> None:
         """保存因子权重、入场/出场阈值和时间衰减配置；合法性检查在构造时完成，避免状态机运行到一半才发现参数错误。"""
         if len(weights) != 4:
@@ -292,6 +295,12 @@ class SignalSynthesizer:
                 raise ValueError(f"{name} 必须 >= 0，当前: {val}")
         if not 0.0 < th_es_entry <= 1.0:
             raise ValueError(f"th_es_entry 必须在 (0, 1] 区间，当前: {th_es_entry}")
+        for name, value in (("stop_loss_pct", stop_loss_pct),
+                            ("trailing_stop_pct", trailing_stop_pct)):
+            if value is not None and not 0.0 < value < 1.0:
+                raise ValueError(f"{name} 必须在 (0, 1) 区间")
+        if th_es_reentry is not None and not th_es_entry <= th_es_reentry <= 1.0:
+            raise ValueError("th_es_reentry 必须不低于 th_es_entry 且不超过 1")
         if not (th_xs_crash < th_xs_exit < th_xs_reduce_high):
             raise ValueError(
                 f"th_xs_crash 必须小于 th_xs_exit 且 th_xs_exit 必须小于 "
@@ -372,6 +381,9 @@ class SignalSynthesizer:
         self.mrs_clip = mrs_clip
         self.es_sigmoid_k = es_sigmoid_k
         self.th_es_entry = th_es_entry
+        self.th_es_reentry = th_es_reentry
+        self.stop_loss_pct = stop_loss_pct
+        self.trailing_stop_pct = trailing_stop_pct
 
         # PS
         self.base_decay_rate = base_decay_rate
@@ -953,7 +965,8 @@ class SignalSynthesizer:
         return gs * cs
 
     def generate_target_weights(self, row: pd.Series,
-                                pos: Optional[Position]) -> float:
+                                pos: Optional[Position],
+                                entry_threshold: Optional[float] = None) -> float:
         """目标持仓比例 Target_Weight ∈ [0, max_single_position]。
 
         未持仓（pos is None）：
@@ -972,7 +985,7 @@ class SignalSynthesizer:
         """
         if pos is None:
             es = self.calculate_entry_score(row)
-            if self.entry_all(row):
+            if self.entry_all(row, entry_threshold=entry_threshold):
                 tw = self.base_weight * es * self._tw_scale(row)
             else:
                 tw = 0.0
@@ -998,7 +1011,8 @@ class SignalSynthesizer:
     # 历史接口兼容包装（旧 8 层开仓闸门 / 6 层平仓闸门语义 → 新架构映射）
     # ------------------------------------------------------------------
 
-    def entry_gates(self, row: pd.Series) -> Dict[str, bool]:
+    def entry_gates(self, row: pd.Series,
+                    entry_threshold: Optional[float] = None) -> Dict[str, bool]:
         """兼容接口：原 8 层开仓闸门明细。
 
         新语义：全球/系统/产业/Alpha/个股 5 层信号闸门统一由「ES >= th_es_entry」
@@ -1007,7 +1021,7 @@ class SignalSynthesizer:
         """
         es = self.calculate_entry_score(row)
         hard = self.hard_filters(row)
-        sig_ok = es >= self.th_es_entry
+        sig_ok = es >= (self.th_es_entry if entry_threshold is None else entry_threshold)
         return {
             "global": sig_ok,
             "system": sig_ok,
@@ -1020,9 +1034,24 @@ class SignalSynthesizer:
             "time": hard["time"],
         }
 
-    def entry_all(self, row: pd.Series) -> bool:
+    def entry_all(self, row: pd.Series,
+                  entry_threshold: Optional[float] = None) -> bool:
         """兼容接口：原「全部开仓闸门为真」。等价于 硬过滤全过 且 ES 达标。"""
-        return all(self.entry_gates(row).values())
+        return all(self.entry_gates(row, entry_threshold).values())
+
+    def hard_exit_reason(self, row: pd.Series, pos: Position) -> Optional[str]:
+        """已成交成本与截至当前有效收盘的最高水位触发独立风险退出。"""
+        close = row.get("close", np.nan)
+        if pd.isna(close) or float(close) <= 0:
+            return None
+        close = float(close)
+        if (self.stop_loss_pct is not None and pos.avg_cost > 0 and
+                close / pos.avg_cost - 1 <= -self.stop_loss_pct):
+            return "stop_loss"
+        if (self.trailing_stop_pct is not None and pos.high_price_watermark > 0 and
+                1 - close / pos.high_price_watermark >= self.trailing_stop_pct):
+            return "trailing_stop"
+        return None
 
     def exit_triggers(self, row: pd.Series, pos: Position) -> Dict[str, bool]:
         """兼容接口：原 6 层平仓闸门明细。
@@ -1154,6 +1183,8 @@ class TradingStateMachine:
         min_add_interval: int = 5,   # 两次加仓之间的最小 Bar 数
         add_requires_entry_gates: bool = True,  # 加仓是否复用全部开仓闸门
         min_reduce_interval: int = 5,  # 两次阶梯减仓之间的最小 Bar 数
+        max_holding_trading_days: Optional[int] = None,
+        reentry_cooldown_trading_days: int = 0,
     ) -> None:
         """初始化信号合成器及加仓、减仓节流间隔；该对象持有逐标的状态，因此新回测开始前应调用 reset。"""
         self.syn = synthesizer or SignalSynthesizer()
@@ -1161,9 +1192,20 @@ class TradingStateMachine:
             raise ValueError(f"min_add_interval 不能为负，当前: {min_add_interval}")
         if min_reduce_interval < 0:
             raise ValueError(f"min_reduce_interval 不能为负，当前: {min_reduce_interval}")
+        if max_holding_trading_days is not None and (
+                isinstance(max_holding_trading_days, bool) or
+                not isinstance(max_holding_trading_days, int) or
+                max_holding_trading_days <= 0):
+            raise ValueError("max_holding_trading_days 必须为正整数或 None")
+        if (isinstance(reentry_cooldown_trading_days, bool) or
+                not isinstance(reentry_cooldown_trading_days, int) or
+                reentry_cooldown_trading_days < 0):
+            raise ValueError("reentry_cooldown_trading_days 必须为非负整数")
         self.min_add_interval = min_add_interval
         self.add_requires_entry_gates = add_requires_entry_gates
         self.min_reduce_interval = min_reduce_interval
+        self.max_holding_trading_days = max_holding_trading_days
+        self.reentry_cooldown_trading_days = reentry_cooldown_trading_days
         self.positions: Dict[str, Position] = {}
         self.reset()
 
@@ -1173,6 +1215,30 @@ class TradingStateMachine:
         self._step = 0  # 全局 Bar 计数（仅用于排序断言）
         self._last_ts = None
         self._account_driven = False
+        self._trade_day_index = -1
+        self._trade_day = None
+        self._entry_day_index: Dict[str, int] = {}
+        self.last_confirmed_exit: Dict[str, Tuple[int, str]] = {}
+        self._reduce_pending: set[str] = set()
+
+    def on_confirmed_exit(self, symbol: str, ts: pd.Timestamp,
+                          cause: Optional[str]) -> None:
+        """只在账户已实际清仓后启动冷静期。"""
+        exit_day = pd.Timestamp(ts).normalize()
+        index = self._trade_day_index + int(self._trade_day is None or exit_day != self._trade_day)
+        self.last_confirmed_exit[symbol] = (index, cause or "sell")
+        self._entry_day_index.pop(symbol, None)
+        self._reduce_pending.discard(symbol)
+
+    def on_confirmed_reduce(self, symbol: str) -> None:
+        """成交后才启动下一次阶梯减仓的节流。"""
+        paper = self.positions.get(symbol)
+        if paper is not None:
+            paper.last_reduce_bar = paper.bars_held + 1
+        self._reduce_pending.discard(symbol)
+
+    def on_reduce_cancelled(self, symbol: str) -> None:
+        self._reduce_pending.discard(symbol)
 
     def on_bar(self, ts: pd.Timestamp, rows: pd.DataFrame,
                account: object) -> List[Signal]:
@@ -1184,6 +1250,10 @@ class TradingStateMachine:
         if self._last_ts is not None and ts <= self._last_ts:
             raise ValueError("状态机 Bar 时间必须严格递增")
         self._last_ts = ts
+        day = ts.normalize()
+        if self._trade_day is None or day != self._trade_day:
+            self._trade_day_index += 1
+            self._trade_day = day
         self._account_driven = True
         result: List[Signal] = []
         for _, row in rows.iterrows():
@@ -1192,8 +1262,10 @@ class TradingStateMachine:
             paper = self.positions.get(sym)
             if actual is None or actual.shares <= 0:
                 self.positions.pop(sym, None)
+                self._entry_day_index.pop(sym, None)
                 paper = None
             else:
+                self._entry_day_index.setdefault(sym, self._trade_day_index)
                 weight = actual.shares * actual.last_price / account.total_equity
                 if paper is None:
                     paper = Position(
@@ -1314,11 +1386,13 @@ class TradingStateMachine:
     # 内部：逐行决策
     # ------------------------------------------------------------------
 
-    def _scores(self, row: pd.Series, pos: Optional[Position]) -> Dict[str, object]:
+    def _scores(self, row: pd.Series, pos: Optional[Position],
+                entry_threshold: Optional[float] = None) -> Dict[str, object]:
         """评分快照（ES/PS/XS/Target_Weight 及分量），写入 Signal.metrics 供复盘与撮合。"""
         scores: Dict[str, object] = {
             "es": self.syn.calculate_entry_score(row),
-            "target_weight": self.syn.generate_target_weights(row, pos),
+            "target_weight": self.syn.generate_target_weights(
+                row, pos, entry_threshold=entry_threshold),
         }
         if pos is not None:
             scores["ps"] = self.syn.calculate_position_score(row, pos)
@@ -1335,9 +1409,16 @@ class TradingStateMachine:
     def _on_flat(self, row: pd.Series) -> Signal:
         """无持仓：A 股硬过滤全过 且 ES >= th_es_entry → BUY，否则 HOLD。"""
         sym = row[SYMBOL]
-        gates = self.syn.entry_gates(row)
-        scores = self._scores(row, None)  # 含 target_weight（开仓目标权重）
-        if self.syn.entry_all(row):
+        prior = self.last_confirmed_exit.get(sym)
+        threshold = (self.syn.th_es_reentry if prior and self.syn.th_es_reentry is not None
+                     else self.syn.th_es_entry)
+        gates = self.syn.entry_gates(row, entry_threshold=threshold)
+        scores = self._scores(row, None, entry_threshold=threshold)
+        cooling = (prior is not None and
+                   self._trade_day_index - prior[0] < self.reentry_cooldown_trading_days)
+        if cooling:
+            scores["target_weight"] = 0.0
+        if not cooling and self.syn.entry_all(row, entry_threshold=threshold) and scores["target_weight"] > 0:
             close = float(row["close"])
             vwap = float(row["vwap"])
             if not self._account_driven:
@@ -1378,6 +1459,21 @@ class TradingStateMachine:
         xs = self.syn.calculate_exit_score(row, pos)
         scores = self._scores(row, pos)  # 含 target_weight（对应各 XS 分支的目标权重）
 
+        cause = ("veto" if row.get("veto_flag", False) else
+                 self.syn.hard_exit_reason(row, pos))
+        entry_index = self._entry_day_index.get(row[SYMBOL])
+        if (cause is None and self.max_holding_trading_days is not None and
+                entry_index is not None and
+                self._trade_day_index - entry_index + 1 >= self.max_holding_trading_days):
+            cause = "max_holding_trading_days"
+        if cause is not None:
+            scores["target_weight"] = 0.0
+            scores["exit_cause"] = cause
+            if not self._account_driven:
+                self.positions.pop(row[SYMBOL], None)
+            return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_SELL,
+                          row["state"], self._metrics(row, scores=scores))
+
         # 次日低开反包：冻结 XS 清仓/阶梯减仓 + 承接加仓（受 time 闸门/窗口约束）
         if self.syn.reversal_active(row, pos) \
                 and not self.syn.reversal_overridden(row):
@@ -1402,6 +1498,7 @@ class TradingStateMachine:
 
         # 清仓：常规清仓（XS <= th_xs_exit）或 极速清仓（XS <= th_xs_crash / 一票否决）
         if xs <= self.syn.th_xs_exit or row.get("veto_flag", False):
+            scores["exit_cause"] = "xs_exit"
             if not self._account_driven:
                 del self.positions[row[SYMBOL]]
             return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_SELL,
@@ -1412,8 +1509,12 @@ class TradingStateMachine:
 
         # 容错阶梯减仓：XS 落入 (th_xs_exit, th_xs_reduce_high) 且满足减仓节奏
         if xs < self.syn.th_xs_reduce_high:
-            if pos.bars_held - pos.last_reduce_bar >= self.min_reduce_interval:
-                pos.last_reduce_bar = pos.bars_held
+            if (row[SYMBOL] not in self._reduce_pending and
+                    pos.bars_held - pos.last_reduce_bar >= self.min_reduce_interval):
+                if self._account_driven:
+                    self._reduce_pending.add(row[SYMBOL])
+                else:
+                    pos.last_reduce_bar = pos.bars_held
                 pos.simulated_weight = float(scores["target_weight"])  # = 当前 × 0.8
                 return Signal(row[SYMBOL], pd.Timestamp(row["ts"]), ACT_DECAY_REDUCE,
                               row["state"], self._metrics(row, scores=scores))
@@ -1451,7 +1552,7 @@ class TradingStateMachine:
             m[col] = float(v) if pd.notna(v) else None
         if scores:
             for k, v in scores.items():
-                m[k] = float(v) if v is not None else None
+                m[k] = v if isinstance(v, str) else float(v) if v is not None else None
         if entry_gates is not None:
             m["entry_gates"] = entry_gates
         if exit_triggers is not None:

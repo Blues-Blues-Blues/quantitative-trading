@@ -117,6 +117,14 @@ REAL_PARAMS: Dict[str, object] = {
     "tw_cmod_clip": (0.6898, 1.2783),
     # ---- 撮合引擎（调仓死区）----
     "deadzone_th": 0.0831,
+    "entry_order_expiry": "same_session",
+    "risk_reduce_bypass_deadzone": False,
+    "risk_reduce_min_shares": 100,
+    "stop_loss_pct": None,
+    "trailing_stop_pct": None,
+    "max_holding_trading_days": None,
+    "reentry_cooldown_trading_days": 0,
+    "th_es_reentry": None,
 }
 # 真实数据回测股票子集（空列表 = 全部 20 只；指定代码可大幅缩短运行时间）
 # 单票检验：603019（计算机设备 / 中科曙光）
@@ -412,8 +420,14 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
             float(x) for x in params.get("tw_cmod_clip", (0.5, 1.5))),
         symbol_to_industry=symbol_to_industry,
         rank_gate=rank_gate,
+        stop_loss_pct=params.get("stop_loss_pct"),
+        trailing_stop_pct=params.get("trailing_stop_pct"),
+        th_es_reentry=params.get("th_es_reentry"),
     )
-    sm = TradingStateMachine(synthesizer=syn)
+    sm = TradingStateMachine(
+        synthesizer=syn,
+        max_holding_trading_days=params.get("max_holding_trading_days"),
+        reentry_cooldown_trading_days=params.get("reentry_cooldown_trading_days", 0))
     t0 = _tick(t0, "信号评估表准备")
 
     # ---- 环节 4：回测撮合引擎 ----
@@ -450,7 +464,10 @@ def run_pipeline(ds: DataSlice, params: Dict[str, object],
         engine = BacktestEngine(account, cost, sizer, ds,
             deadzone_th=float(params.get("deadzone_th", 0.05)),
             state_machine=sm, features=features,
-            snapshot_sink=writer.snapshot if writer is not None else None)
+            snapshot_sink=writer.snapshot if writer is not None else None,
+            entry_order_expiry=params.get("entry_order_expiry", "same_session"),
+            risk_reduce_bypass_deadzone=params.get("risk_reduce_bypass_deadzone", False),
+            risk_reduce_min_shares=params.get("risk_reduce_min_shares", 100))
         trade_log, equity_curve = engine.run()
         if writer is not None:
             writer.finalize(trade_log, engine.generated_signals, equity_curve, kline=ds.kline)

@@ -248,7 +248,7 @@ class TestTPlusOne:
         t1_rej = log[(log["reason"] == "t1_lock")]
         assert not t1_rej.empty  # 当日 SELL 被拒（T+1 锁定）
 
-        deferred = log[log["reason"] == "t1_deferred_sell"]
+        deferred = log[(log["reason"] == "t1_deferred_sell")]
         assert not deferred.empty
         # 挂起卖出成交于次日（D1）开盘
         assert deferred.iloc[0]["ts"] == pd.Timestamp("2024-01-03 09:30")
@@ -573,9 +573,9 @@ class TestTargetRebalanceT1:
         assert not deferred.empty
         assert eng.account.positions["600000"].shares > 0  # 减仓非清仓
 
-    def test_limit_down_skips_no_pending(self):
+    def test_limit_down_keeps_risk_order_pending(self):
         # D0 10:00 BUY（成交 10:30）；D1 10:00 SELL 撮合于 10:30（跌停）
-        # → 拒绝且不挂起；无顺延卖出记录，持仓保留
+        # 跌停阻断当次成交，风险订单继续挂起并在下一有效开盘卖出。
         ds, _ = full_env(dates=_D4)
         buy = Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY,
                      "S_push", {"target_weight": 0.3})
@@ -587,8 +587,10 @@ class TestTargetRebalanceT1:
         eng, (log, _) = run_backtest(ds, [buy, sell])
         assert not log[(log["side"] == ACT_SELL) &
                        (log["reason"] == "limit_down")].empty
-        assert log[(log["reason"] == "t1_deferred_sell")].empty  # 不挂起
-        assert "600000" in eng.account.positions
+        deferred = log[(log["reason"] == "signal_sell") & (log["shares"] > 0)]
+        assert len(deferred) == 1
+        assert deferred.iloc[0].decision_ts == sell.timestamp
+        assert "600000" not in eng.account.positions
 
 
 class TestExecutionProvenance:
@@ -647,7 +649,7 @@ class TestExecutionProvenance:
         assert sells.iloc[-1].ts == pd.Timestamp("2024-01-04 09:30")
         assert engine.account.positions == {}
 
-    def test_superseding_pending_target_is_auditable(self):
+    def test_entry_does_not_supersede_pending_risk_target(self):
         ds, _ = full_env()
         signals = [Signal("600000", pd.Timestamp("2024-01-02 10:00"), ACT_BUY, "S_push", {"target_weight": .2}),
                    Signal("600000", pd.Timestamp("2024-01-02 11:00"), ACT_SELL, "S_push"),
@@ -655,8 +657,9 @@ class TestExecutionProvenance:
         engine, _ = run_backtest(ds, signals)
         pending = next(r for r in engine.order_reports if r.reason == "t1_lock")
         assert pending.signal_id == "sig_00000002"
-        assert pending.superseded_by == "sig_00000003"
-        assert pending.cancelled_ts == pd.Timestamp("2024-01-02 13:30")
+        assert pending.superseded_by is None
+        blocked = engine.order_events.loc[engine.order_events.reason.eq("risk_order_active")]
+        assert blocked.signal_id.tolist() == ["sig_00000003"]
 
     def test_default_engine_does_not_construct_snapshots(self, monkeypatch):
         ds, signals = full_env()
@@ -664,3 +667,161 @@ class TestExecutionProvenance:
         engine, _ = run_backtest(ds, signals)
         assert engine.snapshot_sink is None
         assert not hasattr(engine, "position_snapshots")
+
+
+def _lunch_case(action=ACT_DECAY_REDUCE, later_amount=1e8):
+    axis = pd.to_datetime(["2024-01-02 11:29", "2024-01-02 11:30",
+                           "2024-01-02 13:00", "2024-01-02 13:01"])
+    k = mk_kline(axis)
+    k.loc[axis[1], ["open", "close"]] = np.nan
+    k.loc[axis[1], "amount"] = 0.0
+    k.loc[axis[2], "amount"] = later_amount
+    k.loc[axis[2], "open"] = 10.4
+    ds = DataSlice(kline=k)
+    account = Account(initial_cash=1e6)
+    if action == ACT_DECAY_REDUCE:
+        account.buy("600000", pd.Timestamp("2024-01-01 10:00"), 10, 15000, 150000)
+    signal = Signal("600000", axis[0], action, "S_push",
+                    {"target_weight": .115 if action == ACT_DECAY_REDUCE else .2})
+    return ds, account, signal, axis
+
+
+def test_empty_1130_bar_carries_reduce_to_1300():
+    ds, account, signal, axis = _lunch_case()
+    engine = BacktestEngine(account, ExecutionCost(), PositionSizer(), ds,
+                            [signal], risk_reduce_bypass_deadzone=True)
+    log, _ = engine.run()
+    sells = log[(log.shares > 0) & (log.side == ACT_SELL)]
+    assert len(sells) == 1
+    assert sells.iloc[0].ts == axis[2]
+    assert sells.iloc[0].decision_ts == axis[0]
+    assert not any(s.timestamp == axis[1] for s in engine.generated_signals)
+    assert (engine.order_events.reason == "invalid_open").any()
+
+
+def test_entry_expires_across_lunch():
+    ds, account, signal, axis = _lunch_case(ACT_BUY)
+    engine = BacktestEngine(account, ExecutionCost(), PositionSizer(), ds, [signal])
+    log, _ = engine.run()
+    assert log.shares.sum() == 0
+    assert (engine.order_events.status == "expired").any()
+
+
+def test_next_valid_bar_entry_expires_after_next_day_attempt():
+    axis = pd.to_datetime(["2024-01-02 14:59", "2024-01-02 15:00",
+                           "2024-01-03 09:30", "2024-01-03 09:31"])
+    kline = mk_kline(axis)
+    kline.loc[axis[1], "open"] = np.nan
+    kline.loc[axis[2], "open"] = kline.loc[axis[2], "up_limit"]
+    ds = DataSlice(kline=kline)
+    buy = Signal("600000", axis[0], ACT_BUY, "S_push", {"target_weight": .2})
+    engine = BacktestEngine(Account(1e6), ExecutionCost(), PositionSizer(), ds,
+                            [buy], entry_order_expiry="next_valid_bar")
+    log, _ = engine.run()
+    assert not (log.shares > 0).any()
+    assert (engine.order_events.status == "expired").any()
+    assert log.loc[log.reason.eq("limit_up"), "ts"].tolist() == [axis[2]]
+
+
+@pytest.mark.parametrize("options", [
+    {"entry_order_expiry": "forever"},
+    {"risk_reduce_min_shares": 50},
+    {"risk_reduce_min_shares": 0},
+])
+def test_order_lifecycle_parameters_validate(options):
+    axis = pd.to_datetime(["2024-01-02 10:00"])
+    with pytest.raises(ValueError):
+        BacktestEngine(Account(1e6), ExecutionCost(), PositionSizer(),
+                       DataSlice(kline=mk_kline(axis)), **options)
+
+
+def test_reduce_bypasses_normal_deadzone_only_when_enabled():
+    axis = pd.to_datetime(["2024-01-02 10:00", "2024-01-02 10:01"])
+    ds = DataSlice(kline=mk_kline(axis))
+    reduce = Signal("600000", axis[0], ACT_DECAY_REDUCE, "S_push",
+                    {"target_weight": .115})
+    for enabled in (False, True):
+        account = Account(initial_cash=1e6)
+        account.buy("600000", pd.Timestamp("2024-01-01 10:00"), 10, 15000, 150000)
+        engine = BacktestEngine(account, ExecutionCost(), PositionSizer(), ds,
+                                [reduce], deadzone_th=.0831,
+                                risk_reduce_bypass_deadzone=enabled)
+        log, _ = engine.run()
+        assert bool((log.shares > 0).any()) == enabled
+        assert (engine.order_events.reason == "deadzone_skip").any() == (not enabled)
+    add = Signal("600000", axis[0], ACT_ADD, "S_push", {"target_weight": .17})
+    account = Account(initial_cash=1e6)
+    account.buy("600000", pd.Timestamp("2024-01-01 10:00"), 10, 15000, 150000)
+    log, _ = BacktestEngine(account, ExecutionCost(), PositionSizer(), ds, [add],
+                            deadzone_th=.0831, risk_reduce_bypass_deadzone=True).run()
+    assert not (log.shares > 0).any()
+
+
+def test_no_lookahead_for_deferred_liquidity():
+    prices = []
+    for future_amount in (1e4, 1e10):
+        ds, account, signal, _ = _lunch_case(later_amount=future_amount)
+        engine = BacktestEngine(account, ExecutionCost(), PositionSizer(), ds,
+                                [signal], risk_reduce_bypass_deadzone=True)
+        log, _ = engine.run()
+        prices.append(log.loc[log.shares > 0, "price"].iloc[0])
+        assert (engine.order_events.reason == "liquidity_fallback").any()
+    assert prices[0] == prices[1]
+
+
+def test_limit_down_and_t1_keep_one_risk_order():
+    axis = pd.to_datetime(["2024-01-02 10:00", "2024-01-02 10:01",
+                           "2024-01-02 10:02", "2024-01-03 09:30",
+                           "2024-01-03 09:31"])
+    kline = mk_kline(axis)
+    kline.loc[axis[3], "open"] = kline.loc[axis[3], "down_limit"]
+    ds = DataSlice(kline=kline)
+    buy = Signal("600000", axis[0], ACT_BUY, "S_push", {"target_weight": .2})
+    sell = Signal("600000", axis[1], ACT_SELL, "S_push",
+                  {"exit_cause": "stop_loss"})
+    engine = BacktestEngine(Account(1e6), ExecutionCost(), PositionSizer(), ds,
+                            [buy, sell])
+    log, _ = engine.run()
+    bought = log[(log.side == ACT_BUY) & (log.shares > 0)]
+    sold = log[(log.side == ACT_SELL) & (log.shares > 0)]
+    assert len(bought) == len(sold) == 1
+    assert bought.iloc[0].shares == sold.iloc[0].shares
+    assert sold.iloc[0].ts == axis[4]
+    assert sold.iloc[0].signal_id == "sig_00000002"
+    assert sold.iloc[0].reason == "t1_deferred_sell"
+    assert sold.iloc[0].strategy_cause == "stop_loss"
+    assert engine.account.positions == {}
+    assert (engine.order_events.reason == "limit_down").any()
+
+
+def test_engine_confirms_exit_only_after_flat_fill():
+    axis = pd.to_datetime(["2024-01-02 10:00", "2024-01-02 10:01",
+                           "2024-01-02 10:02", "2024-01-03 09:30"])
+    ds = DataSlice(kline=mk_kline(axis))
+
+    class StateMachineSpy:
+        def reset(self):
+            self.exits = []
+
+        def _build_eval_table(self, data, features):
+            return data.kline.reset_index()[["ts", "symbol"]]
+
+        def on_bar(self, ts, rows, account):
+            if ts == axis[0]:
+                return [Signal("600000", ts, ACT_BUY, "S_push", {"target_weight": .2})]
+            if ts == axis[1]:
+                return [Signal("600000", ts, ACT_SELL, "S_push",
+                               {"exit_cause": "stop_loss"})]
+            if ts < axis[3]:
+                assert not self.exits
+            return []
+
+        def on_confirmed_exit(self, symbol, ts, cause):
+            self.exits.append((symbol, ts, cause))
+
+    spy = StateMachineSpy()
+    engine = BacktestEngine(Account(1e6), ExecutionCost(), PositionSizer(), ds,
+                            state_machine=spy, features=pd.DataFrame())
+    log, _ = engine.run()
+    assert len(log[log.reason.eq("t1_lock")]) == 1
+    assert spy.exits == [("600000", axis[3], "stop_loss")]

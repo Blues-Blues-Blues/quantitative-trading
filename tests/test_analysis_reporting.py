@@ -161,9 +161,10 @@ def test_rejected_buy_never_creates_exposure(tmp_path):
     writer = writer_at(tmp_path)
     engine = small_engine(writer.snapshot)
     ts = pd.Timestamp("2024-01-02 10:01")
-    # 修改已构建的撮合表，制造开盘涨停；其余信号只有 HOLD/SELL。
-    bar = engine._kline_by_ts[ts]
-    bar.loc["600000", "open"] = bar.loc["600000", "up_limit"]
+    # 整个剩余交易时段涨停，待买订单只能在同一时段等待，到期后不建立暴露。
+    for blocked_ts in (ts, pd.Timestamp("2024-01-02 10:02")):
+        bar = engine._kline_by_ts[blocked_ts]
+        bar.loc["600000", "open"] = bar.loc["600000", "up_limit"]
     log, curve = engine.run()
     quality = writer.finalize(log, engine.generated_signals, curve)
     assert log.iloc[0].reason == "limit_up" and pd.isna(log.iloc[0].fill_id)

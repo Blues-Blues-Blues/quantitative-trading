@@ -169,12 +169,21 @@ class StrategyOptimizer:
             tw_cmod_clip=tuple(
                 float(x) for x in params.get("tw_cmod_clip", (0.5, 1.5))),
             symbol_to_industry=self.symbol_to_industry,
+            stop_loss_pct=params.get("stop_loss_pct"),
+            trailing_stop_pct=params.get("trailing_stop_pct"),
+            th_es_reentry=params.get("th_es_reentry"),
         )
-        sm = TradingStateMachine(synthesizer=syn)
+        sm = TradingStateMachine(
+            synthesizer=syn,
+            max_holding_trading_days=params.get("max_holding_trading_days"),
+            reentry_cooldown_trading_days=params.get("reentry_cooldown_trading_days", 0))
         engine = BacktestEngine(
             Account(**self.account_kwargs), self.cost, self.sizer, ds,
             deadzone_th=float(params.get("deadzone_th", 0.05)),
-            state_machine=sm, features=features)
+            state_machine=sm, features=features,
+            entry_order_expiry=params.get("entry_order_expiry", "same_session"),
+            risk_reduce_bypass_deadzone=params.get("risk_reduce_bypass_deadzone", False),
+            risk_reduce_min_shares=params.get("risk_reduce_min_shares", 100))
         trade_log, equity_curve = engine.run()
         return evaluate(equity_curve, trade_log), engine
 

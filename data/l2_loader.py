@@ -48,8 +48,16 @@ _SNAP_VOL_COLS = [f"申买量{i}" for i in range(1, 11)] + \
 
 
 def _hmss_to_timedelta(hmss: pd.Series) -> pd.Timedelta:
-    """HHMMSSmmm int → Timedelta（补零到 9 位：92500780 → 09:25:00.780）。"""
-    s = hmss.astype(str).str.zfill(9)
+    """HHMMSSmmm 或秒级 HHMMSS → Timedelta。
+
+    个别行情文件只保存秒（如 84504 表示 08:45:04）；正常逐笔时间
+    92500780 仍表示 09:25:00.780。A 股原始时刻均晚于 08:00，
+    因此正数且不超过 235959 的值可无歧义地按 HHMMSS 处理。
+    """
+    raw = pd.to_numeric(hmss, errors="raise").astype("int64")
+    seconds_only = raw.between(1, 235959)
+    normalized = raw.where(~seconds_only, raw * 1000)
+    s = normalized.astype(str).str.zfill(9)
     hh = s.str[:2].astype(int)
     mm = s.str[2:4].astype(int)
     ss = s.str[4:6].astype(int)

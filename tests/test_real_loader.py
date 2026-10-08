@@ -4,6 +4,15 @@ import numpy as np
 import pandas as pd
 
 from data.real_loader import RealDataLoader
+from data.l2_loader import _hmss_to_timedelta
+
+
+def test_quote_times_accept_seconds_and_milliseconds():
+    actual = _hmss_to_timedelta(pd.Series([84504, 92500780, 150004, 150001000]))
+    expected = pd.to_timedelta([
+        "08:45:04", "09:25:00.780", "15:00:04", "15:00:01",
+    ])
+    assert actual.tolist() == expected.tolist()
 
 
 def _bars():
@@ -41,3 +50,18 @@ def test_missing_history_and_market_feeds_remain_missing(tmp_path):
     assert out["float_market_cap"].isna().all()
     assert out["up_limit"].isna().all()
     assert loader._load_market_table("index_min", ["index_code"], out.index) is None
+
+
+def test_st_history_without_float_shares(tmp_path):
+    data2 = tmp_path / "data2"
+    data2.mkdir()
+    pd.DataFrame({"symbol": ["600000", "600000"],
+                  "trade_date": ["2024-01-01", "2024-01-03"],
+                  "is_st": [0, 1]}).to_csv(data2 / "stock_history.csv", index=False)
+    loader = RealDataLoader(data_root=tmp_path)
+    loader.l2.load_kline = lambda *args, **kwargs: _bars()
+    out = loader._load_kline(["600000"], "2024-01-02", "2024-01-03")
+    assert out["is_st"].tolist() == [False, True]
+    assert out["float_market_cap"].isna().all()
+    assert np.isnan(out["up_limit"].iloc[0])
+    assert out["up_limit"].iloc[1] == 10.5

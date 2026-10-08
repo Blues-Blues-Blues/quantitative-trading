@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from data.aligner import TimeAligner
@@ -36,10 +37,11 @@ logger = logging.getLogger("indicators.feature_engine")
 # ---- 特征持久化缓存（整区间 + 签名 key）----
 # 命中条件 = 参数签名 + 数据指纹 + 区间 + 标的，全部一致才复用，
 # 跳过高耗时的原始逐笔（tick/l2_snapshot）加载与因子重算。
-_CACHE_SCHEMA_VERSION = "4"   # FEATURE_COLS / 因子计算逻辑变化时递增（强制全部失效）
+_CACHE_SCHEMA_VERSION = "5"   # FEATURE_COLS / 因子计算逻辑变化时递增（强制全部失效）
                               # 1→2：特征数值列统一强制 float64（修复 object dtype 往返不一致）
                               # 2→3：增量拼接去重改为按行键 (ts, symbol)（索引仅 ts，长表多标）
                               #      （原按 index 去重会删掉同 ts 的第二个标的 → 数据减半）
+                              # 4→5：OBI 改买一/卖一队列失衡；无撤单来源时撤单率改为缺失；PSS 加影线方向分
 _ALIGN_VERSION = "2"          # TimeAligner 行为变化时递增
 _DEFAULT_CACHE_DIR = (Path(__file__).resolve().parent.parent
                       / "data" / "feature_cache")
@@ -131,6 +133,12 @@ class FeatureEngine:
         feat = feat.set_index("ts").reindex(columns=FEATURE_COLS)
         feat[_NUMERIC_COLS] = feat[_NUMERIC_COLS].apply(
             pd.to_numeric, errors="coerce")
+        closes = pd.to_numeric(aligned.kline["close"], errors="coerce")
+        decision = (closes.gt(0) & np.isfinite(closes)).to_numpy()
+        feat.attrs["factor_coverage_decision_bars"] = {
+            col: float(feat.loc[decision, col].notna().mean()) if decision.any() else 0.0
+            for col in ("mrs", "grs", "irs", "global_mod", "chain_mod")
+        }
         return feat
 
     # ------------------------------------------------------------------

@@ -315,6 +315,33 @@ class TestMicroStructure:
         den = w1 + w2 + w3 + w4  # 全分量有效
         assert ofss == pytest.approx(float(np.clip(num / den, -1.0, 1.0)))
 
+    def test_obi_uses_best_queue_not_deeper_levels(self):
+        """最优买卖档决定队列失衡；深档反向堆量不应覆盖买一/卖一。"""
+        ds = self._ds_with_orderflow()
+        snap = ds.l2_snapshot.copy()
+        snap["bid1_v"], snap["ask1_v"] = 300.0, 100.0
+        for level in range(2, 6):
+            snap[f"bid{level}_v"] = 1.0
+            snap[f"ask{level}_v"] = 1000.0
+        ds.l2_snapshot = snap
+        comp = MicroStructure().ofss_components(ds)
+        assert comp["obi"].iloc[0] == pytest.approx(0.5)
+
+        ds.l2_snapshot.loc[:, ["bid1_v", "ask1_v"]] = 0.0
+        assert np.isnan(MicroStructure().ofss_components(ds)["obi"].iloc[0])
+
+    def test_missing_cancel_feed_does_not_reward_ofss(self):
+        """仅有成交记录不能证明撤单率为零；缺项权重让渡给已观测分量。"""
+        ds = self._ds_with_orderflow()
+        ds.tick_trades = ds.tick_trades[~ds.tick_trades["is_cancel"]]
+        micro = MicroStructure()
+        comp = micro.ofss_components(ds)
+        assert np.isnan(comp["cancel_ratio"].iloc[0])
+        row = comp.iloc[0]
+        expected = (0.3 * row["obi"] + 0.3 * row["ar"]
+                    + 0.2 * row["big_flow"]) / 0.8
+        assert micro.ofss(comp).iloc[0] == pytest.approx(expected)
+
     def test_ofss_single_weight_returns_component(self):
         """仅单权重有效时，重归一化使 OFSS 恒为该分量本身 → 天然有界 [-1,1]。"""
         ds = self._ds_with_orderflow()
@@ -365,10 +392,23 @@ class TestMicroStructure:
             "open": np.full(n, 9.0), "high": np.full(n, 11.0),
             "low": np.full(n, 7.0), "close": closes,
         }, index=axis)
-        pss = MicroStructure(pss_body_w=0.0, pss_window=3).pss(df).dropna()
+        pss = MicroStructure(pss_body_w=0.0, pss_shadow_w=0.0,
+                             pss_window=3).pss(df).dropna()
         for ts, val in pss.items():
             c = closes[axis.get_loc(ts)]
             assert val == pytest.approx(2 * (c - 7.0) / 4.0 - 1.0)
+
+    def test_pss_shadow_direction(self):
+        """同为十字线，下影较长承接为正，上影较长抛压为负。"""
+        axis = pd.DatetimeIndex(["2024-01-02 09:30", "2024-01-02 09:31"])
+        bars = pd.DataFrame({
+            "symbol": ["600000", "600000"],
+            "open": [10.0, 10.0], "close": [10.0, 10.0],
+            "high": [10.5, 12.0], "low": [8.0, 9.5],
+        }, index=axis)
+        pss = MicroStructure(pss_body_w=0.0, pss_shadow_w=1.0).pss(bars)
+        assert pss.iloc[0] == pytest.approx((2.0 - 0.5) / 2.5)
+        assert pss.iloc[1] == pytest.approx((0.5 - 2.0) / 2.5)
 
     def test_cps_range(self):
         dates = ["2024-01-02", "2024-01-03", "2024-01-04"]
